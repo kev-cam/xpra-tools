@@ -1,0 +1,57 @@
+# xpra-tools AI Control Layer Configuration
+
+frame_capture:
+  # Frame delivery rate to AI agent (Hz)
+  fps: 3.0
+  # Image format: jpeg | png | raw
+  format: jpeg
+  # JPEG quality (1-100), ignored for png/raw
+  quality: 70
+  # Downscale factor (0.0-1.0), 1.0 = full resolution
+  scale: 1.0
+  # Maximum dimension (width or height) - frames larger than this are downscaled
+  max_dimension: 1920
+  # Only send frames when content changes (uses damage rects)
+  delta_only: true
+
+control:
+  # Default input mode: observer | supervised | autonomous | collaborative
+  mode: observer
+  # Key combo that always passes through and forces mode to observer
+  kill_switch: "ctrl+Pause"
+  # Timeout (seconds) before autonomous mode auto-reverts to observer (0 = no timeout)
+  autonomous_timeout: 300
+  # In collaborative mode, how long (ms) after human input to suppress AI input
+  human_priority_ms: 500
+
+zmq:
+  # PUB socket for frame data (plugin publishes, agent subscribes)
+  frame_endpoint: "ipc:///tmp/xpra-ai-frames.sock"
+  # PUB socket for window events (create, destroy, focus, resize, title change)
+  event_endpoint: "ipc:///tmp/xpra-ai-events.sock"
+  # REQ/REP socket for control commands (agent requests, plugin replies)
+  control_endpoint: "ipc:///tmp/xpra-ai-control.sock"
+  # High-water mark for frame publisher (drop old frames if agent is slow)
+  frame_hwm: 5
+  # High-water mark for event publisher
+  event_hwm: 100
+
+agent:
+  # AI model endpoint (for the example agent)
+  model_endpoint: "http://localhost:8080/v1/chat/completions"
+  # Model name
+  model_name: "claude-sonnet-4-20250514"
+  # System prompt for the AI agent
+  system_prompt: |
+    You are an AI agent controlling an X11 desktop via Xpra.
+    You receive screenshots and can perform mouse/keyboard actions.
+    Describe what you see and what actions you want to take.
+  # Action confirmation in supervised mode
+  confirm_timeout: 30
+
+logging:
+  level: INFO
+  # Log frame delivery stats every N seconds
+  stats_interval: 30
+  # Log file (empty = stderr only)
+  file: ""
