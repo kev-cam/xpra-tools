@@ -1,0 +1,44 @@
+#!/usr/bin/perl -s
+
+if ($ns) { $ENV{DONT_SUDO} = 1; }
+
+chdir("/proc");
+
+@p = glob("{1,2,3,4,5,6,7,8,9}*");
+
+foreach $pid (@p) {
+    open(ENV,"<$pid/environ");
+    while(<ENV>) {
+	if (/(^|\0)DISPLAY=(.*?)(\0|$)/ && ($DISP = $2)) {
+	    last if (defined $display && $display ne $DISP);
+	    if (defined $pids{$DISP}) {
+		$pids{$DISP} .= ",$pid";
+	    } else {
+		$pids{$DISP}  = "$pid";
+	    }
+	}
+	if  (/(^|\0)USER=(.*?)(\0|$)/ && ($USER = $2)) {
+	    $uid{$pid} = $USER;
+	}
+    }
+}
+
+foreach $DISP (sort keys %pids) {
+    $pream = $DISP."\n";
+    if (defined $displays) {
+	print $DISP; next;
+    }
+    
+    foreach $pid (split /\,/,$pids{$DISP}) {
+	next if (defined $user &&  $uid{$pid} ne $user);
+	$cmd=`sudo-cat $pid/cmdline`;
+	$cmd =~ tr/\0/ /;
+	next if (($cmd =~ /show-x11/) || ($fx && ! ($cmd =~ /$fx/)));
+	if ($attach) {
+	    exec("xpra","attach",$DISP);
+	} else {
+	    printf("%s  %8s %-8s %s\n",$pream,$pid,$uid{$pid},$cmd);
+	}
+	$pream = "";
+    }
+}

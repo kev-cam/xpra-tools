@@ -1,0 +1,77 @@
+#!/usr/bin/perl -s
+
+if (defined $attach) {
+    if (1 != $attach) {
+	$ENV{DISPLAY}=$attach;
+    }
+}
+
+open(XPRA,"xpra list 2>&1 |");
+
+$pid=-1;
+while (<XPRA>) {
+    if ($debug) {
+	print;
+    }
+    if (m=^/run/user/(\d+)=) {
+	$pid = $1;
+    }
+    if (/LIVE\s*session\s*at\s*:(\d+)/i) {
+	if ($debug) {
+	    print "$1=>$pid\n";
+	}
+	$xpra{$1} = $pid;
+    }
+}
+
+open(XPRA,"$ENV{HOME}/.xpra-start");
+
+while (<XPRA>) {
+    chomp;
+    next if ("" eq $_);
+    
+    if (/\s*(\d+)\s*:\s*(.*)/) {
+	next if ($display && $1 ne $display);
+	
+	print "$1\t'$2' $xpra{$1}\n";
+	$cmd=$2;
+	open (CMD,">/tmp/$$-xpra-cmd");
+	print CMD "#!/bin/sh\nexec $cmd\n";
+	close CMD;
+	chmod 0700,"/tmp/$$-xpra-cmd";
+	$xmd="/tmp/$$-xpra-cmd";
+	if (! defined $xpra{$n = $1}) {
+	    open(NWXP,"xpra start --start='$xmd' :$n 2>&1 |");
+	    while (<NWXP>) {
+		print;
+	    }
+	} else {
+	    open(SHX,"show-x11 -ns -display=:$n 2>&1 |");
+	    $running = 0;
+	    while (<SHX>) {		
+		if (/$cmd/) {
+		    s/^\s+//;
+		    print "Running ",$_;
+		    $running = 1;
+		} elsif ($debug) {
+		    print;
+		}
+	    }
+	    if (! $running) {
+		print "Restarting $cmd on display $n\n";
+		open(NWXP,"xpra control :$n start /tmp/$$-xpra-cmd 2>&1 |");
+		while (<NWXP>) {
+		    print;
+		}
+	    }
+	    if ($attach) {
+		system("xpra attach :$n &")
+	    }
+	}
+	if (! $debug) {
+	    unlink("/tmp/$$-xpra-cmd");
+	}
+    } else {
+	print "Bad line: $_\n";
+    }
+}
