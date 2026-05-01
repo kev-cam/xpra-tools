@@ -1,14 +1,5 @@
 #!/usr/bin/perl -s
 
-# -pick: skip the local ~/.xpra-start flow and pop the network session
-# chooser instead.  Discovers existing X11/xpra sessions across the
-# network via net-mgr + ssh show-x11, displays a zenity menu, attaches
-# to the chosen session.
-if ($pick) {
-    (my $bin = $0) =~ s{[^/]+$}{find-xpra};
-    exec($bin, @ARGV) or die "exec $bin: $!";
-}
-
 if (defined $attach) {
     if (1 != $attach) {
 	$ENV{DISPLAY}=$attach;
