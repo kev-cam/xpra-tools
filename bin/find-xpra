@@ -21,6 +21,7 @@ my $ssh_to     = 3;
 my $overall_to = 8;
 my $list_only;
 my $no_local;
+my $all;
 my $help;
 
 GetOptions(
@@ -29,6 +30,7 @@ GetOptions(
     'timeout=i'  => \$ssh_to,
     'list'       => \$list_only,
     'no-local'   => \$no_local,
+    'a|all'      => \$all,
     'h|help'     => \$help,
 ) or die usage();
 print(usage()), exit 0 if $help;
@@ -40,6 +42,7 @@ usage: find-xpra [options]
   --timeout SEC       per-host ssh ConnectTimeout (default: 3)
   --list              print rows to stdout instead of popping a chooser
   --no-local          skip local show-x11 probe
+  -a, --all           include displays under :20 (presumed plain X)
   -h, --help          this message
 EOF
 
@@ -185,29 +188,76 @@ for my $r (@rows) {
     my $kind_default = (defined $n && $n >= 20) ? 'xpra' : 'X';
     my $s = $by_session{$key} //= { host=>$host, disp=>$disp, user=>$user, cmds=>[], n=>0, kind=>$kind_default };
     $s->{n}++;
-    # collect "interesting" commands — drop common desktop/session daemons
-    next if $cmd =~ m{^(?:/usr|/bin|/sbin)?/?(?:libexec/)?(?:dbus-daemon|dbus-launch|dconf-service|gvfsd|gvfsd-fuse|xdg-\S+|ibus-\S+|pulseaudio|gnome-keyring-daemon|at-spi-\S+|xpra/\S*daemonizer|/usr/bin/python\S*\s+/usr/libexec/xpra/daemonizer)\b};
-    next if $cmd =~ m{\b(?:dbus-daemon|dbus-launch|dconf-service|gvfsd|gvfs-?\S*|xdg-\S+|ibus-\S+|pulseaudio|gnome-keyring|at-spi-\S+|xpra-daemonizer|xpra/daemonizer|sleep)\b};
+    # Drop session-plumbing daemons; keep candidate "main apps" with args.
+    next if $cmd =~ m{\b(?:dbus-daemon|dbus-launch|dconf-service|gvfsd|gvfs-?\S*|xdg-\S+|ibus-\S+|pulseaudio|gnome-keyring|at-spi-\S+|xpra/?\S*daemonizer|sleep)\b};
     next if $cmd =~ m{/sbin/init|/lib/systemd|cron|sshd|mate-session|lxsession};
-    # First word of cmd as label
-    (my $label = $cmd) =~ s{^(\S+)\s.*$}{$1};
-    $label =~ s{^.*/}{};
-    push @{ $s->{cmds} }, $label;
+    # Drop sub-process helpers spawned by the main app.  The user-launched
+    # firefox/chrome/electron we want is the parent — its forked children
+    # carry -contentproc / --type=renderer-style flags.
+    next if $cmd =~ m{(?:crashhelper|-helper\b|RemoteSandbox|GMPProcess|NetworkBroker|content-process)};
+    next if $cmd =~ m{\s-contentproc\b|\s--type=\S};
+    push @{ $s->{cmds} }, $cmd;
+}
+
+# Pick the "main app" cmdline for each session.  Heuristic:
+#   1. Prefer cmds that aren't just a bare interactive shell.
+#   2. Among the rest, prefer the one with the most arguments — a user-
+#      invoked app like `thunderbird -P Calendar` carries args, while a
+#      window-manager / wrapper typically doesn't.
+#   3. Fall back to the first command if everything's a shell.
+sub _main_cmd {
+    my @cmds = @_;
+    return '' unless @cmds;
+    # Drop bare interactive shells with no args.
+    my @nonshell = grep {
+        $_ !~ m{^(?:/usr|/bin)?/?(?:bin/)?(?:bash|sh|csh|tcsh|zsh|ksh|fish)\s*(?:-\S+\s*)*$}
+    } @cmds;
+    @nonshell = @cmds unless @nonshell;
+    # De-prioritize shell -c wrappers — the user's "main app" is usually
+    # whatever a real GUI binary is, not the wrapping `sh -c '...'`.
+    my @shellc  = grep {  m{^(?:/usr|/bin)?/?(?:bin/)?(?:ba|c|t|z|k)?sh\s+-c\b} } @nonshell;
+    my @primary = grep { !m{^(?:/usr|/bin)?/?(?:bin/)?(?:ba|c|t|z|k)?sh\s+-c\b} } @nonshell;
+    my @ranked  = @primary ? @primary : @shellc;
+    # Pick the entry with the most arg tokens (longest user invocation).
+    return (sort { (() = $b =~ /\s\S/g) <=> (() = $a =~ /\s\S/g)
+                || length($b) <=> length($a) } @ranked)[0];
+}
+
+# Format the main cmd for display: basename + args, capped.
+sub _fmt_cmd {
+    my ($cmd, $max) = @_;
+    return '(daemons only)' unless length $cmd;
+    my ($argv0, $rest) = split /\s+/, $cmd, 2;
+    $argv0 =~ s{^.*/}{};
+    my $out = defined $rest && length $rest ? "$argv0 $rest" : $argv0;
+    $out =~ s/\s+$//;
+    $out = substr($out, 0, $max - 3) . '...' if length($out) > $max;
+    return $out;
 }
 
 my @sessions = values %by_session;
+
+# Stamp each session with an IP (looked up from candidates by name) and a
+# numeric display.  Drop displays under :20 unless --all was given —
+# they're presumed plain X (see kind heuristic above).
+my %ip_for_name = map { $_->{name} => $_->{ip} } @candidates;
+for my $s (@sessions) {
+    ($s->{disp_n}) = $s->{disp} =~ /^:(\d+)/;
+    $s->{ip}       = $ip_for_name{$s->{host}};
+}
+unless ($all) {
+    @sessions = grep { defined $_->{disp_n} && $_->{disp_n} >= 20 } @sessions;
+}
+
 @sessions = sort {
        ($a->{host} eq 'localhost' ? 0 : 1) <=> ($b->{host} eq 'localhost' ? 0 : 1)
     || $a->{host} cmp $b->{host}
-    || $a->{disp} cmp $b->{disp}
+    || $a->{disp_n} <=> $b->{disp_n}
 } @sessions;
 
-# Build display rows: keep cmds unique, cap length
+# Build display rows: pick a main cmd and format it.
 for my $s (@sessions) {
-    my %seen; my @uniq = grep { !$seen{$_}++ } @{ $s->{cmds} };
-    my $apps = join(',', @uniq) || '(daemons only)';
-    $apps = substr($apps, 0, 60) . '...' if length($apps) > 60;
-    $s->{apps} = $apps;
+    $s->{apps} = _fmt_cmd(_main_cmd(@{ $s->{cmds} }), 60);
 }
 
 unless (@sessions) {
@@ -236,19 +286,56 @@ my @zen = ('zenity', '--list', '--title', 'Attach to X11 session',
            '--print-column=ALL');
 push @zen, $_->{host}, $_->{disp}, $_->{kind}, $_->{user}, $_->{apps} for @sessions;
 
-open my $zh, '-|', @zen or die "zenity: $!";
-my $pick = <$zh>;
-close $zh;
-exit 1 unless defined $pick;
-chomp $pick;
-my ($host, $disp) = split /\|/, $pick;
-$disp =~ s/^://;     # xpra wants `100`, not `:100`, in URI form
+# Loop: show the chooser, fire off `xpra attach` as a detached child,
+# and re-show the chooser so the user can attach to several sessions.
+# Cancel/close the chooser to exit.
+while (1) {
+    open my $zh, '-|', @zen or die "zenity: $!";
+    my $pick = <$zh>;
+    close $zh;
+    last unless defined $pick;
+    chomp $pick;
+    next unless length $pick;
+    my ($host, $disp) = split /\|/, $pick;
+    my $disp_n = $disp;
+    $disp_n =~ s/^://;
 
-if ($host eq 'localhost') {
-    exec('xpra', 'attach', ":$disp");
-} else {
-    my $url = defined $ssh_user
-        ? "ssh://$ssh_user\@$host/$disp"
-        : "ssh://$host/$disp";
-    exec('xpra', 'attach', $url);
+    my @cmd;
+    if ($host eq 'localhost') {
+        @cmd = ('xpra', 'attach', ":$disp_n");
+    } else {
+        # Use the IP we discovered, not the hostname — names can be
+        # ambiguous across DNS / DHCP / mDNS, the IP is what we actually
+        # talked to.
+        my ($s) = grep { $_->{host} eq $host && $_->{disp} eq $disp } @sessions;
+        my $target = $s && $s->{ip} ? $s->{ip} : $host;
+        my $url = defined $ssh_user
+            ? "ssh://$ssh_user\@$target/$disp_n"
+            : "ssh://$target/$disp_n";
+        @cmd = ('xpra', 'attach', $url);
+    }
+    spawn_detached(@cmd);
+}
+exit 0;
+
+# Double-fork the command into its own session so it survives find-xpra
+# exiting and doesn't leave a zombie when the user closes the chooser.
+sub spawn_detached {
+    my @cmd = @_;
+    my $pid = fork;
+    die "fork: $!" unless defined $pid;
+    if ($pid) {
+        waitpid($pid, 0);    # immediate — intermediate exits right after second fork
+        return;
+    }
+    require POSIX;
+    POSIX::setsid();
+    my $pid2 = fork;
+    exit 1 unless defined $pid2;
+    exit 0 if $pid2;
+    open STDIN,  '<', '/dev/null';
+    open STDOUT, '>', '/dev/null';
+    open STDERR, '>', '/dev/null';
+    exec { $cmd[0] } @cmd;
+    exit 127;
 }
