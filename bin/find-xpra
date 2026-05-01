@@ -12,6 +12,7 @@ use warnings;
 use Getopt::Long qw(:config no_ignore_case no_bundling);
 use IO::Select;
 use IO::Pipe;
+use POSIX ();
 use lib '/usr/local/src/net-mgr/lib';
 use NetMgr::Client;
 
@@ -231,10 +232,12 @@ for my $r (@rows) {
     # is a heuristic; revisit if it's wrong often.
     my ($n) = $disp =~ /^:(\d+)$/;
     my $kind_default = (defined $n && $n >= 20) ? 'xpra' : 'X';
-    my $s = $by_session{$key} //= { host=>$host, disp=>$disp, user=>$user, cmds=>[], n=>0, kind=>$kind_default };
+    my $s = $by_session{$key} //= { host=>$host, disp=>$disp, user=>$user,
+                                     cmds=>[], procs=>[], n=>0, kind=>$kind_default };
     $s->{n}++;
+    push @{ $s->{procs} }, { pid => $pid, user => $user, cmd => $cmd };
     # Drop session-plumbing daemons; keep candidate "main apps" with args.
-    next if $cmd =~ m{\b(?:dbus-daemon|dbus-launch|dconf-service|gvfsd|gvfs-?\S*|xdg-\S+|ibus-\S+|pulseaudio|gnome-keyring|at-spi-\S+|xpra/?\S*daemonizer|sleep)\b};
+    next if $cmd =~ m{\b(?:dbus-daemon|dbus-launch|dconf-service|gvfsd|gvfs-?\S*|xdg-\S+|ibus-\S+|pulseaudio|gnome-keyring|at-spi\S*|xpra/?\S*daemonizer|sleep)\b};
     next if $cmd =~ m{/sbin/init|/lib/systemd|cron|sshd|mate-session|lxsession};
     # Drop sub-process helpers spawned by the main app.  The user-launched
     # firefox/chrome/electron we want is the parent — its forked children
@@ -252,6 +255,29 @@ for my $r (@rows) {
 #      invoked app like `thunderbird -P Calendar` carries args, while a
 #      window-manager / wrapper typically doesn't.
 #   3. Fall back to the first command if everything's a shell.
+# Known GUI applications — always beat generic / shell / network tools.
+my %gui_app = map { $_ => 1 } qw(
+    firefox firefox-bin firefox-esr iceweasel
+    chromium chromium-browser google-chrome chrome brave brave-browser
+    qutebrowser nyxt epiphany
+    thunderbird
+    code codium vscodium electron
+    libreoffice soffice loimpress lowriter localc
+    gimp inkscape blender krita
+    audacity vlc mpv totem
+    discord slack signal-desktop telegram-desktop element-desktop zoom
+    keepassxc gnumeric abiword
+    emacs gvim
+);
+
+sub _argv0_basename {
+    my ($cmd) = @_;
+    my ($a) = $cmd =~ /^(\S+)/;
+    return '' unless defined $a;
+    $a =~ s{^.*/}{};
+    return $a;
+}
+
 sub _main_cmd {
     my @cmds = @_;
     return '' unless @cmds;
@@ -260,6 +286,14 @@ sub _main_cmd {
         $_ !~ m{^(?:/usr|/bin)?/?(?:bin/)?(?:bash|sh|csh|tcsh|zsh|ksh|fish)\s*(?:-\S+\s*)*$}
     } @cmds;
     @nonshell = @cmds unless @nonshell;
+    # Tier 1: known GUI apps (firefox, thunderbird, code, ...) always
+    # beat ssh, vim-in-xterm, generic invocations, etc.  Among multiple
+    # GUI apps, longest invocation wins.
+    my @gui = grep { $gui_app{ _argv0_basename($_) } } @nonshell;
+    if (@gui) {
+        return (sort { (() = $b =~ /\s\S/g) <=> (() = $a =~ /\s\S/g)
+                    || length($b) <=> length($a) } @gui)[0];
+    }
     # De-prioritize shell -c wrappers — the user's "main app" is usually
     # whatever a real GUI binary is, not the wrapping `sh -c '...'`.
     my @shellc  = grep {  m{^(?:/usr|/bin)?/?(?:bin/)?(?:ba|c|t|z|k)?sh\s+-c\b} } @nonshell;
@@ -347,7 +381,7 @@ Tk->import;
 my $mw = MainWindow->new(-title => 'find-xpra: attach to X11 session');
 # Tk's stock default is Helvetica 9 / 10 — far too small on a modern display.
 $mw->optionAdd('*Font' => 'sans-serif 11');
-my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '');
+my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '', '', '');
 for my $i (0 .. $#cols) {
     $mw->Label(-text => $cols[$i], -font => 'sans-serif 11 bold',
                -relief => 'ridge', -padx => 6, -pady => 2)
@@ -361,12 +395,66 @@ for my $s (@sessions) {
            ->grid(-row => $r, -column => $c, -sticky => 'ew');
     }
     my $sess = $s;     # closure capture
-    $mw->Button(-text => 'Attach',
-                -command => sub { spawn_detached(_attach_cmd($sess)) })
-       ->grid(-row => $r, -column => $#cols, -padx => 6, -pady => 1, -sticky => 'ew');
+    $mw->Button(-text => 'Apps',
+                -command => sub { _show_procs($sess) })
+       ->grid(-row => $r, -column => 5, -padx => 6, -pady => 1, -sticky => 'ew');
+    my ($attach_btn, $disc_btn);
+    $attach_btn = $mw->Button(-text => 'Attach',
+        -command => sub {
+            my $pid = spawn_attach(_attach_cmd($sess));
+            $sess->{pid} = $pid;
+            $attach_btn->configure(-state => 'disabled');
+            $disc_btn->configure(-state => 'normal');
+        });
+    $disc_btn = $mw->Button(-text => 'Disconnect', -state => 'disabled',
+        -command => sub {
+            my $pid = $sess->{pid} or return;
+            kill 'TERM', $pid;          # closes the local viewer; remote
+                                        # xpra session keeps running.
+        });
+    $attach_btn->grid(-row => $r, -column => 6, -padx => 6, -pady => 1, -sticky => 'ew');
+    $disc_btn  ->grid(-row => $r, -column => 7, -padx => 6, -pady => 1, -sticky => 'ew');
+    $sess->{_attach_btn} = $attach_btn;
+    $sess->{_disc_btn}   = $disc_btn;
     $r++;
 }
+
+# Reap exited xpra-attach children so the UI flips back when the viewer
+# closes on its own (remote disconnects, user closed the xpra window, ...).
+$mw->repeat(750, sub {
+    for my $s (@sessions) {
+        my $pid = $s->{pid} // next;
+        my $r = waitpid($pid, POSIX::WNOHANG());
+        if ($r != 0) {
+            $s->{pid} = undef;
+            $s->{_attach_btn}->configure(-state => 'normal');
+            $s->{_disc_btn}  ->configure(-state => 'disabled');
+        }
+    }
+});
+
 Tk::MainLoop();
+
+# Pop up a window with every process on this (host, display).  Useful
+# when the picked "main app" doesn't represent what's really running.
+sub _show_procs {
+    my ($s) = @_;
+    my $top = $mw->Toplevel(-title => "$s->{host} $s->{disp} — all processes");
+    my $txt = $top->Scrolled('Text',
+                             -scrollbars => 'osoe',
+                             -width      => 110,
+                             -height     => 25,
+                             -font       => 'monospace 10',
+                             -wrap       => 'none',
+                            )->pack(-fill => 'both', -expand => 1);
+    for my $p (@{ $s->{procs} }) {
+        $txt->insert('end', sprintf("%7d  %-10s  %s\n",
+                     $p->{pid}, $p->{user}, $p->{cmd}));
+    }
+    $txt->configure(-state => 'disabled');
+    $top->Button(-text => 'Close', -command => sub { $top->destroy })
+        ->pack(-pady => 4);
+}
 exit 0;
 
 sub _attach_cmd {
@@ -383,21 +471,16 @@ sub _attach_cmd {
     return ('xpra', 'attach', $url);
 }
 
-# Double-fork the command into its own session so it survives find-xpra
-# exiting and doesn't leave a zombie when the user closes the chooser.
-sub spawn_detached {
+# Spawn an xpra-attach child in its own session (so it keeps running if
+# find-xpra exits or the controlling terminal closes) and return the
+# child PID.  Caller is expected to waitpid(WNOHANG) it from the Tk
+# repeat-timer when the viewer exits.
+sub spawn_attach {
     my @cmd = @_;
     my $pid = fork;
     die "fork: $!" unless defined $pid;
-    if ($pid) {
-        waitpid($pid, 0);    # immediate — intermediate exits right after second fork
-        return;
-    }
-    require POSIX;
+    return $pid if $pid;
     POSIX::setsid();
-    my $pid2 = fork;
-    exit 1 unless defined $pid2;
-    exit 0 if $pid2;
     open STDIN,  '<', '/dev/null';
     open STDOUT, '>', '/dev/null';
     open STDERR, '>', '/dev/null';
