@@ -2,6 +2,19 @@
 
 if ($ns) { $ENV{DONT_SUDO} = 1; }
 
+# -id: emit a header line identifying this host so a discovery tool
+# (e.g. find-xpra) can dedupe results from multiple network aliases of
+# the same physical machine.  Uses /etc/machine-id (stable across reboots
+# and independent of DNS / DHCP-supplied hostnames).
+if ($id) {
+    chomp(my $h = `hostname` // '');
+    my $mid = '';
+    if (open my $f, '<', '/etc/machine-id') {
+        chomp($mid = <$f> // '');
+    }
+    print "# host: $h id: $mid\n";
+}
+
 chdir("/proc");
 
 @p = glob("{1,2,3,4,5,6,7,8,9}*");

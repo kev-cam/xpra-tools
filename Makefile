@@ -76,7 +76,7 @@ deps:
 	check 'command -v ip'    iproute2   'ip command (subnet discovery)'; \
 	check '/usr/bin/perl -MNetMgr::Client -I$(NETMGR_PERL5DIR) -e 1' \
 	                         net-mgr    "NetMgr::Client at $(NETMGR_PERL5DIR) (install net-mgr)"; \
-	check_opt 'command -v zenity' zenity 'zenity — needed for the find-xpra menu (text fallback: --list)'; \
+	check '/usr/bin/perl -MTk -e 1' libtk-perl 'Perl/Tk (find-xpra chooser window)'; \
 	check_opt 'command -v nmap'   nmap   'nmap — fallback discovery if NET_MGR_LISTEN unset'; \
 	check_opt 'command -v sudo-cat' sudo-cat 'sudo-cat — required by show-x11 to read /proc/*/cmdline'; \
 	miss=$$(echo $$miss | tr ' ' '\n' | sort -u | tr '\n' ' '); \

@@ -128,17 +128,19 @@ for my $c (@candidates) {
         open STDERR, '>', '/dev/null';
         my $target = defined $ssh_user ? "$ssh_user\@$c->{ip}" : $c->{ip};
         my @cmd = $c->{local}
-            ? ('show-x11', '-ns')
+            ? ('show-x11', '-ns', '-id')
             : ('ssh',
                '-o', "ConnectTimeout=$ssh_to",
                '-o', 'BatchMode=yes',
                '-o', 'StrictHostKeyChecking=accept-new',
-               $target, 'show-x11', '-ns');
+               $target, 'show-x11', '-ns', '-id');
         if (open my $oh, '-|', @cmd) {
             my $disp;
             while (defined(my $line = <$oh>)) {
                 chomp $line;
-                if ($line =~ /^(:\d+)\s*$/) {
+                if ($line =~ /^#\s*host:\s*(\S*)\s+id:\s*(\S*)/) {
+                    print { $pipe } join("\t", '__id', $c->{name}, $1, $2), "\n";
+                } elsif ($line =~ /^(:\d+)\s*$/) {
                     $disp = $1;
                 } elsif (defined $disp
                          && $line =~ /^\s+(\d+)\s+(\S+)\s+(.+?)\s*$/) {
@@ -155,6 +157,8 @@ for my $c (@candidates) {
 }
 
 my @rows;
+my %remote_id;       # candidate-name -> machine-id (from `show-x11 -id`)
+my %remote_host;     # candidate-name -> remote `hostname`
 my %buf;
 my $deadline = time + $overall_to;
 while ($sel->count) {
@@ -167,13 +171,54 @@ while ($sel->count) {
         if (!$n) { $sel->remove($h); close $h; next }
         $buf{0+$h} .= $chunk;
         while ($buf{0+$h} =~ s/^([^\n]*)\n//) {
-            my @f = split /\t/, $1, 5;
-            push @rows, \@f if @f == 5;
+            my $line = $1;
+            if ($line =~ /^__id\t([^\t]*)\t([^\t]*)\t([^\t]*)$/) {
+                $remote_host{$1} = $2;
+                $remote_id{$1}   = $3;
+            } else {
+                my @f = split /\t/, $line, 5;
+                push @rows, \@f if @f == 5;
+            }
         }
     }
 }
 for my $pid (keys %pid_for) {
     kill 'TERM', $pid if waitpid($pid, 1) == 0;
+}
+
+# Dedupe aliased hosts: every show-x11 -id call printed `# host: H id: M`
+# from /etc/machine-id.  Hosts sharing a machine-id are aliases for the
+# same physical box (e.g. nas3-up / nas3-down on different NICs).  Pick
+# the remote-reported hostname as canonical when available; otherwise
+# the candidate name with no dashes / shortest.
+{
+    my %hosts_by_id;
+    push @{ $hosts_by_id{$remote_id{$_}} }, $_
+        for grep { defined $remote_id{$_} && length $remote_id{$_} } keys %remote_id;
+
+    my %canonical;
+    for my $id (keys %hosts_by_id) {
+        my @group = @{ $hosts_by_id{$id} };
+        next unless @group > 1;
+        my $canon;
+        # Prefer the host's own self-reported name if any group member
+        # reported one (and it's reachable in this run).
+        for my $h (@group) {
+            if (defined $remote_host{$h} && length $remote_host{$h}) {
+                $canon = $remote_host{$h};
+                last;
+            }
+        }
+        $canon //= (sort {
+               (($a =~ /-/ ? 1 : 0) <=> ($b =~ /-/ ? 1 : 0))
+            || (length($a) <=> length($b))
+            || ($a cmp $b)
+        } @group)[0];
+        $canonical{$_} = $canon for @group;
+    }
+    if (%canonical) {
+        $_->[0] = $canonical{$_->[0]} // $_->[0] for @rows;
+    }
 }
 
 # Aggregate process rows into one entry per (host, display).
@@ -196,6 +241,8 @@ for my $r (@rows) {
     # carry -contentproc / --type=renderer-style flags.
     next if $cmd =~ m{(?:crashhelper|-helper\b|RemoteSandbox|GMPProcess|NetworkBroker|content-process)};
     next if $cmd =~ m{\s-contentproc\b|\s--type=\S};
+    # X / VNC servers are session infrastructure, not user-launched apps.
+    next if $cmd =~ m{^(?:\S*/)?(?:Xvnc|Xtightvnc|x11vnc|Xvfb|Xorg|Xtigervnc|krfb|vino-server|tigervncserver)\b};
     push @{ $s->{cmds} }, $cmd;
 }
 
@@ -260,9 +307,21 @@ for my $s (@sessions) {
     $s->{apps} = _fmt_cmd(_main_cmd(@{ $s->{cmds} }), 60);
 }
 
+# Drop sessions whose only contents are session plumbing (no real app to
+# attach to).  --all keeps them.
+unless ($all) {
+    @sessions = grep { $_->{apps} ne '(daemons only)' } @sessions;
+}
+
 unless (@sessions) {
     if ($list_only) { print STDERR "no X11/xpra sessions found\n"; exit 1 }
-    system('zenity', '--info', '--text', 'No X11/xpra sessions found.');
+    require Tk;
+    Tk->import;
+    my $mw = MainWindow->new(-title => 'find-xpra');
+    $mw->Label(-text => 'No X11/xpra sessions found.', -padx => 30, -pady => 30)
+       ->pack;
+    $mw->Button(-text => 'Close', -command => sub { exit 1 })->pack(-pady => 6);
+    Tk::MainLoop();
     exit 1;
 }
 
@@ -276,47 +335,53 @@ if ($list_only) {
     exit 0;
 }
 
-# --- pop up zenity chooser ------------------------------------------------
+# --- pop up Tk chooser ----------------------------------------------------
+#
+# A row per session, with an [Attach] button at the end of each row.
+# Clicking [Attach] fires `xpra attach …` as a detached child and leaves
+# the window up so several sessions can be attached.  Closing the window
+# (regular decoration) ends the program.
 
-my @zen = ('zenity', '--list', '--title', 'Attach to X11 session',
-           '--width', '800', '--height', '450',
-           '--column', 'Host', '--column', 'Display',
-           '--column', 'Kind', '--column', 'User',
-           '--column', 'Apps',
-           '--print-column=ALL');
-push @zen, $_->{host}, $_->{disp}, $_->{kind}, $_->{user}, $_->{apps} for @sessions;
-
-# Loop: show the chooser, fire off `xpra attach` as a detached child,
-# and re-show the chooser so the user can attach to several sessions.
-# Cancel/close the chooser to exit.
-while (1) {
-    open my $zh, '-|', @zen or die "zenity: $!";
-    my $pick = <$zh>;
-    close $zh;
-    last unless defined $pick;
-    chomp $pick;
-    next unless length $pick;
-    my ($host, $disp) = split /\|/, $pick;
-    my $disp_n = $disp;
-    $disp_n =~ s/^://;
-
-    my @cmd;
-    if ($host eq 'localhost') {
-        @cmd = ('xpra', 'attach', ":$disp_n");
-    } else {
-        # Use the IP we discovered, not the hostname — names can be
-        # ambiguous across DNS / DHCP / mDNS, the IP is what we actually
-        # talked to.
-        my ($s) = grep { $_->{host} eq $host && $_->{disp} eq $disp } @sessions;
-        my $target = $s && $s->{ip} ? $s->{ip} : $host;
-        my $url = defined $ssh_user
-            ? "ssh://$ssh_user\@$target/$disp_n"
-            : "ssh://$target/$disp_n";
-        @cmd = ('xpra', 'attach', $url);
-    }
-    spawn_detached(@cmd);
+require Tk;
+Tk->import;
+my $mw = MainWindow->new(-title => 'find-xpra: attach to X11 session');
+# Tk's stock default is Helvetica 9 / 10 — far too small on a modern display.
+$mw->optionAdd('*Font' => 'sans-serif 11');
+my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '');
+for my $i (0 .. $#cols) {
+    $mw->Label(-text => $cols[$i], -font => 'sans-serif 11 bold',
+               -relief => 'ridge', -padx => 6, -pady => 2)
+       ->grid(-row => 0, -column => $i, -sticky => 'ew');
 }
+my $r = 1;
+for my $s (@sessions) {
+    my @vals = ($s->{host}, $s->{disp}, $s->{kind}, $s->{user}, $s->{apps});
+    for my $c (0 .. $#vals) {
+        $mw->Label(-text => $vals[$c], -anchor => 'w', -padx => 6)
+           ->grid(-row => $r, -column => $c, -sticky => 'ew');
+    }
+    my $sess = $s;     # closure capture
+    $mw->Button(-text => 'Attach',
+                -command => sub { spawn_detached(_attach_cmd($sess)) })
+       ->grid(-row => $r, -column => $#cols, -padx => 6, -pady => 1, -sticky => 'ew');
+    $r++;
+}
+Tk::MainLoop();
 exit 0;
+
+sub _attach_cmd {
+    my ($s) = @_;
+    (my $disp_n = $s->{disp}) =~ s/^://;
+    return ('xpra', 'attach', ":$disp_n") if $s->{host} eq 'localhost';
+    # Use the IP we discovered, not the hostname — names can be
+    # ambiguous across DNS / DHCP / mDNS, the IP is what we actually
+    # talked to.
+    my $target = $s->{ip} // $s->{host};
+    my $url = defined $ssh_user
+        ? "ssh://$ssh_user\@$target/$disp_n"
+        : "ssh://$target/$disp_n";
+    return ('xpra', 'attach', $url);
+}
 
 # Double-fork the command into its own session so it survives find-xpra
 # exiting and doesn't leave a zombie when the user closes the chooser.
