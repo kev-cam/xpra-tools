@@ -1,0 +1,250 @@
+#!/usr/bin/perl
+# find-xpra — discover X11/xpra sessions across the network and pop up
+# a chooser to attach.
+#
+# Discovery: query net-mgr for online machines with tcp/22 open (skip APs),
+# then `ssh host show-x11 -ns` in parallel and aggregate.  Local sessions
+# are included by running show-x11 directly.  Choice pops up a zenity menu;
+# selection runs `xpra attach ssh://HOST/DISPLAY` (or local `:DISPLAY`).
+
+use strict;
+use warnings;
+use Getopt::Long qw(:config no_ignore_case no_bundling);
+use IO::Select;
+use IO::Pipe;
+use lib '/usr/local/src/net-mgr/lib';
+use NetMgr::Client;
+
+my $listen     = $ENV{NET_MGR_LISTEN};
+my $ssh_user;             # undef → let ssh_config(5) pick the user
+my $ssh_to     = 3;
+my $overall_to = 8;
+my $list_only;
+my $no_local;
+my $help;
+
+GetOptions(
+    'listen=s'   => \$listen,
+    'ssh-user=s' => \$ssh_user,
+    'timeout=i'  => \$ssh_to,
+    'list'       => \$list_only,
+    'no-local'   => \$no_local,
+    'h|help'     => \$help,
+) or die usage();
+print(usage()), exit 0 if $help;
+
+sub usage { <<'EOF' }
+usage: find-xpra [options]
+  --listen HOST:PORT  net-mgr address (default: nmap-discovered or $NET_MGR_LISTEN)
+  --ssh-user USER     override ssh user (default: from ssh_config(5))
+  --timeout SEC       per-host ssh ConnectTimeout (default: 3)
+  --list              print rows to stdout instead of popping a chooser
+  --no-local          skip local show-x11 probe
+  -h, --help          this message
+EOF
+
+sub find_net_mgr {
+    # nmap the local /24 for port 7531/tcp.  Returns 'host:port' or undef.
+    my $src;
+    if (open my $rh, '-|', 'ip', 'route', 'get', '1.1.1.1') {
+        while (<$rh>) { $src = $1, last if /\bsrc\s+(\S+)/ }
+    }
+    return undef unless $src;
+    (my $subnet = $src) =~ s{\.\d+$}{.0/24};
+    my @hosts;
+    if (open my $nh, '-|',
+        'nmap', '-Pn', '-T4', '-n', '-p', '7531', '--open', '-oG', '-', $subnet) {
+        while (<$nh>) {
+            if (/^Host:\s+(\S+).*7531\/open/) { push @hosts, $1 }
+        }
+        close $nh;
+    }
+    return @hosts ? "$hosts[0]:7531" : undef;
+}
+
+# --- discover candidate hosts via net-mgr ---------------------------------
+
+unless (defined $listen) {
+    $listen = find_net_mgr() or die "no net-mgr server found on local subnet\n";
+}
+
+my $cli = NetMgr::Client->new(listen => $listen);
+$cli->hello(consumer => "net-show-x11.$$");
+my $machines = $cli->snapshot(1, 'machines');
+my $ifaces   = $cli->snapshot(2, 'interfaces');
+my $addrs    = $cli->snapshot(3, 'addresses', where => "family = 'v4'");
+my $ports22  = $cli->snapshot(4, 'ports', where => "port = 22");
+my $aps      = $cli->snapshot(5, 'aps');
+$cli->bye;
+
+my %ap_mac  = map { $_->{mac} => 1 } @$aps;
+my %ssh_mac = map { $_->{mac} => 1 } @$ports22;
+my %ip_for;
+for my $a (@$addrs) {
+    push @{ $ip_for{$a->{mac}} }, $a->{addr};
+}
+my %macs_of;
+for my $i (@$ifaces) {
+    next unless defined $i->{machine_id};
+    push @{ $macs_of{$i->{machine_id}} }, $i->{mac};
+}
+
+my @candidates;
+for my $m (@$machines) {
+    next unless $m->{online};
+    my $best_ip;
+    for my $mac (@{ $macs_of{$m->{id}} || [] }) {
+        next if $ap_mac{$mac};
+        next unless $ssh_mac{$mac};
+        ($best_ip) = sort @{ $ip_for{$mac} || [] };
+        last if defined $best_ip;
+    }
+    next unless defined $best_ip;
+    push @candidates, { name => $m->{primary_name} // $best_ip, ip => $best_ip };
+}
+# The net-mgr host itself isn't in its own inventory — add it explicitly.
+my ($mgr_host) = split /:/, $listen, 2;
+unless (grep { ($_->{name} // '') eq $mgr_host || ($_->{ip} // '') eq $mgr_host } @candidates) {
+    push @candidates, { name => $mgr_host, ip => $mgr_host };
+}
+
+unless ($no_local) {
+    push @candidates, { name => 'localhost', ip => undef, local => 1 };
+}
+
+# --- parallel show-x11 probe ----------------------------------------------
+
+my $sel = IO::Select->new;
+my %pid_for;
+for my $c (@candidates) {
+    my $pipe = IO::Pipe->new;
+    my $pid  = fork;
+    die "fork: $!" unless defined $pid;
+    if (!$pid) {
+        $pipe->writer;
+        open STDERR, '>', '/dev/null';
+        my $target = defined $ssh_user ? "$ssh_user\@$c->{ip}" : $c->{ip};
+        my @cmd = $c->{local}
+            ? ('show-x11', '-ns')
+            : ('ssh',
+               '-o', "ConnectTimeout=$ssh_to",
+               '-o', 'BatchMode=yes',
+               '-o', 'StrictHostKeyChecking=accept-new',
+               $target, 'show-x11', '-ns');
+        if (open my $oh, '-|', @cmd) {
+            my $disp;
+            while (defined(my $line = <$oh>)) {
+                chomp $line;
+                if ($line =~ /^(:\d+)\s*$/) {
+                    $disp = $1;
+                } elsif (defined $disp
+                         && $line =~ /^\s+(\d+)\s+(\S+)\s+(.+?)\s*$/) {
+                    print { $pipe } join("\t", $c->{name}, $disp, $1, $2, $3), "\n";
+                }
+            }
+            close $oh;
+        }
+        exit 0;
+    }
+    $pipe->reader;
+    $sel->add($pipe);
+    $pid_for{$pid} = $pipe;
+}
+
+my @rows;
+my %buf;
+my $deadline = time + $overall_to;
+while ($sel->count) {
+    my $remain = $deadline - time;
+    last if $remain <= 0;
+    my @ready = $sel->can_read($remain);
+    last unless @ready;
+    for my $h (@ready) {
+        my $n = sysread($h, my $chunk, 4096);
+        if (!$n) { $sel->remove($h); close $h; next }
+        $buf{0+$h} .= $chunk;
+        while ($buf{0+$h} =~ s/^([^\n]*)\n//) {
+            my @f = split /\t/, $1, 5;
+            push @rows, \@f if @f == 5;
+        }
+    }
+}
+for my $pid (keys %pid_for) {
+    kill 'TERM', $pid if waitpid($pid, 1) == 0;
+}
+
+# Aggregate process rows into one entry per (host, display).
+my %by_session;       # "$host\t$disp" -> { host, disp, kind, user, cmds, n }
+for my $r (@rows) {
+    my ($host, $disp, $pid, $user, $cmd) = @$r;
+    my $key = "$host\t$disp";
+    my $s = $by_session{$key} //= { host=>$host, disp=>$disp, user=>$user, cmds=>[], n=>0, kind=>'X' };
+    $s->{n}++;
+    $s->{kind} = 'xpra' if $cmd =~ m{(?:^|/)xpra(?:[/-]|\b)};
+    # collect "interesting" commands — drop common desktop/session daemons
+    next if $cmd =~ m{^(?:/usr|/bin|/sbin)?/?(?:libexec/)?(?:dbus-daemon|dbus-launch|dconf-service|gvfsd|gvfsd-fuse|xdg-\S+|ibus-\S+|pulseaudio|gnome-keyring-daemon|at-spi-\S+|xpra/\S*daemonizer|/usr/bin/python\S*\s+/usr/libexec/xpra/daemonizer)\b};
+    next if $cmd =~ m{\b(?:dbus-daemon|dbus-launch|dconf-service|gvfsd|gvfs-?\S*|xdg-\S+|ibus-\S+|pulseaudio|gnome-keyring|at-spi-\S+|xpra-daemonizer|xpra/daemonizer|sleep)\b};
+    next if $cmd =~ m{/sbin/init|/lib/systemd|cron|sshd|mate-session|lxsession};
+    # First word of cmd as label
+    (my $label = $cmd) =~ s{^(\S+)\s.*$}{$1};
+    $label =~ s{^.*/}{};
+    push @{ $s->{cmds} }, $label;
+}
+
+my @sessions = values %by_session;
+@sessions = sort {
+       ($a->{host} eq 'localhost' ? 0 : 1) <=> ($b->{host} eq 'localhost' ? 0 : 1)
+    || $a->{host} cmp $b->{host}
+    || $a->{disp} cmp $b->{disp}
+} @sessions;
+
+# Build display rows: keep cmds unique, cap length
+for my $s (@sessions) {
+    my %seen; my @uniq = grep { !$seen{$_}++ } @{ $s->{cmds} };
+    my $apps = join(',', @uniq) || '(daemons only)';
+    $apps = substr($apps, 0, 60) . '...' if length($apps) > 60;
+    $s->{apps} = $apps;
+}
+
+unless (@sessions) {
+    if ($list_only) { print STDERR "no X11/xpra sessions found\n"; exit 1 }
+    system('zenity', '--info', '--text', 'No X11/xpra sessions found.');
+    exit 1;
+}
+
+if ($list_only) {
+    printf "%-16s %-6s %-5s %-8s %-4s %s\n",
+        'HOST','DISP','KIND','USER','PROC','APPS';
+    for my $s (@sessions) {
+        printf "%-16s %-6s %-5s %-8s %-4d %s\n",
+            $s->{host}, $s->{disp}, $s->{kind}, $s->{user}, $s->{n}, $s->{apps};
+    }
+    exit 0;
+}
+
+# --- pop up zenity chooser ------------------------------------------------
+
+my @zen = ('zenity', '--list', '--title', 'Attach to X11 session',
+           '--width', '800', '--height', '450',
+           '--column', 'Host', '--column', 'Display',
+           '--column', 'Kind', '--column', 'User',
+           '--column', 'Apps',
+           '--print-column=ALL');
+push @zen, $_->{host}, $_->{disp}, $_->{kind}, $_->{user}, $_->{apps} for @sessions;
+
+open my $zh, '-|', @zen or die "zenity: $!";
+my $pick = <$zh>;
+close $zh;
+exit 1 unless defined $pick;
+chomp $pick;
+my ($host, $disp) = split /\|/, $pick;
+$disp =~ s/^://;     # xpra wants `100`, not `:100`, in URI form
+
+if ($host eq 'localhost') {
+    exec('xpra', 'attach', ":$disp");
+} else {
+    my $url = defined $ssh_user
+        ? "ssh://$ssh_user\@$host/$disp"
+        : "ssh://$host/$disp";
+    exec('xpra', 'attach', $url);
+}
