@@ -178,9 +178,13 @@ my %by_session;       # "$host\t$disp" -> { host, disp, kind, user, cmds, n }
 for my $r (@rows) {
     my ($host, $disp, $pid, $user, $cmd) = @$r;
     my $key = "$host\t$disp";
-    my $s = $by_session{$key} //= { host=>$host, disp=>$disp, user=>$user, cmds=>[], n=>0, kind=>'X' };
+    # Default kind by display number: <:20 is presumed plain X, :20+ is
+    # presumed xpra.  We're not running `xpra list` on the remote, so this
+    # is a heuristic; revisit if it's wrong often.
+    my ($n) = $disp =~ /^:(\d+)$/;
+    my $kind_default = (defined $n && $n >= 20) ? 'xpra' : 'X';
+    my $s = $by_session{$key} //= { host=>$host, disp=>$disp, user=>$user, cmds=>[], n=>0, kind=>$kind_default };
     $s->{n}++;
-    $s->{kind} = 'xpra' if $cmd =~ m{(?:^|/)xpra(?:[/-]|\b)};
     # collect "interesting" commands — drop common desktop/session daemons
     next if $cmd =~ m{^(?:/usr|/bin|/sbin)?/?(?:libexec/)?(?:dbus-daemon|dbus-launch|dconf-service|gvfsd|gvfsd-fuse|xdg-\S+|ibus-\S+|pulseaudio|gnome-keyring-daemon|at-spi-\S+|xpra/\S*daemonizer|/usr/bin/python\S*\s+/usr/libexec/xpra/daemonizer)\b};
     next if $cmd =~ m{\b(?:dbus-daemon|dbus-launch|dconf-service|gvfsd|gvfs-?\S*|xdg-\S+|ibus-\S+|pulseaudio|gnome-keyring|at-spi-\S+|xpra-daemonizer|xpra/daemonizer|sleep)\b};
