@@ -18,6 +18,9 @@ use File::Path qw(make_path);
 use lib '/usr/local/src/net-mgr/lib';
 use NetMgr::Client;
 
+# Snapshot before GetOptions consumes it; needed to re-exec on Rescan.
+my @ORIG_ARGV = @ARGV;
+
 # Persisted per-host preferences live in ~/.config/find-xpra/config.json:
 #   { "nas3": { "terminal": "mate-terminal" }, ... }
 # `*` is the wildcard-default key.
@@ -391,12 +394,22 @@ my $mw = MainWindow->new(-title => 'find-xpra: attach to X11 session');
 # Tk's stock default is Helvetica 9 / 10 — far too small on a modern display.
 $mw->optionAdd('*Font' => 'sans-serif 11');
 my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '', '', '', '', '');
+
+# Rescan: re-exec self with the same args.  Discovery runs again and the
+# UI rebuilds.  In-flight xpra-attach children are setsid'd so they
+# survive the exec; their Disconnect tracking is lost (close the viewer
+# via xpra's own UI in that case).
+$mw->Button(-text => 'Rescan',
+            -command => sub { exec { $^X } $^X, $0, @ORIG_ARGV })
+   ->grid(-row => 0, -column => 0, -columnspan => scalar(@cols),
+          -sticky => 'ew', -padx => 6, -pady => 4);
+
 for my $i (0 .. $#cols) {
     $mw->Label(-text => $cols[$i], -font => 'sans-serif 11 bold',
                -relief => 'ridge', -padx => 6, -pady => 2)
-       ->grid(-row => 0, -column => $i, -sticky => 'ew');
+       ->grid(-row => 1, -column => $i, -sticky => 'ew');
 }
-my $r = 1;
+my $r = 2;
 for my $s (@sessions) {
     my @vals = ($s->{host}, $s->{disp}, $s->{kind}, $s->{user}, $s->{apps});
     for my $c (0 .. $#vals) {
