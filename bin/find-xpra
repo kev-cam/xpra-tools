@@ -13,8 +13,17 @@ use Getopt::Long qw(:config no_ignore_case no_bundling);
 use IO::Select;
 use IO::Pipe;
 use POSIX ();
+use JSON::PP qw(encode_json decode_json);
+use File::Path qw(make_path);
 use lib '/usr/local/src/net-mgr/lib';
 use NetMgr::Client;
+
+# Persisted per-host preferences live in ~/.config/find-xpra/config.json:
+#   { "nas3": { "terminal": "mate-terminal" }, ... }
+# `*` is the wildcard-default key.
+my $CONFIG_DIR  = ($ENV{XDG_CONFIG_HOME} // "$ENV{HOME}/.config") . '/find-xpra';
+my $CONFIG_PATH = "$CONFIG_DIR/config.json";
+my $SETTINGS    = _load_settings();
 
 my $listen     = $ENV{NET_MGR_LISTEN};
 my $ssh_user;             # undef → let ssh_config(5) pick the user
@@ -381,7 +390,7 @@ Tk->import;
 my $mw = MainWindow->new(-title => 'find-xpra: attach to X11 session');
 # Tk's stock default is Helvetica 9 / 10 — far too small on a modern display.
 $mw->optionAdd('*Font' => 'sans-serif 11');
-my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '', '', '', '');
+my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '', '', '', '', '');
 for my $i (0 .. $#cols) {
     $mw->Label(-text => $cols[$i], -font => 'sans-serif 11 bold',
                -relief => 'ridge', -padx => 6, -pady => 2)
@@ -401,6 +410,9 @@ for my $s (@sessions) {
     $mw->Button(-text => 'Terminal',
                 -command => sub { spawn_detached(_term_cmd($sess)) })
        ->grid(-row => $r, -column => 6, -padx => 6, -pady => 1, -sticky => 'ew');
+    $mw->Button(-text => 'Settings',
+                -command => sub { _show_settings($sess) })
+       ->grid(-row => $r, -column => 7, -padx => 6, -pady => 1, -sticky => 'ew');
     my ($attach_btn, $disc_btn);
     $attach_btn = $mw->Button(-text => 'Attach',
         -command => sub {
@@ -415,8 +427,8 @@ for my $s (@sessions) {
             kill 'TERM', $pid;          # closes the local viewer; remote
                                         # xpra session keeps running.
         });
-    $attach_btn->grid(-row => $r, -column => 7, -padx => 6, -pady => 1, -sticky => 'ew');
-    $disc_btn  ->grid(-row => $r, -column => 8, -padx => 6, -pady => 1, -sticky => 'ew');
+    $attach_btn->grid(-row => $r, -column => 8, -padx => 6, -pady => 1, -sticky => 'ew');
+    $disc_btn  ->grid(-row => $r, -column => 9, -padx => 6, -pady => 1, -sticky => 'ew');
     $sess->{_attach_btn} = $attach_btn;
     $sess->{_disc_btn}   = $disc_btn;
     $r++;
@@ -437,6 +449,35 @@ $mw->repeat(750, sub {
 });
 
 Tk::MainLoop();
+
+# Pop up a per-host settings window — currently just terminal choice,
+# but designed to grow.  Saves to ~/.config/find-xpra/config.json on Save.
+sub _show_settings {
+    my ($s) = @_;
+    my $host = $s->{host};
+    my $top  = $mw->Toplevel(-title => "find-xpra: settings for $host");
+    $top->Label(-text => "Terminal for $host:",
+                -font => 'sans-serif 11 bold')
+        ->pack(-anchor => 'w', -padx => 12, -pady => 6);
+
+    my @choices = qw(xterm mate-terminal gnome-terminal urxvt
+                     alacritty kitty terminator lxterminal st);
+    my $sel = _terminal_for($host);
+    for my $t (@choices) {
+        $top->Radiobutton(-text => $t, -value => $t, -variable => \$sel,
+                          -anchor => 'w')
+            ->pack(-fill => 'x', -padx => 30);
+    }
+
+    my $btns = $top->Frame->pack(-pady => 10);
+    $btns->Button(-text => 'Save', -command => sub {
+        $SETTINGS->{$host}{terminal} = $sel;
+        _save_settings($SETTINGS);
+        $top->destroy;
+    })->pack(-side => 'left', -padx => 6);
+    $btns->Button(-text => 'Cancel', -command => sub { $top->destroy })
+         ->pack(-side => 'left', -padx => 6);
+}
 
 # Pop up a window with every process on this (host, display).  Useful
 # when the picked "main app" doesn't represent what's really running.
@@ -478,19 +519,52 @@ sub _attach_cmd {
 # Uses the `( cmd & )` subshell-background idiom so the launching shell
 # can exit immediately (and ssh with it).  Forces bash because the
 # remote login shell may be csh/tcsh.
+sub _load_settings {
+    return {} unless -f $CONFIG_PATH;
+    open my $fh, '<', $CONFIG_PATH or return {};
+    local $/; my $json = <$fh>;
+    close $fh;
+    return eval { decode_json($json) } // {};
+}
+
+sub _save_settings {
+    my ($s) = @_;
+    make_path($CONFIG_DIR);
+    open my $fh, '>', $CONFIG_PATH or do { warn "save: $!"; return };
+    print $fh encode_json($s);
+    close $fh;
+}
+
+sub _terminal_for {
+    my ($host) = @_;
+    return $SETTINGS->{$host}{terminal}
+        // $SETTINGS->{'*'}{terminal}
+        // 'xterm';
+}
+
 sub _term_cmd {
     my ($s) = @_;
     (my $disp_n = $s->{disp}) =~ s/^://;
-    my $bash = qq{(xterm -display :$disp_n &)};
+    my $term = _terminal_for($s->{host});
+    # mate-terminal / gnome-terminal don't accept `-display`; they use
+    # the DISPLAY env var.  xterm accepts both — we use env-var form so
+    # one launch line works for everything.
+    my $cmd = "(DISPLAY=:$disp_n $term &)";
     if ($s->{host} eq 'localhost') {
-        return ('bash', '-c', $bash);
+        # Perl exec hands $cmd to bash directly — no shell re-tokenisation,
+        # so no extra quoting needed.
+        return ('bash', '-c', $cmd);
     }
     my $target = $s->{ip} // $s->{host};
     my @ssh_target = defined $ssh_user ? ("$ssh_user\@$target") : ($target);
+    # ssh joins everything after the target with spaces and ships it to
+    # the remote shell, which re-parses.  Without literal single quotes
+    # around the bash arg, the remote shell would interpret the parens
+    # as a subshell of *its own* and bash -c would get an empty arg.
     return ('ssh',
             '-o', 'BatchMode=yes',
             '-o', 'StrictHostKeyChecking=accept-new',
-            @ssh_target, 'bash', '-c', $bash);
+            @ssh_target, 'bash', '-c', "'$cmd'");
 }
 
 # Fire-and-forget spawn (no PID tracking, no zombie).  Double-fork into
