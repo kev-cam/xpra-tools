@@ -139,6 +139,11 @@ for my $c (@candidates) {
     if (!$pid) {
         $pipe->writer;
         open STDERR, '>', '/dev/null';
+        # Defensive self-kill: if we're still alive past the global
+        # deadline, take ourselves out so a stuck ssh can't pin a fd or
+        # leave a process around.
+        $SIG{ALRM} = sub { exit 1 };
+        alarm($overall_to + 1);
         my $target = defined $ssh_user ? "$ssh_user\@$c->{ip}" : $c->{ip};
         my @cmd = $c->{local}
             ? ('show-x11', '-ns', '-id')
@@ -146,6 +151,13 @@ for my $c (@candidates) {
                '-o', "ConnectTimeout=$ssh_to",
                '-o', 'BatchMode=yes',
                '-o', 'StrictHostKeyChecking=accept-new',
+               # Catch stalled-after-connect cases (auth hang, dropped
+               # session): ~6s to give up entirely.
+               '-o', 'ServerAliveInterval=3',
+               '-o', 'ServerAliveCountMax=2',
+               # No interactive prompts under any circumstance.
+               '-o', 'NumberOfPasswordPrompts=0',
+               '-o', 'PreferredAuthentications=publickey',
                $target, 'show-x11', '-ns', '-id');
         if (open my $oh, '-|', @cmd) {
             my $disp;
@@ -195,8 +207,20 @@ while ($sel->count) {
         }
     }
 }
+# Kill stragglers — TERM first, brief grace, then KILL so a stuck ssh
+# can't leave the parent waiting indefinitely for the kernel to reap.
 for my $pid (keys %pid_for) {
-    kill 'TERM', $pid if waitpid($pid, 1) == 0;
+    kill 'TERM', $pid if waitpid($pid, POSIX::WNOHANG()) == 0;
+}
+my $kdeadline = time + 1;
+for my $pid (keys %pid_for) {
+    while (waitpid($pid, POSIX::WNOHANG()) == 0 && time < $kdeadline) {
+        select undef, undef, undef, 0.05;
+    }
+    if (waitpid($pid, POSIX::WNOHANG()) == 0) {
+        kill 'KILL', $pid;
+        waitpid($pid, 0);
+    }
 }
 
 # Dedupe aliased hosts: every show-x11 -id call printed `# host: H id: M`
@@ -575,8 +599,13 @@ sub _term_cmd {
     # around the bash arg, the remote shell would interpret the parens
     # as a subshell of *its own* and bash -c would get an empty arg.
     return ('ssh',
+            '-o', "ConnectTimeout=$ssh_to",
             '-o', 'BatchMode=yes',
             '-o', 'StrictHostKeyChecking=accept-new',
+            '-o', 'ServerAliveInterval=3',
+            '-o', 'ServerAliveCountMax=2',
+            '-o', 'NumberOfPasswordPrompts=0',
+            '-o', 'PreferredAuthentications=publickey',
             @ssh_target, 'bash', '-c', "'$cmd'");
 }
 
