@@ -381,7 +381,7 @@ Tk->import;
 my $mw = MainWindow->new(-title => 'find-xpra: attach to X11 session');
 # Tk's stock default is Helvetica 9 / 10 — far too small on a modern display.
 $mw->optionAdd('*Font' => 'sans-serif 11');
-my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '', '', '');
+my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '', '', '', '');
 for my $i (0 .. $#cols) {
     $mw->Label(-text => $cols[$i], -font => 'sans-serif 11 bold',
                -relief => 'ridge', -padx => 6, -pady => 2)
@@ -398,6 +398,9 @@ for my $s (@sessions) {
     $mw->Button(-text => 'Apps',
                 -command => sub { _show_procs($sess) })
        ->grid(-row => $r, -column => 5, -padx => 6, -pady => 1, -sticky => 'ew');
+    $mw->Button(-text => 'Terminal',
+                -command => sub { spawn_detached(_term_cmd($sess)) })
+       ->grid(-row => $r, -column => 6, -padx => 6, -pady => 1, -sticky => 'ew');
     my ($attach_btn, $disc_btn);
     $attach_btn = $mw->Button(-text => 'Attach',
         -command => sub {
@@ -412,8 +415,8 @@ for my $s (@sessions) {
             kill 'TERM', $pid;          # closes the local viewer; remote
                                         # xpra session keeps running.
         });
-    $attach_btn->grid(-row => $r, -column => 6, -padx => 6, -pady => 1, -sticky => 'ew');
-    $disc_btn  ->grid(-row => $r, -column => 7, -padx => 6, -pady => 1, -sticky => 'ew');
+    $attach_btn->grid(-row => $r, -column => 7, -padx => 6, -pady => 1, -sticky => 'ew');
+    $disc_btn  ->grid(-row => $r, -column => 8, -padx => 6, -pady => 1, -sticky => 'ew');
     $sess->{_attach_btn} = $attach_btn;
     $sess->{_disc_btn}   = $disc_btn;
     $r++;
@@ -469,6 +472,42 @@ sub _attach_cmd {
         ? "ssh://$ssh_user\@$target/$disp_n"
         : "ssh://$target/$disp_n";
     return ('xpra', 'attach', $url);
+}
+
+# Build the command to launch a terminal on the session's display.
+# Uses the `( cmd & )` subshell-background idiom so the launching shell
+# can exit immediately (and ssh with it).  Forces bash because the
+# remote login shell may be csh/tcsh.
+sub _term_cmd {
+    my ($s) = @_;
+    (my $disp_n = $s->{disp}) =~ s/^://;
+    my $bash = qq{(xterm -display :$disp_n &)};
+    if ($s->{host} eq 'localhost') {
+        return ('bash', '-c', $bash);
+    }
+    my $target = $s->{ip} // $s->{host};
+    my @ssh_target = defined $ssh_user ? ("$ssh_user\@$target") : ($target);
+    return ('ssh',
+            '-o', 'BatchMode=yes',
+            '-o', 'StrictHostKeyChecking=accept-new',
+            @ssh_target, 'bash', '-c', $bash);
+}
+
+# Fire-and-forget spawn (no PID tracking, no zombie).  Double-fork into
+# a new session so it survives find-xpra exit; init reaps the orphan.
+sub spawn_detached {
+    my @cmd = @_;
+    my $pid = fork // die "fork: $!";
+    if ($pid) { waitpid($pid, 0); return; }
+    POSIX::setsid();
+    my $pid2 = fork;
+    exit 1 unless defined $pid2;
+    exit 0 if $pid2;
+    open STDIN,  '<', '/dev/null';
+    open STDOUT, '>', '/dev/null';
+    open STDERR, '>', '/dev/null';
+    exec { $cmd[0] } @cmd;
+    exit 127;
 }
 
 # Spawn an xpra-attach child in its own session (so it keeps running if
