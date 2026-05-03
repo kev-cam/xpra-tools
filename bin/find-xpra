@@ -505,67 +505,106 @@ sub pick_host {
         $mw->optionAdd('*Font' => 'sans-serif 11');
         $mw->Label(-text => 'Probe which host?', -padx => 16, -pady => 8)
             ->grid(-row => 0, -column => 0, -columnspan => 4, -sticky => 'w');
-        for my $i (0 .. $#$cands) {
-            my $c    = $cands->[$i];
-            my $name = _name_for($c);
-            my $is_fav = $SETTINGS->{$name}{favorite} ? 1 : 0;
-            # Per-row chosen user: starts at the resolved ssh-config User
-            # (or $USER for the explicit-localhost fallback) and is bound
-            # to an Optionmenu so the human can override before clicking
-            # the host button.
-            my $row_user = $ssh_user
-                        // $c->{ssh_user}
-                        // $ENV{USER}
-                        // ($user_choices[0] // '');
-            my ($fav_btn, $main_btn, $user_om, $forget_btn);
-            $fav_btn = $mw->Button(
-                -text => $is_fav ? "\x{2605}" : "\x{2606}",
-                -command => sub {
-                    $is_fav = !$is_fav;
-                    $SETTINGS->{$name}{favorite} = $is_fav ? 1 : 0;
-                    _save_settings($SETTINGS);
-                    $fav_btn->configure(-text => $is_fav ? "\x{2605}" : "\x{2606}");
-                });
-            $main_btn = $mw->Button(
-                -text => _host_label($c), -anchor => 'w',
-                -command => sub {
-                    # Send back chosen index + the user from this row so
-                    # the parent ssh-probes as exactly that user.
-                    print {$wh} "$i\t$row_user\n";
-                    close $wh;
-                    $mw->destroy;
-                });
-            $user_om = $mw->Optionmenu(
-                -options => [@user_choices],
-                -variable => \$row_user,
-            );
-            # Optionmenu defaults to the first option; force it to our
-            # resolved/preferred user if it's in the list.
-            if (length $row_user
-                && grep { $_ eq $row_user } @user_choices) {
-                $user_om->setOption($row_user);
+
+        # "Hidden" hosts (Forget'd in a previous run) stay out of the
+        # picker until the user clicks "Show all", which switches mode
+        # so hidden rows reappear with an "Enable" button to un-hide.
+        my $show_hidden = 0;
+        my @row_widgets;
+        my ($show_btn, $rebuild_rows);
+        $rebuild_rows = sub {
+            $_->destroy for @row_widgets;
+            @row_widgets = ();
+            my $r = 1;
+            for my $i (0 .. $#$cands) {
+                my $c    = $cands->[$i];
+                my $name = _name_for($c);
+                my $is_hidden = $SETTINGS->{$name}{hidden} ? 1 : 0;
+                next if $is_hidden && !$show_hidden;
+                my $is_fav = $SETTINGS->{$name}{favorite} ? 1 : 0;
+                # Per-row chosen user: starts at the resolved ssh-config
+                # User (or $USER for the explicit-localhost fallback) and
+                # is bound to an Optionmenu so the human can override
+                # before clicking the host button.
+                my $row_user = $ssh_user
+                            // $c->{ssh_user}
+                            // $ENV{USER}
+                            // ($user_choices[0] // '');
+                my ($fav_btn, $main_btn, $user_om, $action_btn);
+                $fav_btn = $mw->Button(
+                    -text => $is_fav ? "\x{2605}" : "\x{2606}",
+                    -command => sub {
+                        $is_fav = !$is_fav;
+                        $SETTINGS->{$name}{favorite} = $is_fav ? 1 : 0;
+                        _save_settings($SETTINGS);
+                        $fav_btn->configure(
+                            -text => $is_fav ? "\x{2605}" : "\x{2606}");
+                    });
+                $main_btn = $mw->Button(
+                    -text => _host_label($c), -anchor => 'w',
+                    -command => sub {
+                        # Send back chosen index + the user from this row
+                        # so the parent ssh-probes as exactly that user.
+                        print {$wh} "$i\t$row_user\n";
+                        close $wh;
+                        $mw->destroy;
+                    });
+                $user_om = $mw->Optionmenu(
+                    -options => [@user_choices],
+                    -variable => \$row_user,
+                );
+                # Optionmenu defaults to the first option; force it to
+                # our resolved/preferred user if it's in the list.
+                if (length $row_user
+                    && grep { $_ eq $row_user } @user_choices) {
+                    $user_om->setOption($row_user);
+                }
+                if ($is_hidden) {
+                    $action_btn = $mw->Button(
+                        -text => 'Enable',
+                        -command => sub {
+                            delete $SETTINGS->{$name}{hidden};
+                            _save_settings($SETTINGS);
+                            $rebuild_rows->();
+                        });
+                } else {
+                    $action_btn = $mw->Button(
+                        -text => 'Forget',
+                        -command => sub {
+                            $SETTINGS->{$name}{hidden} = 1;
+                            _save_settings($SETTINGS);
+                            delete $CACHE->{$name};
+                            _save_cache();
+                            $rebuild_rows->();
+                        });
+                }
+                $fav_btn   ->grid(-row => $r, -column => 0, -padx => 4, -pady => 1);
+                $main_btn  ->grid(-row => $r, -column => 1, -padx => 4, -pady => 1, -sticky => 'ew');
+                $user_om   ->grid(-row => $r, -column => 2, -padx => 4, -pady => 1, -sticky => 'ew');
+                $action_btn->grid(-row => $r, -column => 3, -padx => 4, -pady => 1);
+                push @row_widgets, $fav_btn, $main_btn, $user_om, $action_btn;
+                $r++;
             }
-            $forget_btn = $mw->Button(
-                -text => 'Forget',
-                -command => sub {
-                    delete $CACHE->{$name};
-                    _save_cache();
-                    # Drop the row from the dialog immediately so the
-                    # entry is visibly gone.  Empty grid rows collapse to
-                    # zero height by default, so subsequent rows shift up.
-                    $fav_btn   ->destroy;
-                    $main_btn  ->destroy;
-                    $user_om   ->destroy;
-                    $forget_btn->destroy;
-                });
-            $fav_btn   ->grid(-row => $i+1, -column => 0, -padx => 4, -pady => 1);
-            $main_btn  ->grid(-row => $i+1, -column => 1, -padx => 4, -pady => 1, -sticky => 'ew');
-            $user_om   ->grid(-row => $i+1, -column => 2, -padx => 4, -pady => 1, -sticky => 'ew');
-            $forget_btn->grid(-row => $i+1, -column => 3, -padx => 4, -pady => 1);
-        }
-        $mw->Button(-text => 'Cancel', -command => sub { $mw->destroy })
-            ->grid(-row => scalar(@$cands)+1, -column => 0,
-                   -columnspan => 4, -pady => 10);
+        };
+        $rebuild_rows->();
+
+        # Bottom controls in a Frame so the row-count of the host list
+        # doesn't disturb their grid coordinates.
+        my $bottom = $mw->Frame;
+        $bottom->grid(-row => 9999, -column => 0, -columnspan => 4, -pady => 10);
+        $show_btn = $bottom->Button(
+            -text => 'Show all',
+            -command => sub {
+                $show_hidden = !$show_hidden;
+                $show_btn->configure(
+                    -text => $show_hidden ? 'Hide hidden' : 'Show all');
+                $rebuild_rows->();
+            });
+        $show_btn->pack(-side => 'left', -padx => 6);
+        $bottom->Button(-text => 'Cancel',
+                        -command => sub { $mw->destroy })
+               ->pack(-side => 'left', -padx => 6);
+
         $mw->protocol('WM_DELETE_WINDOW' => sub { $mw->destroy });
         Tk::MainLoop();
         # Cancel/window-close: $wh was never written to.  Closing it now
