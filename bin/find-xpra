@@ -12,6 +12,7 @@ use warnings;
 use Getopt::Long qw(:config no_ignore_case no_bundling);
 use IO::Select;
 use IO::Pipe;
+use IO::Socket::INET;
 use POSIX ();
 use JSON::PP qw(encode_json decode_json);
 use File::Path qw(make_path);
@@ -26,41 +27,164 @@ my @ORIG_ARGV = @ARGV;
 # `*` is the wildcard-default key.
 my $CONFIG_DIR  = ($ENV{XDG_CONFIG_HOME} // "$ENV{HOME}/.config") . '/find-xpra';
 my $CONFIG_PATH = "$CONFIG_DIR/config.json";
+my $CACHE_PATH  = "$CONFIG_DIR/cache.json";
 my $SETTINGS    = _load_settings();
+my $CACHE       = _load_cache();
 
 my $listen     = $ENV{NET_MGR_LISTEN};
 my $ssh_user;             # undef → let ssh_config(5) pick the user
+my $user;                 # --user: ssh as USER and filter sessions to USER
 my $ssh_to     = 3;
 my $overall_to = 8;
 my $list_only;
 my $no_local;
+my $no_scan;
+my $scan;
+my $pick;
+my $no_prompt;
+my $ssh_key;
+my $debug;
 my $all;
 my $help;
 
 GetOptions(
     'listen=s'   => \$listen,
+    'user=s'     => \$user,
     'ssh-user=s' => \$ssh_user,
+    'ssh-key=s'  => \$ssh_key,
     'timeout=i'  => \$ssh_to,
     'list'       => \$list_only,
     'no-local'   => \$no_local,
+    'no-scan'    => \$no_scan,
+    'no-prompt'  => \$no_prompt,
+    'scan'       => \$scan,
+    'pick'       => \$pick,
+    'debug'      => \$debug,
     'a|all'      => \$all,
     'h|help'     => \$help,
 ) or die usage();
 print(usage()), exit 0 if $help;
 
+# --user is a shorthand: ssh as that user AND only show their sessions.
+# --ssh-user (if also given) wins for the ssh-as part.
+$ssh_user //= $user if defined $user;
+
+# By default, prompts go through ssh-askpass (a GUI dialog) — the parallel
+# probe forks have stdin closed and a fresh session, so ssh can't ask on the
+# tty even if it wanted to.  SSH_ASKPASS_REQUIRE=force makes OpenSSH 8.4+
+# use askpass even with $DISPLAY unset on systems that ship one.
+$ENV{SSH_ASKPASS_REQUIRE} //= 'force' unless $no_prompt;
+
+# Debug log: when --debug is on, mirror stderr trace to a file too so
+# the trace survives launching from a Tk/desktop context where stderr
+# isn't on a terminal.  Append; multiple find-xpra runs and forked
+# probes all write here, prefixed with pid so their lines stay sortable.
+our $DEBUG_LOG_PATH = '/tmp/find-xpra-debug.log';
+our $DEBUG_LOG_FH;
+if ($debug) {
+    if (open $DEBUG_LOG_FH, '>>', $DEBUG_LOG_PATH) {
+        $DEBUG_LOG_FH->autoflush(1);
+        print {$DEBUG_LOG_FH}
+            "\n=== ", scalar(localtime), " pid=$$ ===\n",
+            "    cmd: $0 ", join(' ', @ORIG_ARGV), "\n";
+    } else {
+        warn "debug log: can't open $DEBUG_LOG_PATH: $!\n";
+    }
+}
+
+sub _dbg {
+    return unless $debug;
+    my $msg = join('', @_);
+    $msg .= "\n" unless $msg =~ /\n\z/;
+    print STDERR $msg;
+    print {$DEBUG_LOG_FH} $msg if $DEBUG_LOG_FH;
+}
+
+sub ssh_opts {
+    my @opts = (
+        '-o', "ConnectTimeout=$ssh_to",
+        '-o', 'StrictHostKeyChecking=accept-new',
+        '-o', 'ServerAliveInterval=3',
+        '-o', 'ServerAliveCountMax=2',
+    );
+    push @opts, '-i', $ssh_key if defined $ssh_key;
+    if ($no_prompt) {
+        push @opts,
+            '-o', 'BatchMode=yes',
+            '-o', 'NumberOfPasswordPrompts=0',
+            '-o', 'PreferredAuthentications=publickey';
+    }
+    return @opts;
+}
+
+# Build (ssh-args, login) for a candidate.  Use the candidate name as
+# the login destination so ~/.ssh/config Host blocks (User, IdentityFile,
+# Port, ...) match — but force the actual connection to the IP we
+# discovered via `-o HostName=<ip>`, so we don't depend on DNS or
+# /etc/hosts being right for that name.  When the name is missing or
+# already an IP, fall back to the plain-IP form.
+sub ssh_target {
+    my ($c) = @_;
+    my $name = $c->{name};
+    my $ip   = $c->{ip};
+    my @args;
+    my $host;
+    if (defined $name && defined $ip && $name ne $ip) {
+        push @args, '-o', "HostName=$ip";
+        $host = $name;
+    } else {
+        $host = $ip // $name;
+    }
+    my $login = defined $ssh_user ? "$ssh_user\@$host" : $host;
+    return (@args, $login);
+}
+
 sub usage { <<'EOF' }
 usage: find-xpra [options]
-  --listen HOST:PORT  net-mgr address (default: nmap-discovered or $NET_MGR_LISTEN)
-  --ssh-user USER     override ssh user (default: from ssh_config(5))
-  --timeout SEC       per-host ssh ConnectTimeout (default: 3)
-  --list              print rows to stdout instead of popping a chooser
-  --no-local          skip local show-x11 probe
-  -a, --all           include displays under :20 (presumed plain X)
-  -h, --help          this message
+  --listen HOST[:PORT]  net-mgr address (default: $NET_MGR_LISTEN, then
+                        127.0.0.1:7531, then nmap-scan local /24 for :7531)
+  --user USER           ssh as USER and only show sessions owned by USER
+  --ssh-user USER       override ssh user only (default: from ssh_config(5))
+  --ssh-key FILE        ssh -i FILE (private key to authenticate with)
+  --no-prompt           never prompt for an ssh password (BatchMode=yes,
+                        publickey-only); default is to allow ssh-askpass
+  --scan                force nmap scan even if local net-mgr is up
+  --pick                pop up a host chooser before any ssh probe;
+                        sorted by favorite, last-known session count,
+                        then signals (X / VNC / net-mgr); per-row star
+                        toggles favorite, "Forget" clears the cache
+                        entry (Tk dialog; --list gets a CLI prompt)
+  --no-scan             don't fall back to scanning the subnet for net-mgr
+  --timeout SEC         per-host ssh ConnectTimeout (default: 3)
+  --list                print rows to stdout instead of popping a chooser
+  --no-local            skip local show-x11 probe; also skip our own IP
+                        when scanning for net-mgr
+  -a, --all             include displays under :20 (presumed plain X)
+  --debug               print the probe command for each candidate and
+                        leave ssh's stderr attached so failures show why
+  -h, --help            this message
 EOF
 
-sub find_net_mgr {
+sub probe_net_mgr {
+    # Quick TCP probe — does anything answer at HOST[:PORT]?
+    my ($addr) = @_;
+    my ($host, $port) = split /:/, $addr, 2;
+    $port = 7531 if !defined $port || $port eq '';
+    my $sock = IO::Socket::INET->new(
+        PeerAddr => $host,
+        PeerPort => $port,
+        Proto    => 'tcp',
+        Timeout  => 1,
+    ) or return 0;
+    close $sock;
+    return 1;
+}
+
+sub scan_net_mgr {
     # nmap the local /24 for port 7531/tcp.  Returns 'host:port' or undef.
+    # If $skip_self, drop our own source IP from the result so a remote
+    # peer wins instead of looping back to ourselves.
+    my ($skip_self) = @_;
     my $src;
     if (open my $rh, '-|', 'ip', 'route', 'get', '1.1.1.1') {
         while (<$rh>) { $src = $1, last if /\bsrc\s+(\S+)/ }
@@ -71,7 +195,10 @@ sub find_net_mgr {
     if (open my $nh, '-|',
         'nmap', '-Pn', '-T4', '-n', '-p', '7531', '--open', '-oG', '-', $subnet) {
         while (<$nh>) {
-            if (/^Host:\s+(\S+).*7531\/open/) { push @hosts, $1 }
+            if (/^Host:\s+(\S+).*7531\/open/) {
+                next if $skip_self && $1 eq $src;
+                push @hosts, $1;
+            }
         }
         close $nh;
     }
@@ -81,7 +208,17 @@ sub find_net_mgr {
 # --- discover candidate hosts via net-mgr ---------------------------------
 
 unless (defined $listen) {
-    $listen = find_net_mgr() or die "no net-mgr server found on local subnet\n";
+    if ($scan) {
+        $listen = scan_net_mgr($no_local)
+            or die "--scan: no net-mgr found on local /24\n";
+    } elsif (probe_net_mgr('127.0.0.1:7531')) {
+        $listen = '127.0.0.1:7531';
+    } elsif (!$no_scan) {
+        $listen = scan_net_mgr($no_local)
+            or die "no net-mgr found locally or on the subnet; use --listen HOST\n";
+    } else {
+        die "no local net-mgr at 127.0.0.1:7531 and --no-scan set; use --listen HOST\n";
+    }
 }
 
 my $cli = NetMgr::Client->new(listen => $listen);
@@ -91,6 +228,12 @@ my $ifaces   = $cli->snapshot(2, 'interfaces');
 my $addrs    = $cli->snapshot(3, 'addresses', where => "family = 'v4'");
 my $ports22  = $cli->snapshot(4, 'ports', where => "port = 22");
 my $aps      = $cli->snapshot(5, 'aps');
+# Service ports used to prioritise the --pick list.  X11: 6000-6063
+# (TCP-listening Xorg/Xvfb), VNC: 5900-5999, net-mgr: 7531.
+my $svc_ports = $cli->snapshot(6, 'ports',
+    where => "(port >= 6000 AND port <= 6063)"
+           . " OR (port >= 5900 AND port <= 5999)"
+           . " OR port = 7531");
 $cli->bye;
 
 my %ap_mac  = map { $_->{mac} => 1 } @$aps;
@@ -104,28 +247,220 @@ for my $i (@$ifaces) {
     next unless defined $i->{machine_id};
     push @{ $macs_of{$i->{machine_id}} }, $i->{mac};
 }
+my %svc_for;     # mac => [ports]
+for my $p (@$svc_ports) {
+    push @{ $svc_for{$p->{mac}} }, $p->{port};
+}
+
+# Local IPs — used to flag candidates that are us, so we run show-x11
+# directly instead of sshing into ourselves.
+my %local_ip;
+if (open my $rh, '-|', 'ip', '-o', 'addr', 'show') {
+    while (<$rh>) {
+        $local_ip{$1} = 1 if /\binet6?\s+([\da-f.:]+)/i;
+    }
+}
 
 my @candidates;
 for my $m (@$machines) {
     next unless $m->{online};
     my $best_ip;
+    my ($x_n, $vnc_n, $nm_n) = (0, 0, 0);
     for my $mac (@{ $macs_of{$m->{id}} || [] }) {
+        for my $p (@{ $svc_for{$mac} || [] }) {
+            $x_n++   if $p >= 6000 && $p <= 6063;
+            $vnc_n++ if $p >= 5900 && $p <= 5999;
+            $nm_n++  if $p == 7531;
+        }
         next if $ap_mac{$mac};
         next unless $ssh_mac{$mac};
-        ($best_ip) = sort @{ $ip_for{$mac} || [] };
-        last if defined $best_ip;
+        ($best_ip) = sort @{ $ip_for{$mac} || [] } unless defined $best_ip;
     }
     next unless defined $best_ip;
-    push @candidates, { name => $m->{primary_name} // $best_ip, ip => $best_ip };
+    push @candidates, { name => $m->{primary_name} // $best_ip, ip => $best_ip,
+                        local => $local_ip{$best_ip} ? 1 : 0,
+                        x => $x_n, vnc => $vnc_n, nm => $nm_n };
 }
-# The net-mgr host itself isn't in its own inventory — add it explicitly.
+# The net-mgr host itself isn't in its own inventory — add it explicitly,
+# unless it's loopback (covered by the localhost probe; adding 127.0.0.1
+# would either duplicate it or, with --no-local, ssh-probe ourselves
+# under the wrong host label).
 my ($mgr_host) = split /:/, $listen, 2;
-unless (grep { ($_->{name} // '') eq $mgr_host || ($_->{ip} // '') eq $mgr_host } @candidates) {
+my $mgr_is_local = $mgr_host =~ /^(?:127\.|::1$|localhost$)/
+                || $local_ip{$mgr_host};
+unless ($mgr_is_local
+        || grep { ($_->{name} // '') eq $mgr_host || ($_->{ip} // '') eq $mgr_host } @candidates) {
     push @candidates, { name => $mgr_host, ip => $mgr_host };
 }
 
-unless ($no_local) {
+if ($no_local) {
+    @candidates = grep { !$_->{local} } @candidates;
+} elsif (!grep { $_->{local} } @candidates) {
+    # Fallback when the local box isn't in net-mgr's inventory.
     push @candidates, { name => 'localhost', ip => undef, local => 1 };
+}
+
+# If --user is set and differs from the current account, the local
+# shortcut (which runs show-x11/xpra-list as $ENV{USER}) won't see the
+# target user's sessions.  Strip the `local` flag so we ssh in as $user
+# instead.  Need an IP for ssh — fall back to 127.0.0.1 for the
+# "localhost" placeholder.
+if (defined $user && $user ne ($ENV{USER} // '')) {
+    for my $c (@candidates) {
+        next unless $c->{local};
+        $c->{local} = 0;
+        $c->{ip} //= '127.0.0.1';
+    }
+}
+
+if ($pick) {
+    # Sort by:
+    #   1. favorite (sticky pin from prior runs)
+    #   2. cached session count (so a host last seen with sessions floats)
+    #   3. net-mgr-known signals: X (6000-6063), VNC (5900-5999), net-mgr (7531)
+    #   4. name (alphabetic) — stable order for everything else.
+    my @ranked = sort {
+           (($SETTINGS->{ _name_for($b) }{favorite}//0)
+            <=> ($SETTINGS->{ _name_for($a) }{favorite}//0))
+        || (($CACHE->{ _name_for($b) }{n_sessions}//0)
+            <=> ($CACHE->{ _name_for($a) }{n_sessions}//0))
+        || (($b->{x}  // 0) <=> ($a->{x}  // 0))
+        || (($b->{vnc}// 0) <=> ($a->{vnc}// 0))
+        || (($b->{nm} // 0) <=> ($a->{nm} // 0))
+        || (_name_for($a)   cmp _name_for($b))
+    } @candidates;
+    my $chosen = pick_host(\@ranked);
+    defined $chosen or exit 1;
+    @candidates = ($chosen);
+}
+
+sub _name_for {
+    my ($c) = @_;
+    return $c->{name} // 'localhost';
+}
+
+sub _host_label {
+    my ($c) = @_;
+    return 'localhost' if !defined $c->{ip};   # explicit-fallback case
+    my $name = _name_for($c);
+    my $disp = $name;
+    $disp .= " ($c->{ip})"   if $c->{ip} ne $name;
+    $disp .= "  [local]"     if $c->{local};
+    if (my $cl = _cache_label($name)) { $disp .= "  [$cl]" }
+    my @tags;
+    push @tags, "$c->{x} X"     if $c->{x};
+    push @tags, "$c->{vnc} VNC" if $c->{vnc};
+    push @tags, "net-mgr"       if $c->{nm};
+    $disp .= "  [".join(', ', @tags)."]" if @tags;
+    return $disp;
+}
+
+sub pick_host {
+    my ($cands) = @_;
+    if ($list_only) {
+        print STDERR "Hosts:\n";
+        for my $i (0 .. $#$cands) {
+            my $fav = $SETTINGS->{ _name_for($cands->[$i]) }{favorite} ? '* ' : '  ';
+            print STDERR sprintf("  [%d] %s%s\n", $i+1, $fav, _host_label($cands->[$i]));
+        }
+        print STDERR "Pick (1-", scalar @$cands, ", empty to cancel): ";
+        my $line = <STDIN>;
+        return undef unless defined $line;
+        chomp $line;
+        return undef if $line eq '';
+        my $i = $line - 1;
+        return undef unless $i >= 0 && $i < @$cands;
+        return $cands->[$i];
+    }
+    # Tk picker runs in a forked subprocess: keeps the main process from
+    # ever loading Tk, so the post-pick parallel-ssh probe doesn't fork
+    # off a child carrying the parent's X11 fd (which crashes both ends
+    # when the child exits, even with POSIX::_exit).  Child writes the
+    # chosen index to a pipe; parent reads it and proceeds.
+    pipe(my $rh, my $wh) or die "pipe: $!";
+    my $pid = fork // die "fork: $!";
+    if (!$pid) {
+        close $rh;
+        require Tk;
+        Tk->import;
+        my $mw = MainWindow->new(-title => 'find-xpra: pick host');
+        $mw->optionAdd('*Font' => 'sans-serif 11');
+        $mw->Label(-text => 'Probe which host?', -padx => 16, -pady => 8)
+            ->grid(-row => 0, -column => 0, -columnspan => 3, -sticky => 'w');
+        for my $i (0 .. $#$cands) {
+            my $c    = $cands->[$i];
+            my $name = _name_for($c);
+            my $is_fav = $SETTINGS->{$name}{favorite} ? 1 : 0;
+            my ($fav_btn, $main_btn);
+            $fav_btn = $mw->Button(
+                -text => $is_fav ? "\x{2605}" : "\x{2606}",
+                -command => sub {
+                    $is_fav = !$is_fav;
+                    $SETTINGS->{$name}{favorite} = $is_fav ? 1 : 0;
+                    _save_settings($SETTINGS);
+                    $fav_btn->configure(-text => $is_fav ? "\x{2605}" : "\x{2606}");
+                });
+            $main_btn = $mw->Button(
+                -text => _host_label($c), -anchor => 'w',
+                -command => sub {
+                    print {$wh} "$i\n";
+                    close $wh;
+                    $mw->destroy;
+                });
+            my $forget_btn = $mw->Button(
+                -text => 'Forget',
+                -command => sub {
+                    delete $CACHE->{$name};
+                    _save_cache();
+                    $main_btn->configure(-text => _host_label($c));
+                });
+            $fav_btn   ->grid(-row => $i+1, -column => 0, -padx => 4, -pady => 1);
+            $main_btn  ->grid(-row => $i+1, -column => 1, -padx => 4, -pady => 1, -sticky => 'ew');
+            $forget_btn->grid(-row => $i+1, -column => 2, -padx => 4, -pady => 1);
+        }
+        $mw->Button(-text => 'Cancel', -command => sub { $mw->destroy })
+            ->grid(-row => scalar(@$cands)+1, -column => 0,
+                   -columnspan => 3, -pady => 10);
+        $mw->protocol('WM_DELETE_WINDOW' => sub { $mw->destroy });
+        Tk::MainLoop();
+        # Cancel/window-close: $wh was never written to.  Closing it now
+        # signals EOF to the parent so it doesn't block reading.
+        close $wh;
+        POSIX::_exit(0);
+    }
+    close $wh;
+    my $line = <$rh>;
+    close $rh;
+    waitpid($pid, 0);
+    return undef unless defined $line && length $line;
+    chomp $line;
+    return undef unless $line =~ /^(\d+)$/;
+    my $idx = $1 + 0;
+    return undef unless $idx < @$cands;
+    return $cands->[$idx];
+}
+
+# Single MainWindow for the whole process — Tk segfaults if you create,
+# destroy, and recreate one.  Lazily initialised; withdrawn until something
+# (chooser, no-sessions dialog) actually needs it.  Picker, settings,
+# proc-list popups, etc. attach as Toplevels of this.
+my $TK_MW;
+sub _tk_mw {
+    return $TK_MW if $TK_MW;
+    _dbg("[debug] _tk_mw: require Tk");
+    require Tk;
+    _dbg("[debug] _tk_mw: Tk->import");
+    Tk->import;
+    _dbg("[debug] _tk_mw: MainWindow->new");
+    $TK_MW = MainWindow->new(-title => 'find-xpra');
+    _dbg("[debug] _tk_mw: MW created, configuring");
+    $TK_MW->optionAdd('*Font' => 'sans-serif 11');
+    # Don't withdraw — the picker is a subprocess now, so the parent MW
+    # doesn't need to be hidden to make room for the picker Toplevel.
+    # Withdraw + immediate deiconify on a freshly-created MW seems to be
+    # what triggers the segfault on this Tk build.
+    _dbg("[debug] _tk_mw: ready");
+    return $TK_MW;
 }
 
 # --- parallel show-x11 probe ----------------------------------------------
@@ -138,43 +473,76 @@ for my $c (@candidates) {
     die "fork: $!" unless defined $pid;
     if (!$pid) {
         $pipe->writer;
-        open STDERR, '>', '/dev/null';
+        # POSIX::_exit (used at the bottom to skip Tk's END handler)
+        # also skips stdio buffer flush, so anything Perl-buffered to
+        # the pipe is lost.  Autoflush keeps every write reaching the
+        # parent immediately.
+        $pipe->autoflush(1);
+        # --debug: leave stderr attached so the user sees ssh's complaint
+        # ("Permission denied", "Connection refused", ...).  Otherwise
+        # silence it as before so a tide of "Permission denied"s doesn't
+        # drown the probe output.
+        open STDERR, '>', '/dev/null' unless $debug;
+        # Detach from the controlling tty + close stdin so ssh can't try
+        # to read a password off the terminal (N parallel probes would
+        # otherwise race for the tty).  ssh falls back to SSH_ASKPASS.
+        POSIX::setsid();
+        open STDIN, '<', '/dev/null';
         # Defensive self-kill: if we're still alive past the global
         # deadline, take ourselves out so a stuck ssh can't pin a fd or
-        # leave a process around.
-        $SIG{ALRM} = sub { exit 1 };
+        # leave a process around.  POSIX::_exit skips END blocks — Tk's
+        # END would otherwise try to tear down the X11 fd inherited from
+        # the parent picker and crash both processes.
+        $SIG{ALRM} = sub { POSIX::_exit(1) };
         alarm($overall_to + 1);
-        my $target = defined $ssh_user ? "$ssh_user\@$c->{ip}" : $c->{ip};
+        # Run both:
+        #   show-x11 -ns -id   -> per-display proc list (apps + machine-id)
+        #   xpra list          -> authoritative list of xpra displays, even
+        #                         empty ones that show-x11 would miss
+        # Separator marks the boundary so the parser can switch modes.
+        my $remote = 'show-x11 -ns -id; echo __XPRA__; xpra list 2>/dev/null';
         my @cmd = $c->{local}
-            ? ('show-x11', '-ns', '-id')
-            : ('ssh',
-               '-o', "ConnectTimeout=$ssh_to",
-               '-o', 'BatchMode=yes',
-               '-o', 'StrictHostKeyChecking=accept-new',
-               # Catch stalled-after-connect cases (auth hang, dropped
-               # session): ~6s to give up entirely.
-               '-o', 'ServerAliveInterval=3',
-               '-o', 'ServerAliveCountMax=2',
-               # No interactive prompts under any circumstance.
-               '-o', 'NumberOfPasswordPrompts=0',
-               '-o', 'PreferredAuthentications=publickey',
-               $target, 'show-x11', '-ns', '-id');
+            ? ('sh', '-c', $remote)
+            : ('ssh', ssh_opts(), ssh_target($c), $remote);
+        _dbg("[debug] $c->{name}: ",
+             join(' ', map { /\s/ ? "'$_'" : $_ } @cmd));
         if (open my $oh, '-|', @cmd) {
             my $disp;
+            my $in_xpra = 0;
             while (defined(my $line = <$oh>)) {
                 chomp $line;
+                _dbg("[debug] $c->{name}> $line");
+                if ($line eq '__XPRA__') { $in_xpra = 1; next }
+                if ($in_xpra) {
+                    # `xpra list` lines like:  "\tLIVE session at :20"
+                    # Dedup happens parent-side via the row hash.
+                    if ($line =~ /\bLIVE session at\s+(:\d+)\b/) {
+                        print { $pipe } join("\t", '__xpra__', $c->{name}, $1), "\n";
+                    }
+                    next;
+                }
                 if ($line =~ /^#\s*host:\s*(\S*)\s+id:\s*(\S*)/) {
                     print { $pipe } join("\t", '__id', $c->{name}, $1, $2), "\n";
                 } elsif ($line =~ /^(:\d+)\s*$/) {
                     $disp = $1;
                 } elsif (defined $disp
-                         && $line =~ /^\s+(\d+)\s+(\S+)\s+(.+?)\s*$/) {
-                    print { $pipe } join("\t", $c->{name}, $disp, $1, $2, $3), "\n";
+                         # show-x11 emits `printf("%s  %8s %-8s %s\n", ...)`
+                         # — pid is right-justified in 8 cols and the USER
+                         # field is exactly 8 cols, *all spaces if blank*.
+                         # Greedy `(\S+)` would otherwise eat the command's
+                         # first token as the user.
+                         && $line =~ /^\s+(\d+) (.{8}) (.+?)\s*$/) {
+                    my ($pid, $user, $cmd) = ($1, $2, $3);
+                    $user =~ s/^\s+|\s+$//g;
+                    print { $pipe } join("\t", $c->{name}, $disp, $pid, $user, $cmd), "\n";
                 }
             }
             close $oh;
         }
-        exit 0;
+        # POSIX::_exit, not exit — Tk loaded in parent for the picker
+        # leaves an END handler that closes the (shared) X11 fd; running
+        # it from the forked child segfaults the parent.
+        POSIX::_exit(0);
     }
     $pipe->reader;
     $sel->add($pipe);
@@ -182,6 +550,7 @@ for my $c (@candidates) {
 }
 
 my @rows;
+my %xpra_listed;     # "$host\t$disp" -> 1 (display reported by `xpra list`)
 my %remote_id;       # candidate-name -> machine-id (from `show-x11 -id`)
 my %remote_host;     # candidate-name -> remote `hostname`
 my %buf;
@@ -200,6 +569,8 @@ while ($sel->count) {
             if ($line =~ /^__id\t([^\t]*)\t([^\t]*)\t([^\t]*)$/) {
                 $remote_host{$1} = $2;
                 $remote_id{$1}   = $3;
+            } elsif ($line =~ /^__xpra__\t([^\t]*)\t([^\t]*)$/) {
+                $xpra_listed{"$1\t$2"} = 1;
             } else {
                 my @f = split /\t/, $line, 5;
                 push @rows, \@f if @f == 5;
@@ -207,6 +578,9 @@ while ($sel->count) {
         }
     }
 }
+_dbg("[debug] parent: select-loop done, "
+     . scalar(@rows) . " rows, "
+     . scalar(keys %xpra_listed) . " xpra-listed");
 # Kill stragglers — TERM first, brief grace, then KILL so a stuck ssh
 # can't leave the parent waiting indefinitely for the kernel to reap.
 for my $pid (keys %pid_for) {
@@ -255,21 +629,50 @@ for my $pid (keys %pid_for) {
     }
     if (%canonical) {
         $_->[0] = $canonical{$_->[0]} // $_->[0] for @rows;
+        my %relabelled;
+        for my $key (keys %xpra_listed) {
+            my ($h, $d) = split /\t/, $key, 2;
+            my $h2 = $canonical{$h} // $h;
+            $relabelled{"$h2\t$d"} = 1;
+        }
+        %xpra_listed = %relabelled;
     }
 }
 
 # Aggregate process rows into one entry per (host, display).
+my %ip_for_name    = map { _name_for($_) => $_->{ip}    } @candidates;
+my %local_for_name = map { _name_for($_) => $_->{local} } @candidates;
 my %by_session;       # "$host\t$disp" -> { host, disp, kind, user, cmds, n }
+# Seed sessions reported by `xpra list` first — that way an xpra session
+# with no surviving show-x11 procs (or no apps at all) still appears.
+# User is seeded with whoever we logged in as: $ENV{USER} for the local
+# probe, $ssh_user (or current user) for ssh probes.  Without this seed,
+# `--user X` would drop sessions that show-x11 didn't manage to read
+# proc rows for (eg. when sudo-cat is missing on the remote).
+for my $key (keys %xpra_listed) {
+    my ($host, $disp) = split /\t/, $key, 2;
+    my $is_local = $local_for_name{$host};
+    my $user_seed = $is_local ? ($ENV{USER} // '')
+                              : ($ssh_user // $ENV{USER} // '');
+    $by_session{$key} = { host=>$host, disp=>$disp, user=>$user_seed,
+                          cmds=>[], procs=>[], n=>0, kind=>'xpra',
+                          xpra_listed=>1 };
+}
 for my $r (@rows) {
     my ($host, $disp, $pid, $user, $cmd) = @$r;
     my $key = "$host\t$disp";
     # Default kind by display number: <:20 is presumed plain X, :20+ is
-    # presumed xpra.  We're not running `xpra list` on the remote, so this
-    # is a heuristic; revisit if it's wrong often.
+    # presumed xpra.  Overridden to 'xpra' for displays `xpra list`
+    # confirmed.
     my ($n) = $disp =~ /^:(\d+)$/;
     my $kind_default = (defined $n && $n >= 20) ? 'xpra' : 'X';
     my $s = $by_session{$key} //= { host=>$host, disp=>$disp, user=>$user,
                                      cmds=>[], procs=>[], n=>0, kind=>$kind_default };
+    $s->{kind} = 'xpra' if $xpra_listed{$key};
+    # Prefer a non-empty user — some procs (eg. pulseaudio in xpra
+    # sessions) report no USER and would otherwise lock in the session
+    # owner as ''.
+    $s->{user} = $user if length $user && !length $s->{user};
     $s->{n}++;
     push @{ $s->{procs} }, { pid => $pid, user => $user, cmd => $cmd };
     # Drop session-plumbing daemons; keep candidate "main apps" with args.
@@ -357,40 +760,73 @@ my @sessions = values %by_session;
 # Stamp each session with an IP (looked up from candidates by name) and a
 # numeric display.  Drop displays under :20 unless --all was given —
 # they're presumed plain X (see kind heuristic above).
-my %ip_for_name = map { $_->{name} => $_->{ip} } @candidates;
 for my $s (@sessions) {
     ($s->{disp_n}) = $s->{disp} =~ /^:(\d+)/;
     $s->{ip}       = $ip_for_name{$s->{host}};
+    $s->{local}    = $local_for_name{$s->{host}} ? 1 : 0;
 }
 unless ($all) {
     @sessions = grep { defined $_->{disp_n} && $_->{disp_n} >= 20 } @sessions;
 }
+if (defined $user) {
+    @sessions = grep { defined $_->{user} && $_->{user} eq $user } @sessions;
+}
 
 @sessions = sort {
-       ($a->{host} eq 'localhost' ? 0 : 1) <=> ($b->{host} eq 'localhost' ? 0 : 1)
+       ($b->{local}//0) <=> ($a->{local}//0)
     || $a->{host} cmp $b->{host}
     || $a->{disp_n} <=> $b->{disp_n}
 } @sessions;
 
-# Build display rows: pick a main cmd and format it.
+# Build display rows: pick a main cmd and format it.  An xpra-listed
+# session with no surviving non-daemon procs reads as "(empty xpra)" so
+# the user can still attach to it.
 for my $s (@sessions) {
-    $s->{apps} = _fmt_cmd(_main_cmd(@{ $s->{cmds} }), 60);
+    my $main = _main_cmd(@{ $s->{cmds} });
+    $s->{apps} = length $main           ? _fmt_cmd($main, 60)
+               : $s->{xpra_listed}      ? '(empty xpra)'
+               :                          '(daemons only)';
 }
 
 # Drop sessions whose only contents are session plumbing (no real app to
-# attach to).  --all keeps them.
+# attach to).  Keep xpra-listed sessions even if empty — the user might
+# specifically want to attach to a freshly-started, app-less display.
+# --all keeps everything.
 unless ($all) {
     @sessions = grep { $_->{apps} ne '(daemons only)' } @sessions;
 }
 
+# Cache successful probe results per host so the next picker run shows
+# "[N sess Tm ago]" labels — useful when ssh isn't working today.  Only
+# update on positive results (>0 sessions); a transient failure shouldn't
+# erase a known-good entry.
+{
+    my %sess_count;
+    $sess_count{$_->{host}}++ for @sessions;
+    my $changed;
+    for my $host (keys %sess_count) {
+        $CACHE->{$host} = { ts => time, n_sessions => $sess_count{$host} };
+        $changed = 1;
+    }
+    _save_cache() if $changed;
+}
+
+_dbg("[debug] parent: " . scalar(@sessions) . " sessions ready, "
+     . ($list_only ? '--list mode' : 'about to open Tk chooser'));
+
 unless (@sessions) {
     if ($list_only) { print STDERR "no X11/xpra sessions found\n"; exit 1 }
-    require Tk;
-    Tk->import;
-    my $mw = MainWindow->new(-title => 'find-xpra');
+    my $mw = _tk_mw();
+    $mw->title('find-xpra');
+    $mw->deiconify;
     $mw->Label(-text => 'No X11/xpra sessions found.', -padx => 30, -pady => 30)
        ->pack;
-    $mw->Button(-text => 'Close', -command => sub { exit 1 })->pack(-pady => 6);
+    # Destroy the window so MainLoop returns cleanly, then exit at
+    # the script level — calling `exit` directly from inside a Tk
+    # callback unwinds Perl while MainLoop is still on the stack and
+    # Tk's END handler then segfaults tearing down a half-live UI.
+    $mw->Button(-text => 'Close', -command => sub { $mw->destroy })
+       ->pack(-pady => 6);
     Tk::MainLoop();
     exit 1;
 }
@@ -412,11 +848,11 @@ if ($list_only) {
 # the window up so several sessions can be attached.  Closing the window
 # (regular decoration) ends the program.
 
-require Tk;
-Tk->import;
-my $mw = MainWindow->new(-title => 'find-xpra: attach to X11 session');
-# Tk's stock default is Helvetica 9 / 10 — far too small on a modern display.
-$mw->optionAdd('*Font' => 'sans-serif 11');
+_dbg("[debug] parent: requiring Tk for chooser");
+my $mw = _tk_mw();
+_dbg("[debug] parent: MainWindow created");
+$mw->title('find-xpra: attach to X11 session');
+$mw->deiconify;
 my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '', '', '', '', '');
 
 # Rescan: re-exec self with the same args.  Discovery runs again and the
@@ -541,15 +977,23 @@ exit 0;
 sub _attach_cmd {
     my ($s) = @_;
     (my $disp_n = $s->{disp}) =~ s/^://;
-    return ('xpra', 'attach', ":$disp_n") if $s->{host} eq 'localhost';
-    # Use the IP we discovered, not the hostname — names can be
-    # ambiguous across DNS / DHCP / mDNS, the IP is what we actually
-    # talked to.
-    my $target = $s->{ip} // $s->{host};
+    return ('xpra', 'attach', ":$disp_n") if $s->{local};
+    # Use the host name in the ssh URL so ~/.ssh/config Host blocks (User,
+    # IdentityFile, ...) match.  If we know the IP, force the actual
+    # connection to it via xpra's --ssh override (`-o HostName=$ip`) so
+    # we don't depend on DNS/mDNS being right for the name.
+    my $name = $s->{host};
+    my $ip   = $s->{ip};
+    my @opts;
+    if (defined $name && defined $ip && $name ne $ip) {
+        push @opts, "--ssh=ssh -o HostName=$ip";
+    } else {
+        $name = $ip if defined $ip;
+    }
     my $url = defined $ssh_user
-        ? "ssh://$ssh_user\@$target/$disp_n"
-        : "ssh://$target/$disp_n";
-    return ('xpra', 'attach', $url);
+        ? "ssh://$ssh_user\@$name/$disp_n"
+        : "ssh://$name/$disp_n";
+    return ('xpra', 'attach', @opts, $url);
 }
 
 # Build the command to launch a terminal on the session's display.
@@ -572,6 +1016,37 @@ sub _save_settings {
     close $fh;
 }
 
+sub _load_cache {
+    return {} unless -f $CACHE_PATH;
+    open my $fh, '<', $CACHE_PATH or return {};
+    local $/; my $json = <$fh>;
+    close $fh;
+    return eval { decode_json($json) } // {};
+}
+
+sub _save_cache {
+    make_path($CONFIG_DIR);
+    open my $fh, '>', $CACHE_PATH or do { warn "cache save: $!"; return };
+    print $fh encode_json($CACHE);
+    close $fh;
+}
+
+sub _ago {
+    my ($ts) = @_;
+    my $a = time - ($ts // 0);
+    return $a < 60     ? "${a}s"
+         : $a < 3600   ? sprintf("%dm", int($a/60))
+         : $a < 86400  ? sprintf("%dh", int($a/3600))
+         :               sprintf("%dd", int($a/86400));
+}
+
+sub _cache_label {
+    my ($name) = @_;
+    my $c = $CACHE->{$name} or return undef;
+    return undef unless defined $c->{n_sessions} && $c->{n_sessions} > 0;
+    return sprintf('%d sess %s ago', $c->{n_sessions}, _ago($c->{ts}));
+}
+
 sub _terminal_for {
     my ($host) = @_;
     return $SETTINGS->{$host}{terminal}
@@ -587,26 +1062,18 @@ sub _term_cmd {
     # the DISPLAY env var.  xterm accepts both — we use env-var form so
     # one launch line works for everything.
     my $cmd = "(DISPLAY=:$disp_n $term &)";
-    if ($s->{host} eq 'localhost') {
+    if ($s->{local}) {
         # Perl exec hands $cmd to bash directly — no shell re-tokenisation,
         # so no extra quoting needed.
         return ('bash', '-c', $cmd);
     }
-    my $target = $s->{ip} // $s->{host};
-    my @ssh_target = defined $ssh_user ? ("$ssh_user\@$target") : ($target);
     # ssh joins everything after the target with spaces and ships it to
     # the remote shell, which re-parses.  Without literal single quotes
     # around the bash arg, the remote shell would interpret the parens
     # as a subshell of *its own* and bash -c would get an empty arg.
-    return ('ssh',
-            '-o', "ConnectTimeout=$ssh_to",
-            '-o', 'BatchMode=yes',
-            '-o', 'StrictHostKeyChecking=accept-new',
-            '-o', 'ServerAliveInterval=3',
-            '-o', 'ServerAliveCountMax=2',
-            '-o', 'NumberOfPasswordPrompts=0',
-            '-o', 'PreferredAuthentications=publickey',
-            @ssh_target, 'bash', '-c', "'$cmd'");
+    return ('ssh', ssh_opts(),
+            ssh_target({ name => $s->{host}, ip => $s->{ip} }),
+            'bash', '-c', "'$cmd'");
 }
 
 # Fire-and-forget spawn (no PID tracking, no zombie).  Double-fork into
@@ -615,15 +1082,16 @@ sub spawn_detached {
     my @cmd = @_;
     my $pid = fork // die "fork: $!";
     if ($pid) { waitpid($pid, 0); return; }
+    # In the forked child: skip Tk's END handler, which would close the
+    # X11 fd inherited from the parent and crash the chooser.
     POSIX::setsid();
     my $pid2 = fork;
-    exit 1 unless defined $pid2;
-    exit 0 if $pid2;
+    POSIX::_exit(1) unless defined $pid2;
+    POSIX::_exit(0) if $pid2;
     open STDIN,  '<', '/dev/null';
     open STDOUT, '>', '/dev/null';
     open STDERR, '>', '/dev/null';
-    exec { $cmd[0] } @cmd;
-    exit 127;
+    exec { $cmd[0] } @cmd or POSIX::_exit(127);
 }
 
 # Spawn an xpra-attach child in its own session (so it keeps running if
@@ -635,10 +1103,11 @@ sub spawn_attach {
     my $pid = fork;
     die "fork: $!" unless defined $pid;
     return $pid if $pid;
+    # In the forked child: skip Tk's END so we don't share-close the
+    # parent chooser's X11 fd if exec fails.
     POSIX::setsid();
     open STDIN,  '<', '/dev/null';
     open STDOUT, '>', '/dev/null';
     open STDERR, '>', '/dev/null';
-    exec { $cmd[0] } @cmd;
-    exit 127;
+    exec { $cmd[0] } @cmd or POSIX::_exit(127);
 }

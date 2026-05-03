@@ -44,7 +44,14 @@ foreach $DISP (sort keys %pids) {
     
     foreach $pid (split /\,/,$pids{$DISP}) {
 	next if (defined $user &&  $uid{$pid} ne $user);
-	$cmd=`sudo-cat $pid/cmdline`;
+	# When DONT_SUDO is set (or sudo-cat isn't installed), read the
+	# cmdline directly — works for any pid the current user owns.
+	if ($ENV{DONT_SUDO} || !-x '/usr/bin/sudo-cat' && !`command -v sudo-cat 2>/dev/null`) {
+	    if (open my $cf, '<', "$pid/cmdline") { local $/; $cmd = <$cf> // ''; close $cf }
+	    else { $cmd = '' }
+	} else {
+	    $cmd = `sudo-cat $pid/cmdline`;
+	}
 	$cmd =~ tr/\0/ /;
 	next if (($cmd =~ /show-x11/) || ($fx && ! ($cmd =~ /$fx/)));
 	if ($attach) {

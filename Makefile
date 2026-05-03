@@ -77,6 +77,8 @@ deps:
 	check '/usr/bin/perl -MNetMgr::Client -I$(NETMGR_PERL5DIR) -e 1' \
 	                         net-mgr    "NetMgr::Client at $(NETMGR_PERL5DIR) (install net-mgr)"; \
 	check '/usr/bin/perl -MTk -e 1' libtk-perl 'Perl/Tk (find-xpra chooser window)'; \
+	check '[ -x /usr/bin/ssh-askpass ]' ssh-askpass-gnome \
+	                         'ssh-askpass GUI (find-xpra password prompts; any /usr/bin/ssh-askpass provider works: ssh-askpass-gnome, ssh-askpass, ksshaskpass, ...)'; \
 	check_opt 'command -v nmap'   nmap   'nmap — fallback discovery if NET_MGR_LISTEN unset'; \
 	check_opt 'command -v sudo-cat' sudo-cat 'sudo-cat — required by show-x11 to read /proc/*/cmdline'; \
 	miss=$$(echo $$miss | tr ' ' '\n' | sort -u | tr '\n' ' '); \
