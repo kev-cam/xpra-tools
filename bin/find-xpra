@@ -156,7 +156,16 @@ sub _ssh_config_user {
     my ($name, $ip) = @_;
     return undef unless defined $name && length $name;
     my $g_user;
-    if (open my $h, '-|', 'ssh', '-G', $name) {
+    # Fork-exec ssh -G with stderr silenced so the harmless
+    # "Pseudo-terminal will not be allocated because stdin is not a
+    # terminal" warning doesn't flood the user's terminal.
+    my $cpid = open my $h, '-|';
+    if (!defined $cpid) {
+        # fork failed — fall through to reverse-lookup only.
+    } elsif ($cpid == 0) {
+        open STDERR, '>', '/dev/null';
+        exec 'ssh', '-G', $name or POSIX::_exit(127);
+    } else {
         while (<$h>) { $g_user = $1, last if /^user\s+(\S+)/ }
         close $h;
     }
@@ -498,13 +507,24 @@ sub pick_host {
     my $pid = fork // die "fork: $!";
     if (!$pid) {
         close $rh;
+        _dbg("[debug] picker: child started, requiring Tk");
         require Tk;
         Tk->import;
+        _dbg("[debug] picker: Tk loaded");
         my @user_choices = _ssh_config_users();
+        _dbg("[debug] picker: user_choices = " . join(',', @user_choices));
         my $mw = MainWindow->new(-title => 'find-xpra: pick host');
+        _dbg("[debug] picker: MainWindow created");
         $mw->optionAdd('*Font' => 'sans-serif 11');
         $mw->Label(-text => 'Probe which host?', -padx => 16, -pady => 8)
-            ->grid(-row => 0, -column => 0, -columnspan => 4, -sticky => 'w');
+            ->pack(-anchor => 'w');
+
+        # Two stacked frames: one for host rows, one for the bottom
+        # controls.  Keeping them separate means rows->grid coordinates
+        # stay local to $rows_f and we don't need a bogus large row
+        # number to anchor the buttons below.
+        my $rows_f   = $mw->Frame;  $rows_f  ->pack(-fill => 'both', -expand => 1);
+        my $bottom_f = $mw->Frame;  $bottom_f->pack(-fill => 'x',    -pady   => 10);
 
         # "Hidden" hosts (Forget'd in a previous run) stay out of the
         # picker until the user clicks "Show all", which switches mode
@@ -515,7 +535,7 @@ sub pick_host {
         $rebuild_rows = sub {
             $_->destroy for @row_widgets;
             @row_widgets = ();
-            my $r = 1;
+            my $r = 0;
             for my $i (0 .. $#$cands) {
                 my $c    = $cands->[$i];
                 my $name = _name_for($c);
@@ -531,7 +551,7 @@ sub pick_host {
                             // $ENV{USER}
                             // ($user_choices[0] // '');
                 my ($fav_btn, $main_btn, $user_om, $action_btn);
-                $fav_btn = $mw->Button(
+                $fav_btn = $rows_f->Button(
                     -text => $is_fav ? "\x{2605}" : "\x{2606}",
                     -command => sub {
                         $is_fav = !$is_fav;
@@ -540,7 +560,7 @@ sub pick_host {
                         $fav_btn->configure(
                             -text => $is_fav ? "\x{2605}" : "\x{2606}");
                     });
-                $main_btn = $mw->Button(
+                $main_btn = $rows_f->Button(
                     -text => _host_label($c), -anchor => 'w',
                     -command => sub {
                         # Send back chosen index + the user from this row
@@ -549,7 +569,7 @@ sub pick_host {
                         close $wh;
                         $mw->destroy;
                     });
-                $user_om = $mw->Optionmenu(
+                $user_om = $rows_f->Optionmenu(
                     -options => [@user_choices],
                     -variable => \$row_user,
                 );
@@ -560,7 +580,7 @@ sub pick_host {
                     $user_om->setOption($row_user);
                 }
                 if ($is_hidden) {
-                    $action_btn = $mw->Button(
+                    $action_btn = $rows_f->Button(
                         -text => 'Enable',
                         -command => sub {
                             delete $SETTINGS->{$name}{hidden};
@@ -568,7 +588,7 @@ sub pick_host {
                             $rebuild_rows->();
                         });
                 } else {
-                    $action_btn = $mw->Button(
+                    $action_btn = $rows_f->Button(
                         -text => 'Forget',
                         -command => sub {
                             $SETTINGS->{$name}{hidden} = 1;
@@ -587,12 +607,9 @@ sub pick_host {
             }
         };
         $rebuild_rows->();
+        _dbg("[debug] picker: rows built");
 
-        # Bottom controls in a Frame so the row-count of the host list
-        # doesn't disturb their grid coordinates.
-        my $bottom = $mw->Frame;
-        $bottom->grid(-row => 9999, -column => 0, -columnspan => 4, -pady => 10);
-        $show_btn = $bottom->Button(
+        $show_btn = $bottom_f->Button(
             -text => 'Show all',
             -command => sub {
                 $show_hidden = !$show_hidden;
@@ -601,12 +618,14 @@ sub pick_host {
                 $rebuild_rows->();
             });
         $show_btn->pack(-side => 'left', -padx => 6);
-        $bottom->Button(-text => 'Cancel',
-                        -command => sub { $mw->destroy })
-               ->pack(-side => 'left', -padx => 6);
+        $bottom_f->Button(-text => 'Cancel',
+                          -command => sub { $mw->destroy })
+                 ->pack(-side => 'left', -padx => 6);
 
         $mw->protocol('WM_DELETE_WINDOW' => sub { $mw->destroy });
+        _dbg("[debug] picker: about to MainLoop");
         Tk::MainLoop();
+        _dbg("[debug] picker: MainLoop returned");
         # Cancel/window-close: $wh was never written to.  Closing it now
         # signals EOF to the parent so it doesn't block reading.
         close $wh;
