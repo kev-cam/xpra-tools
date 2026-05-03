@@ -139,20 +139,104 @@ sub ssh_target {
     return (@args, $login);
 }
 
-# Ask ssh which user it would actually log in as for HOST, by parsing
-# `ssh -G HOST` (which evaluates ~/.ssh/config Match/Host blocks etc.).
-# Returns the resolved username, or undef if ssh -G fails.  Used so
-# sessions found under e.g. `find-xpra --listen clevo` (with Host clevo
-# User claude) are tagged as claude's, not whoever ran find-xpra.
+# Resolve the ssh login user for a candidate by consulting ssh_config.
+# Two-step:
+#   1. `ssh -G NAME` evaluates Host/Match blocks where NAME is the alias
+#      (e.g. `Host clevo User claude` matches when NAME is "clevo").
+#   2. If that returned just the default $USER (i.e. no rule matched),
+#      reverse-scan the config for any Host block whose `Hostname` line
+#      points at NAME / IP / bare-name.  This handles the common case
+#      where the alias differs from the real hostname:
+#         Host clevo
+#             Hostname clevo-air.grfx.com
+#             User claude
+#      so a candidate named "clevo-air" or "clevo-air.grfx.com" still
+#      picks up User=claude.
 sub _ssh_config_user {
-    my ($name) = @_;
+    my ($name, $ip) = @_;
     return undef unless defined $name && length $name;
-    my $u;
+    my $g_user;
     if (open my $h, '-|', 'ssh', '-G', $name) {
-        while (<$h>) { $u = $1, last if /^user\s+(\S+)/ }
+        while (<$h>) { $g_user = $1, last if /^user\s+(\S+)/ }
         close $h;
     }
-    return $u;
+    return $g_user if defined $g_user
+                   && length $g_user
+                   && $g_user ne ($ENV{USER} // '');
+    my $hostname_map = _ssh_config_hostname_map();
+    for my $key (
+        lc $name,
+        (defined $ip ? lc $ip : ()),
+        ($name =~ /^([^.]+)\./ ? lc $1 : ()),
+    ) {
+        return $hostname_map->{$key} if defined $hostname_map->{$key};
+    }
+    return $g_user;
+}
+
+# Build a lower-cased "Hostname value -> User" map across all ssh_config
+# files, plus a bare-form alias (Hostname `clevo-air.grfx.com` also
+# entered as `clevo-air`).  First definition wins, matching ssh's own
+# precedence.
+sub _ssh_config_hostname_map {
+    my %map;
+    my $cur;
+    my $finalize = sub {
+        return unless $cur;
+        if (defined $cur->{user} && defined $cur->{hostname}) {
+            my $hn = lc $cur->{hostname};
+            $map{$hn} //= $cur->{user};
+            $map{$1}  //= $cur->{user} if $hn =~ /^([^.]+)\./;
+        }
+        $cur = undef;
+    };
+    for my $f (
+        ($ENV{HOME} ? "$ENV{HOME}/.ssh/config" : ()),
+        '/etc/ssh/ssh_config',
+        glob('/etc/ssh/ssh_config.d/*.conf'),
+    ) {
+        next unless -r $f;
+        open my $fh, '<', $f or next;
+        while (<$fh>) {
+            s/#.*//;
+            s/^\s+|\s+$//g;
+            next unless length;
+            if (/^Host\s+/i) {
+                $finalize->();
+                $cur = { user => undef, hostname => undef };
+            } elsif ($cur) {
+                if    (/^Hostname\s+(\S+)/i) { $cur->{hostname} = $1 }
+                elsif (/^User\s+(\S+)/i)     { $cur->{user}     = $1 }
+            }
+        }
+        $finalize->();
+        close $fh;
+    }
+    return \%map;
+}
+
+# Collect every distinct User mentioned across ~/.ssh/config and
+# /etc/ssh/ssh_config, plus the current $USER.  Used to populate the
+# per-row user dropdown in the --pick chooser so a host that ssh_config
+# defaults to (e.g.) `claude` can still be probed as `dkc`/`wdkc` from
+# the same picker.
+sub _ssh_config_users {
+    my %users;
+    $users{$ENV{USER}} = 1 if defined $ENV{USER} && length $ENV{USER};
+    for my $f (
+        ($ENV{HOME} ? "$ENV{HOME}/.ssh/config" : ()),
+        '/etc/ssh/ssh_config',
+        glob('/etc/ssh/ssh_config.d/*.conf'),
+    ) {
+        next unless -r $f;
+        open my $fh, '<', $f or next;
+        while (<$fh>) {
+            next if /^\s*(?:#|$)/;
+            $users{$1} = 1 if /^\s*User\s+(\S+)/i;
+        }
+        close $fh;
+    }
+    return sort keys %users;
 }
 
 sub usage { <<'EOF' }
@@ -337,7 +421,7 @@ if (defined $user && $user ne ($ENV{USER} // '')) {
 unless (defined $ssh_user) {
     for my $c (@candidates) {
         next if $c->{local};
-        $c->{ssh_user} = _ssh_config_user($c->{name});
+        $c->{ssh_user} = _ssh_config_user($c->{name}, $c->{ip});
     }
 }
 
@@ -360,6 +444,11 @@ if ($pick) {
     my $chosen = pick_host(\@ranked);
     defined $chosen or exit 1;
     @candidates = ($chosen);
+    # If the picker's user-dropdown selected a specific login, lift it
+    # to the global $ssh_user so ssh_target() / ssh_opts() / attach all
+    # honour it for the rest of the run.
+    $ssh_user = $chosen->{ssh_user}
+        if defined $chosen->{ssh_user} && length $chosen->{ssh_user};
 }
 
 sub _name_for {
@@ -371,12 +460,7 @@ sub _host_label {
     my ($c) = @_;
     return 'localhost' if !defined $c->{ip};   # explicit-fallback case
     my $name = _name_for($c);
-    # Prefix the resolved login user (from ~/.ssh/config or --user) so
-    # the picker shows what the ssh probe will actually log in as.  An
-    # explicit --ssh-user wins; otherwise the per-candidate ssh-config
-    # User; otherwise omitted (ssh's own default).
-    my $login_user = $ssh_user // $c->{ssh_user};
-    my $disp = defined $login_user ? "$login_user\@$name" : $name;
+    my $disp = $name;
     $disp .= " ($c->{ip})"   if $c->{ip} ne $name;
     $disp .= "  [local]"     if $c->{local};
     if (my $cl = _cache_label($name)) { $disp .= "  [$cl]" }
@@ -416,15 +500,24 @@ sub pick_host {
         close $rh;
         require Tk;
         Tk->import;
+        my @user_choices = _ssh_config_users();
         my $mw = MainWindow->new(-title => 'find-xpra: pick host');
         $mw->optionAdd('*Font' => 'sans-serif 11');
         $mw->Label(-text => 'Probe which host?', -padx => 16, -pady => 8)
-            ->grid(-row => 0, -column => 0, -columnspan => 3, -sticky => 'w');
+            ->grid(-row => 0, -column => 0, -columnspan => 4, -sticky => 'w');
         for my $i (0 .. $#$cands) {
             my $c    = $cands->[$i];
             my $name = _name_for($c);
             my $is_fav = $SETTINGS->{$name}{favorite} ? 1 : 0;
-            my ($fav_btn, $main_btn);
+            # Per-row chosen user: starts at the resolved ssh-config User
+            # (or $USER for the explicit-localhost fallback) and is bound
+            # to an Optionmenu so the human can override before clicking
+            # the host button.
+            my $row_user = $ssh_user
+                        // $c->{ssh_user}
+                        // $ENV{USER}
+                        // ($user_choices[0] // '');
+            my ($fav_btn, $main_btn, $user_om, $forget_btn);
             $fav_btn = $mw->Button(
                 -text => $is_fav ? "\x{2605}" : "\x{2606}",
                 -command => sub {
@@ -436,11 +529,22 @@ sub pick_host {
             $main_btn = $mw->Button(
                 -text => _host_label($c), -anchor => 'w',
                 -command => sub {
-                    print {$wh} "$i\n";
+                    # Send back chosen index + the user from this row so
+                    # the parent ssh-probes as exactly that user.
+                    print {$wh} "$i\t$row_user\n";
                     close $wh;
                     $mw->destroy;
                 });
-            my $forget_btn;
+            $user_om = $mw->Optionmenu(
+                -options => [@user_choices],
+                -variable => \$row_user,
+            );
+            # Optionmenu defaults to the first option; force it to our
+            # resolved/preferred user if it's in the list.
+            if (length $row_user
+                && grep { $_ eq $row_user } @user_choices) {
+                $user_om->setOption($row_user);
+            }
             $forget_btn = $mw->Button(
                 -text => 'Forget',
                 -command => sub {
@@ -451,15 +555,17 @@ sub pick_host {
                     # zero height by default, so subsequent rows shift up.
                     $fav_btn   ->destroy;
                     $main_btn  ->destroy;
+                    $user_om   ->destroy;
                     $forget_btn->destroy;
                 });
             $fav_btn   ->grid(-row => $i+1, -column => 0, -padx => 4, -pady => 1);
             $main_btn  ->grid(-row => $i+1, -column => 1, -padx => 4, -pady => 1, -sticky => 'ew');
-            $forget_btn->grid(-row => $i+1, -column => 2, -padx => 4, -pady => 1);
+            $user_om   ->grid(-row => $i+1, -column => 2, -padx => 4, -pady => 1, -sticky => 'ew');
+            $forget_btn->grid(-row => $i+1, -column => 3, -padx => 4, -pady => 1);
         }
         $mw->Button(-text => 'Cancel', -command => sub { $mw->destroy })
             ->grid(-row => scalar(@$cands)+1, -column => 0,
-                   -columnspan => 3, -pady => 10);
+                   -columnspan => 4, -pady => 10);
         $mw->protocol('WM_DELETE_WINDOW' => sub { $mw->destroy });
         Tk::MainLoop();
         # Cancel/window-close: $wh was never written to.  Closing it now
@@ -473,10 +579,16 @@ sub pick_host {
     waitpid($pid, 0);
     return undef unless defined $line && length $line;
     chomp $line;
-    return undef unless $line =~ /^(\d+)$/;
+    my ($idx_str, $picked_user) = split /\t/, $line, 2;
+    return undef unless defined $idx_str && $idx_str =~ /^(\d+)$/;
     my $idx = $1 + 0;
     return undef unless $idx < @$cands;
-    return $cands->[$idx];
+    my $picked = $cands->[$idx];
+    # Honour the user the picker selected (overrides any earlier
+    # ssh-config resolution) so the probe / attach run as that user.
+    $picked->{ssh_user} = $picked_user
+        if defined $picked_user && length $picked_user;
+    return $picked;
 }
 
 # Single MainWindow for the whole process — Tk segfaults if you create,
