@@ -407,12 +407,18 @@ sub pick_host {
                     close $wh;
                     $mw->destroy;
                 });
-            my $forget_btn = $mw->Button(
+            my $forget_btn;
+            $forget_btn = $mw->Button(
                 -text => 'Forget',
                 -command => sub {
                     delete $CACHE->{$name};
                     _save_cache();
-                    $main_btn->configure(-text => _host_label($c));
+                    # Drop the row from the dialog immediately so the
+                    # entry is visibly gone.  Empty grid rows collapse to
+                    # zero height by default, so subsequent rows shift up.
+                    $fav_btn   ->destroy;
+                    $main_btn  ->destroy;
+                    $forget_btn->destroy;
                 });
             $fav_btn   ->grid(-row => $i+1, -column => 0, -padx => 4, -pady => 1);
             $main_btn  ->grid(-row => $i+1, -column => 1, -padx => 4, -pady => 1, -sticky => 'ew');
