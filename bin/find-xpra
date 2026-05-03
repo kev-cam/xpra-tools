@@ -139,6 +139,22 @@ sub ssh_target {
     return (@args, $login);
 }
 
+# Ask ssh which user it would actually log in as for HOST, by parsing
+# `ssh -G HOST` (which evaluates ~/.ssh/config Match/Host blocks etc.).
+# Returns the resolved username, or undef if ssh -G fails.  Used so
+# sessions found under e.g. `find-xpra --listen clevo` (with Host clevo
+# User claude) are tagged as claude's, not whoever ran find-xpra.
+sub _ssh_config_user {
+    my ($name) = @_;
+    return undef unless defined $name && length $name;
+    my $u;
+    if (open my $h, '-|', 'ssh', '-G', $name) {
+        while (<$h>) { $u = $1, last if /^user\s+(\S+)/ }
+        close $h;
+    }
+    return $u;
+}
+
 sub usage { <<'EOF' }
 usage: find-xpra [options]
   --listen HOST[:PORT]  net-mgr address (default: $NET_MGR_LISTEN, then
@@ -310,6 +326,18 @@ if (defined $user && $user ne ($ENV{USER} // '')) {
         next unless $c->{local};
         $c->{local} = 0;
         $c->{ip} //= '127.0.0.1';
+    }
+}
+
+# Resolve per-candidate ssh user via `ssh -G NAME` when neither --user
+# nor --ssh-user was given.  ~/.ssh/config Host blocks (e.g. `Host clevo
+# User claude`) then drive both the ssh login and the user we tag the
+# session under, so `find-xpra --listen clevo` correctly attributes
+# sessions to claude rather than to whoever ran find-xpra.
+unless (defined $ssh_user) {
+    for my $c (@candidates) {
+        next if $c->{local};
+        $c->{ssh_user} = _ssh_config_user($c->{name});
     }
 }
 
@@ -646,20 +674,21 @@ for my $pid (keys %pid_for) {
 }
 
 # Aggregate process rows into one entry per (host, display).
-my %ip_for_name    = map { _name_for($_) => $_->{ip}    } @candidates;
-my %local_for_name = map { _name_for($_) => $_->{local} } @candidates;
+my %ip_for_name    = map { _name_for($_) => $_->{ip}       } @candidates;
+my %local_for_name = map { _name_for($_) => $_->{local}    } @candidates;
+my %user_for_name  = map { _name_for($_) => $_->{ssh_user} } @candidates;
 my %by_session;       # "$host\t$disp" -> { host, disp, kind, user, cmds, n }
 # Seed sessions reported by `xpra list` first — that way an xpra session
 # with no surviving show-x11 procs (or no apps at all) still appears.
 # User is seeded with whoever we logged in as: $ENV{USER} for the local
-# probe, $ssh_user (or current user) for ssh probes.  Without this seed,
-# `--user X` would drop sessions that show-x11 didn't manage to read
-# proc rows for (eg. when sudo-cat is missing on the remote).
+# probe, the per-candidate ssh-config-resolved user for remote probes
+# (or $ssh_user / $ENV{USER} as fallbacks).
 for my $key (keys %xpra_listed) {
     my ($host, $disp) = split /\t/, $key, 2;
     my $is_local = $local_for_name{$host};
-    my $user_seed = $is_local ? ($ENV{USER} // '')
-                              : ($ssh_user // $ENV{USER} // '');
+    my $user_seed = $is_local
+        ? ($ENV{USER} // '')
+        : ($ssh_user // $user_for_name{$host} // $ENV{USER} // '');
     $by_session{$key} = { host=>$host, disp=>$disp, user=>$user_seed,
                           cmds=>[], procs=>[], n=>0, kind=>'xpra',
                           xpra_listed=>1 };
