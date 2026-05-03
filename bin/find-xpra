@@ -371,7 +371,12 @@ sub _host_label {
     my ($c) = @_;
     return 'localhost' if !defined $c->{ip};   # explicit-fallback case
     my $name = _name_for($c);
-    my $disp = $name;
+    # Prefix the resolved login user (from ~/.ssh/config or --user) so
+    # the picker shows what the ssh probe will actually log in as.  An
+    # explicit --ssh-user wins; otherwise the per-candidate ssh-config
+    # User; otherwise omitted (ssh's own default).
+    my $login_user = $ssh_user // $c->{ssh_user};
+    my $disp = defined $login_user ? "$login_user\@$name" : $name;
     $disp .= " ($c->{ip})"   if $c->{ip} ne $name;
     $disp .= "  [local]"     if $c->{local};
     if (my $cl = _cache_label($name)) { $disp .= "  [$cl]" }
