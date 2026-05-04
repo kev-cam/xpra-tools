@@ -107,7 +107,13 @@ sub ssh_opts {
         '-o', 'ServerAliveInterval=3',
         '-o', 'ServerAliveCountMax=2',
     );
-    push @opts, '-i', $ssh_key if defined $ssh_key;
+    # Identity: --ssh-key wins, else fall back to the per-user key the
+    # picker's "Keys" dialog saved in $SETTINGS->{_user_keys}{$user}.
+    my $key = $ssh_key;
+    if (!defined $key && defined $ssh_user) {
+        $key = $SETTINGS->{_user_keys}{$ssh_user};
+    }
+    push @opts, '-i', $key if defined $key && length $key;
     if ($no_prompt) {
         push @opts,
             '-o', 'BatchMode=yes',
@@ -742,9 +748,63 @@ sub pick_host {
                 $entry->bind('<Return>', $accept);
                 $top->protocol('WM_DELETE_WINDOW' => sub { $top->destroy });
             });
-        # Initial layout: Show all + Add user + Cancel (Hide kept in reserve).
+        my $keys_btn = $bottom_f->Button(
+            -text => 'Keys',
+            -command => sub {
+                my $top = $mw->Toplevel(-title => 'find-xpra: ssh keys');
+                $top->Label(-text => 'Per-user ssh key files (used when '
+                                   . '--ssh-key isn\'t given):',
+                            -padx => 12, -pady => 8)->pack(-anchor => 'w');
+                my %paths;   # user -> scalar holding current path
+                for my $u (@user_choices) {
+                    my $val = $SETTINGS->{_user_keys}{$u} // '';
+                    $paths{$u} = \$val;
+                    my $row = $top->Frame;
+                    $row->pack(-fill => 'x', -padx => 12, -pady => 2);
+                    $row->Label(-text => $u, -width => 12, -anchor => 'w')
+                        ->pack(-side => 'left');
+                    my $entry = $row->Entry(-textvariable => $paths{$u},
+                                            -width => 40);
+                    $entry->pack(-side => 'left', -fill => 'x',
+                                 -expand => 1, -padx => 4);
+                    $row->Button(-text => 'Browse', -command => sub {
+                        my $start = "$ENV{HOME}/.ssh";
+                        $start = $ENV{HOME} unless -d $start;
+                        my $f = $top->getOpenFile(
+                            -title      => "ssh key for $u",
+                            -initialdir => $start,
+                        );
+                        ${ $paths{$u} } = $f
+                            if defined $f && length $f;
+                    })->pack(-side => 'left', -padx => 2);
+                    $row->Button(-text => 'Clear', -command => sub {
+                        ${ $paths{$u} } = '';
+                    })->pack(-side => 'left', -padx => 2);
+                }
+                my $bf = $top->Frame->pack(-pady => 10);
+                $bf->Button(-text => 'Save', -command => sub {
+                    for my $u (keys %paths) {
+                        my $v = ${ $paths{$u} };
+                        $v =~ s/^\s+|\s+$//g if defined $v;
+                        if (defined $v && length $v) {
+                            $SETTINGS->{_user_keys}{$u} = $v;
+                        } else {
+                            delete $SETTINGS->{_user_keys}{$u};
+                        }
+                    }
+                    _save_settings($SETTINGS);
+                    $top->destroy;
+                })->pack(-side => 'left', -padx => 6);
+                $bf->Button(-text => 'Cancel',
+                            -command => sub { $top->destroy })
+                   ->pack(-side => 'left', -padx => 6);
+                $top->protocol('WM_DELETE_WINDOW' => sub { $top->destroy });
+            });
+        # Initial layout: Show all + Add user + Keys + Cancel
+        # (Hide kept in reserve — swaps with Show all.)
         $show_btn  ->pack(-side => 'left', -padx => 6);
         $add_btn   ->pack(-side => 'left', -padx => 6);
+        $keys_btn  ->pack(-side => 'left', -padx => 6);
         $cancel_btn->pack(-side => 'left', -padx => 6);
 
         $mw->protocol('WM_DELETE_WINDOW' => sub { $mw->destroy });
@@ -760,6 +820,10 @@ sub pick_host {
     my $line = <$rh>;
     close $rh;
     waitpid($pid, 0);
+    # The picker subprocess may have written settings (favourites,
+    # hidden hosts, added users, per-user keys); reload so the parent
+    # sees them for ssh_opts() / probe / attach.
+    $SETTINGS = _load_settings();
     return undef unless defined $line && length $line;
     chomp $line;
     my ($idx_str, $picked_user) = split /\t/, $line, 2;
