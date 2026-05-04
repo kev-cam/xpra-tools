@@ -64,7 +64,7 @@ check_opt() { \
 check 'command -v perl'  perl       'Perl interpreter'; \
 check 'command -v xpra'  xpra       'xpra (attach/start sessions)'; \
 check 'command -v ssh'   openssh-client 'ssh client (remote show-x11 probe)'; \
-check 'command -v ip'    iproute2   'ip command (subnet discovery)'; \
+check_opt 'command -v ip' iproute2   'ip command (local-IP detection + nmap-scan source IP; not on Cygwin)'; \
 check '/usr/bin/perl -MNetMgr::Client -I$(NETMGR_PERL5DIR) -e 1' \
                          net-mgr    "NetMgr::Client at $(NETMGR_PERL5DIR) (install net-mgr)"; \
 check '/usr/bin/perl -MTk -e 1' libtk-perl 'Perl/Tk (find-xpra chooser window)'; \
