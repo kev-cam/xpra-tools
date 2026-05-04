@@ -1318,13 +1318,11 @@ sub _xpra_bin {
     if (defined $ENV{XPRA} && length $ENV{XPRA}) {
         return $XPRA_BIN = $ENV{XPRA};
     }
-    # If something on PATH responds to `xpra --version`, use it.  Use
-    # 2>/dev/null so the warning doesn't pollute the user's terminal.
-    my $rc = system 'sh', '-c', 'command -v xpra >/dev/null 2>&1';
-    return $XPRA_BIN = 'xpra' if $rc == 0;
-    # Cygwin: xpra is typically installed under Program Files as a
-    # native Windows binary, not on the Cygwin PATH.  Probe the usual
-    # locations and use the first one that exists.
+    # Cygwin: prefer the native Windows install under Program Files
+    # over whatever `command -v xpra` reports.  Cygwin's PATH often
+    # leaks Windows directories so PATH lookup can find a broken stub
+    # or a binary that won't actually run from a Cygwin process; the
+    # explicit Xpra_cmd.exe / Xpra.exe paths are the reliable choice.
     if ($^O eq 'cygwin' || $^O eq 'msys') {
         for my $p (
             '/cygdrive/c/Program Files/Xpra/Xpra_cmd.exe',
@@ -1335,6 +1333,9 @@ sub _xpra_bin {
             return $XPRA_BIN = $p if -x $p;
         }
     }
+    # If something on PATH responds, use it.
+    my $rc = system 'sh', '-c', 'command -v xpra >/dev/null 2>&1';
+    return $XPRA_BIN = 'xpra' if $rc == 0;
     # Last resort — let exec fail loudly rather than silently.
     return $XPRA_BIN = 'xpra';
 }
