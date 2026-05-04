@@ -62,7 +62,8 @@ check_opt() { \
   fi; \
 }; \
 check 'command -v perl'  perl       'Perl interpreter'; \
-check 'command -v xpra'  xpra       'xpra (attach/start sessions)'; \
+check 'command -v xpra || [ -x "/cygdrive/c/Program Files/Xpra/Xpra_cmd.exe" ] || [ -x "/cygdrive/c/Program Files (x86)/Xpra/Xpra_cmd.exe" ]' \
+                         xpra       'xpra (attach/start sessions; on Cygwin the Windows install under Program Files is detected automatically)'; \
 check 'command -v ssh'   openssh-client 'ssh client (remote show-x11 probe)'; \
 check_opt 'command -v ip' iproute2   'ip command (local-IP detection + nmap-scan source IP; not on Cygwin)'; \
 check '/usr/bin/perl -MNetMgr::Client -I$(NETMGR_PERL5DIR) -e 1' \

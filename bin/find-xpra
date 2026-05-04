@@ -1245,10 +1245,38 @@ sub _show_procs {
 }
 exit 0;
 
+our $XPRA_BIN;
+sub _xpra_bin {
+    return $XPRA_BIN if defined $XPRA_BIN;
+    # Honour an explicit override first (e.g. XPRA=/path/to/xpra).
+    if (defined $ENV{XPRA} && length $ENV{XPRA}) {
+        return $XPRA_BIN = $ENV{XPRA};
+    }
+    # If something on PATH responds to `xpra --version`, use it.  Use
+    # 2>/dev/null so the warning doesn't pollute the user's terminal.
+    my $rc = system 'sh', '-c', 'command -v xpra >/dev/null 2>&1';
+    return $XPRA_BIN = 'xpra' if $rc == 0;
+    # Cygwin: xpra is typically installed under Program Files as a
+    # native Windows binary, not on the Cygwin PATH.  Probe the usual
+    # locations and use the first one that exists.
+    if ($^O eq 'cygwin' || $^O eq 'msys') {
+        for my $p (
+            '/cygdrive/c/Program Files/Xpra/Xpra_cmd.exe',
+            '/cygdrive/c/Program Files (x86)/Xpra/Xpra_cmd.exe',
+            '/cygdrive/c/Program Files/Xpra/Xpra.exe',
+            '/cygdrive/c/Program Files (x86)/Xpra/Xpra.exe',
+        ) {
+            return $XPRA_BIN = $p if -x $p;
+        }
+    }
+    # Last resort — let exec fail loudly rather than silently.
+    return $XPRA_BIN = 'xpra';
+}
+
 sub _attach_cmd {
     my ($s) = @_;
     (my $disp_n = $s->{disp}) =~ s/^://;
-    return ('xpra', 'attach', ":$disp_n") if $s->{local};
+    return (_xpra_bin(), 'attach', ":$disp_n") if $s->{local};
     # Use the host name in the ssh URL so ~/.ssh/config Host blocks (User,
     # IdentityFile, ...) match.  If we know the IP, force the actual
     # connection to it via xpra's --ssh override (`-o HostName=$ip`) so
@@ -1264,7 +1292,7 @@ sub _attach_cmd {
     my $url = defined $ssh_user
         ? "ssh://$ssh_user\@$name/$disp_n"
         : "ssh://$name/$disp_n";
-    return ('xpra', 'attach', @opts, $url);
+    return (_xpra_bin(), 'attach', @opts, $url);
 }
 
 # Build the command to launch a terminal on the session's display.
