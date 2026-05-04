@@ -768,7 +768,9 @@ for my $c (@candidates) {
         #   xpra list          -> authoritative list of xpra displays, even
         #                         empty ones that show-x11 would miss
         # Separator marks the boundary so the parser can switch modes.
-        my $remote = 'show-x11 -ns -id; echo __XPRA__; xpra list 2>/dev/null';
+        # No `2>/dev/null` -- a csh/tcsh login shell on the remote chokes
+        # on bash-style redirection and the whole probe returns nothing.
+        my $remote = 'show-x11 -ns -id; echo __XPRA__; xpra list';
         my @cmd = $c->{local}
             ? ('sh', '-c', $remote)
             : ('ssh', ssh_opts(), ssh_target($c), $remote);
