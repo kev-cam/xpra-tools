@@ -1465,6 +1465,7 @@ sub spawn_detached {
 # repeat-timer when the viewer exits.
 sub spawn_attach {
     my @cmd = @_;
+    _dbg("[debug] attach: " . join(' ', map { /\s/ ? "'$_'" : $_ } @cmd));
     my $pid = fork;
     die "fork: $!" unless defined $pid;
     return $pid if $pid;
@@ -1472,7 +1473,15 @@ sub spawn_attach {
     # parent chooser's X11 fd if exec fails.
     POSIX::setsid();
     open STDIN,  '<', '/dev/null';
-    open STDOUT, '>', '/dev/null';
-    open STDERR, '>', '/dev/null';
+    # In --debug mode keep stdout/stderr attached (and tee'd to the log
+    # file via _dbg) so xpra's launch errors are visible.  Otherwise
+    # silence them so a failed attach doesn't spam the chooser.
+    if ($debug && $DEBUG_LOG_FH) {
+        open STDOUT, '>&', $DEBUG_LOG_FH;
+        open STDERR, '>&', $DEBUG_LOG_FH;
+    } else {
+        open STDOUT, '>', '/dev/null';
+        open STDERR, '>', '/dev/null';
+    }
     exec { $cmd[0] } @cmd or POSIX::_exit(127);
 }
