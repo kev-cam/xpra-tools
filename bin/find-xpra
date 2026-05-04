@@ -609,33 +609,34 @@ sub pick_host {
         $rebuild_rows->();
         _dbg("[debug] picker: rows built");
 
-        # Two distinct buttons rather than one toggle so the available
-        # action is obvious: Show all reveals hidden hosts (with Enable
-        # buttons to un-hide), Hide goes back to the default view.  Each
-        # disables itself once its mode is active.
-        my $hide_btn;
+        # Show all and Hide swap places: only one is visible at a time.
+        # Default view: [Show all] [Cancel].  After clicking Show all:
+        # [Hide] [Cancel].
+        my ($cancel_btn, $hide_btn);
         $show_btn = $bottom_f->Button(
             -text => 'Show all',
             -command => sub {
                 $show_hidden = 1;
                 $rebuild_rows->();
-                $show_btn->configure(-state => 'disabled');
-                $hide_btn->configure(-state => 'normal');
+                $show_btn->packForget;
+                $hide_btn->pack(-side => 'left', -padx => 6,
+                                -before => $cancel_btn);
             });
-        $show_btn->pack(-side => 'left', -padx => 6);
         $hide_btn = $bottom_f->Button(
             -text => 'Hide',
-            -state => 'disabled',
             -command => sub {
                 $show_hidden = 0;
                 $rebuild_rows->();
-                $show_btn->configure(-state => 'normal');
-                $hide_btn->configure(-state => 'disabled');
+                $hide_btn->packForget;
+                $show_btn->pack(-side => 'left', -padx => 6,
+                                -before => $cancel_btn);
             });
-        $hide_btn->pack(-side => 'left', -padx => 6);
-        $bottom_f->Button(-text => 'Cancel',
-                          -command => sub { $mw->destroy })
-                 ->pack(-side => 'left', -padx => 6);
+        $cancel_btn = $bottom_f->Button(
+            -text => 'Cancel',
+            -command => sub { $mw->destroy });
+        # Initial layout: Show all + Cancel (Hide kept in reserve).
+        $show_btn  ->pack(-side => 'left', -padx => 6);
+        $cancel_btn->pack(-side => 'left', -padx => 6);
 
         $mw->protocol('WM_DELETE_WINDOW' => sub { $mw->destroy });
         _dbg("[debug] picker: about to MainLoop");
