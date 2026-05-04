@@ -225,13 +225,17 @@ sub _ssh_config_hostname_map {
 }
 
 # Collect every distinct User mentioned across ~/.ssh/config and
-# /etc/ssh/ssh_config, plus the current $USER.  Used to populate the
-# per-row user dropdown in the --pick chooser so a host that ssh_config
-# defaults to (e.g.) `claude` can still be probed as `dkc`/`wdkc` from
-# the same picker.
+# /etc/ssh/ssh_config, plus the current $USER, plus any names the user
+# explicitly added via the picker's "Add user" button (persisted under
+# $SETTINGS->{_users}).  Used to populate the per-row user dropdown so a
+# host that ssh_config defaults to (e.g.) `claude` can still be probed
+# as `dkc`/`wdkc` from the same picker.
 sub _ssh_config_users {
     my %users;
     $users{$ENV{USER}} = 1 if defined $ENV{USER} && length $ENV{USER};
+    for my $u (keys %{ $SETTINGS->{_users} || {} }) {
+        $users{$u} = 1;
+    }
     for my $f (
         ($ENV{HOME} ? "$ENV{HOME}/.ssh/config" : ()),
         '/etc/ssh/ssh_config',
@@ -708,8 +712,39 @@ sub pick_host {
         $cancel_btn = $bottom_f->Button(
             -text => 'Cancel',
             -command => sub { $mw->destroy });
-        # Initial layout: Show all + Cancel (Hide kept in reserve).
+        my $add_btn = $bottom_f->Button(
+            -text => 'Add user',
+            -command => sub {
+                my $top = $mw->Toplevel(-title => 'find-xpra: add user');
+                $top->Label(-text => 'New username for the dropdowns:',
+                            -padx => 12, -pady => 8)->pack(-anchor => 'w');
+                my $name = '';
+                my $entry = $top->Entry(-textvariable => \$name, -width => 30);
+                $entry->pack(-padx => 12, -pady => 4, -fill => 'x');
+                $entry->focus;
+                my $bf = $top->Frame->pack(-pady => 8);
+                my $accept = sub {
+                    $name =~ s/^\s+|\s+$//g;
+                    if (length $name) {
+                        $SETTINGS->{_users}{$name} = 1;
+                        _save_settings($SETTINGS);
+                        # Refresh the choices list and rebuild rows so
+                        # every dropdown picks up the new option.
+                        @user_choices = _ssh_config_users();
+                        $rebuild_rows->();
+                    }
+                    $top->destroy;
+                };
+                $bf->Button(-text => 'OK',     -command => $accept)
+                   ->pack(-side => 'left', -padx => 6);
+                $bf->Button(-text => 'Cancel', -command => sub { $top->destroy })
+                   ->pack(-side => 'left', -padx => 6);
+                $entry->bind('<Return>', $accept);
+                $top->protocol('WM_DELETE_WINDOW' => sub { $top->destroy });
+            });
+        # Initial layout: Show all + Add user + Cancel (Hide kept in reserve).
         $show_btn  ->pack(-side => 'left', -padx => 6);
+        $add_btn   ->pack(-side => 'left', -padx => 6);
         $cancel_btn->pack(-side => 'left', -padx => 6);
 
         $mw->protocol('WM_DELETE_WINDOW' => sub { $mw->destroy });
