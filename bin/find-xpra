@@ -1314,27 +1314,42 @@ exit 0;
 our $XPRA_BIN;
 sub _xpra_bin {
     return $XPRA_BIN if defined $XPRA_BIN;
+    _dbg("[debug] _xpra_bin: \$^O=$^O  XPRA=" . ($ENV{XPRA} // '(unset)'));
     # Honour an explicit override first (e.g. XPRA=/path/to/xpra).
     if (defined $ENV{XPRA} && length $ENV{XPRA}) {
+        _dbg("[debug] _xpra_bin: using XPRA env=$ENV{XPRA}");
         return $XPRA_BIN = $ENV{XPRA};
     }
-    # Cygwin: prefer the native Windows install under Program Files
-    # over whatever `command -v xpra` reports.  Cygwin's PATH often
-    # leaks Windows directories so PATH lookup can find a broken stub
-    # or a binary that won't actually run from a Cygwin process; the
-    # explicit Xpra_cmd.exe / Xpra.exe paths are the reliable choice.
-    if ($^O eq 'cygwin' || $^O eq 'msys') {
+    # Cygwin/MSYS/Windows: prefer the native Windows install under
+    # Program Files over whatever `command -v xpra` reports.  Cygwin's
+    # PATH often leaks Windows directories so PATH lookup can find a
+    # broken stub or a binary that won't actually run from a Cygwin
+    # process; the explicit Xpra_cmd.exe / Xpra.exe paths are the
+    # reliable choice.  $^O is "cygwin" / "msys" / "MSWin32".
+    if ($^O =~ /^(?:cygwin|msys|MSWin32)$/i) {
         for my $p (
             '/cygdrive/c/Program Files/Xpra/Xpra_cmd.exe',
             '/cygdrive/c/Program Files (x86)/Xpra/Xpra_cmd.exe',
             '/cygdrive/c/Program Files/Xpra/Xpra.exe',
             '/cygdrive/c/Program Files (x86)/Xpra/Xpra.exe',
+            'C:/Program Files/Xpra/Xpra_cmd.exe',
+            'C:/Program Files (x86)/Xpra/Xpra_cmd.exe',
+            'C:/Program Files/Xpra/Xpra.exe',
+            'C:/Program Files (x86)/Xpra/Xpra.exe',
         ) {
-            return $XPRA_BIN = $p if -x $p;
+            my $hit = -e $p ? 'exists' : 'missing';
+            my $exec = -x $p ? 'exec'   : 'noexec';
+            _dbg("[debug] _xpra_bin:   $p ($hit, $exec)");
+            if (-e $p) {
+                _dbg("[debug] _xpra_bin: using $p");
+                return $XPRA_BIN = $p;
+            }
         }
     }
     # If something on PATH responds, use it.
     my $rc = system 'sh', '-c', 'command -v xpra >/dev/null 2>&1';
+    _dbg("[debug] _xpra_bin: PATH lookup rc=$rc -> "
+         . ($rc == 0 ? 'using bare xpra' : 'falling through'));
     return $XPRA_BIN = 'xpra' if $rc == 0;
     # Last resort — let exec fail loudly rather than silently.
     return $XPRA_BIN = 'xpra';
