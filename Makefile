@@ -65,7 +65,8 @@ check 'command -v perl'  perl       'Perl interpreter'; \
 check 'command -v xpra || [ -x "/cygdrive/c/Program Files/Xpra/Xpra_cmd.exe" ] || [ -x "/cygdrive/c/Program Files (x86)/Xpra/Xpra_cmd.exe" ]' \
                          xpra       'xpra (attach/start sessions; on Cygwin the Windows install under Program Files is detected automatically)'; \
 check 'command -v ssh'   openssh-client 'ssh client (remote show-x11 probe)'; \
-check_opt 'command -v ip' iproute2   'ip command (local-IP detection + nmap-scan source IP; not on Cygwin)'; \
+check_opt 'command -v ip || command -v ifconfig || command -v ipconfig' \
+                         iproute2   'ip / ifconfig / ipconfig (local-IP detection + nmap-scan source IP; any one is fine)'; \
 check '/usr/bin/perl -MNetMgr::Client -I$(NETMGR_PERL5DIR) -e 1' \
                          net-mgr    "NetMgr::Client at $(NETMGR_PERL5DIR) (install net-mgr)"; \
 check '/usr/bin/perl -MTk -e 1' libtk-perl 'Perl/Tk (find-xpra chooser window)'; \

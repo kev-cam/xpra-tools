@@ -289,15 +289,49 @@ sub probe_net_mgr {
     return 1;
 }
 
+sub _local_ips_set {
+    # Cross-platform: try `ip` (Linux), `ifconfig` (BSD/macOS, older
+    # Linux), then `ipconfig` (Cygwin/Windows native).  Returns a hashref
+    # keyed by every IPv4/IPv6 address we own.
+    my %ips;
+    if (open my $h, '-|', 'ip', '-o', 'addr', 'show') {
+        while (<$h>) { $ips{$1} = 1 if /\binet6?\s+([\da-f.:]+)/i }
+        close $h;
+    }
+    if (!%ips && open my $h, '-|', 'ifconfig') {
+        while (<$h>) { $ips{$1} = 1 if /\binet6?\s+(?:addr:\s*)?([\da-f.:]+)/i }
+        close $h;
+    }
+    if (!%ips && open my $h, '-|', 'ipconfig') {
+        while (<$h>) { $ips{$1} = 1
+            if /(?:IPv4 Address|IPv6 Address|IP Address)[^:]*:\s*([\da-f.:]+)/i }
+        close $h;
+    }
+    return \%ips;
+}
+
+sub _default_src_ip {
+    # The IP we'd use to reach the outside world.  On Linux, ask `ip
+    # route get`.  Otherwise, fall back to the first non-loopback IPv4
+    # we own — good enough for picking a /24 to nmap-scan.
+    if (open my $h, '-|', 'ip', 'route', 'get', '1.1.1.1') {
+        while (<$h>) { return $1 if /\bsrc\s+(\S+)/ }
+    }
+    my $ips = _local_ips_set();
+    for my $ip (sort keys %$ips) {
+        next unless $ip =~ /^\d+\.\d+\.\d+\.\d+$/;
+        next if $ip =~ /^127\./;
+        return $ip;
+    }
+    return undef;
+}
+
 sub scan_net_mgr {
     # nmap the local /24 for port 7531/tcp.  Returns 'host:port' or undef.
     # If $skip_self, drop our own source IP from the result so a remote
     # peer wins instead of looping back to ourselves.
     my ($skip_self) = @_;
-    my $src;
-    if (open my $rh, '-|', 'ip', 'route', 'get', '1.1.1.1') {
-        while (<$rh>) { $src = $1, last if /\bsrc\s+(\S+)/ }
-    }
+    my $src = _default_src_ip();
     return undef unless $src;
     (my $subnet = $src) =~ s{\.\d+$}{.0/24};
     my @hosts;
@@ -362,13 +396,10 @@ for my $p (@$svc_ports) {
 }
 
 # Local IPs — used to flag candidates that are us, so we run show-x11
-# directly instead of sshing into ourselves.
-my %local_ip;
-if (open my $rh, '-|', 'ip', '-o', 'addr', 'show') {
-    while (<$rh>) {
-        $local_ip{$1} = 1 if /\binet6?\s+([\da-f.:]+)/i;
-    }
-}
+# directly instead of sshing into ourselves.  _local_ips_set() probes
+# ip / ifconfig / ipconfig in turn so this works on Linux, BSD/macOS
+# and Cygwin alike.
+my %local_ip = %{ _local_ips_set() };
 
 my @candidates;
 for my $m (@$machines) {
