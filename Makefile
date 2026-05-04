@@ -12,6 +12,9 @@ PREFIX           ?= /usr/local
 BINDIR           ?= $(PREFIX)/bin
 NETMGR_PERL5DIR  ?= $(PREFIX)/share/perl5
 DESTDIR          ?=
+# Set FORCE=1 to skip the dependency prompt entirely (useful in CI or when
+# you know your package manager differs from Debian/Ubuntu — e.g. Cygwin).
+FORCE            ?=
 
 BINS = launch-xpra show-x11 find-xpra
 
@@ -31,12 +34,73 @@ help:
 	@echo '  BINDIR            ($(BINDIR))'
 	@echo '  NETMGR_PERL5DIR   ($(NETMGR_PERL5DIR))    — where NetMgr/*.pm lives'
 	@echo '  DESTDIR           ($(DESTDIR))'
+	@echo '  FORCE             (set to 1 to skip the deps prompt)'
 
 list:
 	@for f in $(BINS); do echo "  bin/$$f → $(DESTDIR)$(BINDIR)/$$f"; done
 
-install: deps
-	$(INSTALL) -d $(DESTDIR)$(BINDIR)
+# --- shared dependency-check shell snippet --------------------------------
+# Sets $$miss to the space-separated list of missing required packages and
+# $$opt_miss to missing optionals.  Used by both `deps` and `install`.
+
+define DEPS_CHECK_SH
+miss=""; opt_miss=""; \
+check() { \
+  if /bin/sh -c "$$1" >/dev/null 2>&1; then \
+    printf "  ok       %-20s %s\n" "$$2" "$$3"; \
+  else \
+    printf "  MISSING  %-20s %s\n" "$$2" "$$3"; \
+    miss="$$miss $$2"; \
+  fi; \
+}; \
+check_opt() { \
+  if /bin/sh -c "$$1" >/dev/null 2>&1; then \
+    printf "  ok       %-20s %s (optional)\n" "$$2" "$$3"; \
+  else \
+    printf "  optional %-20s %s\n" "$$2" "$$3"; \
+    opt_miss="$$opt_miss $$2"; \
+  fi; \
+}; \
+check 'command -v perl'  perl       'Perl interpreter'; \
+check 'command -v xpra'  xpra       'xpra (attach/start sessions)'; \
+check 'command -v ssh'   openssh-client 'ssh client (remote show-x11 probe)'; \
+check 'command -v ip'    iproute2   'ip command (subnet discovery)'; \
+check '/usr/bin/perl -MNetMgr::Client -I$(NETMGR_PERL5DIR) -e 1' \
+                         net-mgr    "NetMgr::Client at $(NETMGR_PERL5DIR) (install net-mgr)"; \
+check '/usr/bin/perl -MTk -e 1' libtk-perl 'Perl/Tk (find-xpra chooser window)'; \
+check '[ -x /usr/bin/ssh-askpass ]' ssh-askpass-gnome \
+                         'ssh-askpass GUI (find-xpra password prompts; any /usr/bin/ssh-askpass provider works: ssh-askpass-gnome, ssh-askpass, ksshaskpass, ...)'; \
+check_opt 'command -v nmap'   nmap   'nmap — fallback discovery if NET_MGR_LISTEN unset'; \
+check_opt 'command -v sudo-cat' sudo-cat 'sudo-cat — required by show-x11 to read /proc/*/cmdline'; \
+miss=$$(echo $$miss | tr ' ' '\n' | sort -u | tr '\n' ' '); \
+miss=$${miss% }; miss=$${miss# }
+endef
+
+deps:
+	@$(DEPS_CHECK_SH); \
+	if [ -n "$$miss" ]; then \
+	  echo; echo "Missing required: $$miss"; \
+	  echo "Install on Debian/Ubuntu:  sudo apt install $$miss"; \
+	  exit 1; \
+	fi
+
+install:
+	@$(DEPS_CHECK_SH); \
+	if [ -n "$$miss" ]; then \
+	  echo; echo "Missing required: $$miss"; \
+	  echo "Install on Debian/Ubuntu:  sudo apt install $$miss"; \
+	  if [ "$(FORCE)" = "1" ]; then \
+	    echo "(FORCE=1: continuing despite missing dependencies)"; \
+	  elif [ -t 0 ]; then \
+	    printf "Continue install anyway? [y/N] "; \
+	    read ans; \
+	    case "$$ans" in [yY]*) ;; *) echo "Aborted."; exit 1 ;; esac; \
+	  else \
+	    echo "(non-interactive: aborting; rerun with FORCE=1 to override)" >&2; \
+	    exit 1; \
+	  fi; \
+	fi
+	@$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	@for f in $(BINS); do \
 	  echo "  bin/$$f → $(DESTDIR)$(BINDIR)/$$f"; \
 	  sed -e "s|^use lib '/usr/local/src/net-mgr/lib';|use lib '$(NETMGR_PERL5DIR)';|" \
@@ -47,44 +111,3 @@ install: deps
 
 uninstall:
 	@for f in $(BINS); do rm -fv $(DESTDIR)$(BINDIR)/$$f; done
-
-# --- dependency check (Debian/Ubuntu apt names) ---------------------------
-# Required deps are needed at runtime; missing optionals just disable a
-# sub-feature.
-
-deps:
-	@miss=""; opt_miss=""; \
-	check() { \
-	  if /bin/sh -c "$$1" >/dev/null 2>&1; then \
-	    printf "  ok       %-20s %s\n" "$$2" "$$3"; \
-	  else \
-	    printf "  MISSING  %-20s %s\n" "$$2" "$$3"; \
-	    miss="$$miss $$2"; \
-	  fi; \
-	}; \
-	check_opt() { \
-	  if /bin/sh -c "$$1" >/dev/null 2>&1; then \
-	    printf "  ok       %-20s %s (optional)\n" "$$2" "$$3"; \
-	  else \
-	    printf "  optional %-20s %s\n" "$$2" "$$3"; \
-	    opt_miss="$$opt_miss $$2"; \
-	  fi; \
-	}; \
-	check 'command -v perl'  perl       'Perl interpreter'; \
-	check 'command -v xpra'  xpra       'xpra (attach/start sessions)'; \
-	check 'command -v ssh'   openssh-client 'ssh client (remote show-x11 probe)'; \
-	check 'command -v ip'    iproute2   'ip command (subnet discovery)'; \
-	check '/usr/bin/perl -MNetMgr::Client -I$(NETMGR_PERL5DIR) -e 1' \
-	                         net-mgr    "NetMgr::Client at $(NETMGR_PERL5DIR) (install net-mgr)"; \
-	check '/usr/bin/perl -MTk -e 1' libtk-perl 'Perl/Tk (find-xpra chooser window)'; \
-	check '[ -x /usr/bin/ssh-askpass ]' ssh-askpass-gnome \
-	                         'ssh-askpass GUI (find-xpra password prompts; any /usr/bin/ssh-askpass provider works: ssh-askpass-gnome, ssh-askpass, ksshaskpass, ...)'; \
-	check_opt 'command -v nmap'   nmap   'nmap — fallback discovery if NET_MGR_LISTEN unset'; \
-	check_opt 'command -v sudo-cat' sudo-cat 'sudo-cat — required by show-x11 to read /proc/*/cmdline'; \
-	miss=$$(echo $$miss | tr ' ' '\n' | sort -u | tr '\n' ' '); \
-	miss=$${miss% }; miss=$${miss# }; \
-	if [ -n "$$miss" ]; then \
-	  echo; echo "Missing required: $$miss"; \
-	  echo "Install on Debian/Ubuntu:  sudo apt install $$miss"; \
-	  exit 1; \
-	fi
