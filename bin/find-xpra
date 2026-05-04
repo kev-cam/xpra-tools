@@ -458,6 +458,10 @@ if ($pick) {
     # honour it for the rest of the run.
     $ssh_user = $chosen->{ssh_user}
         if defined $chosen->{ssh_user} && length $chosen->{ssh_user};
+    # We're now probing exactly one host the user explicitly picked, so
+    # the parallel-probe haste no longer applies — give them plenty of
+    # time to deal with the askpass dialog.
+    $overall_to = 120;
 }
 
 sub _name_for {
