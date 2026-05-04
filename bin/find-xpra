@@ -516,15 +516,54 @@ sub pick_host {
         my $mw = MainWindow->new(-title => 'find-xpra: pick host');
         _dbg("[debug] picker: MainWindow created");
         $mw->optionAdd('*Font' => 'sans-serif 11');
+        # Bottom controls packed FIRST with -side => 'bottom' so they
+        # always anchor to the window's bottom edge regardless of how
+        # tall the rows section gets.  The header packs to the top.
+        my $bottom_f = $mw->Frame;
+        $bottom_f->pack(-side => 'bottom', -fill => 'x', -pady => 10);
         $mw->Label(-text => 'Probe which host?', -padx => 16, -pady => 8)
-            ->pack(-anchor => 'w');
+            ->pack(-side => 'top', -anchor => 'w');
 
-        # Two stacked frames: one for host rows, one for the bottom
-        # controls.  Keeping them separate means rows->grid coordinates
-        # stay local to $rows_f and we don't need a bogus large row
-        # number to anchor the buttons below.
-        my $rows_f   = $mw->Frame;  $rows_f  ->pack(-fill => 'both', -expand => 1);
-        my $bottom_f = $mw->Frame;  $bottom_f->pack(-fill => 'x',    -pady   => 10);
+        # Host rows go in a Canvas-wrapped Frame so the dialog scrolls
+        # vertically when there are more candidates than fit on screen.
+        my $rows_outer = $mw->Frame;
+        $rows_outer->pack(-side => 'top', -fill => 'both', -expand => 1);
+        my $canvas = $rows_outer->Canvas(
+            -borderwidth        => 0,
+            -highlightthickness => 0,
+        );
+        my $sb = $rows_outer->Scrollbar(
+            -orient  => 'vertical',
+            -command => [ 'yview', $canvas ],
+        );
+        $canvas->configure(-yscrollcommand => [ 'set', $sb ]);
+        $sb    ->pack(-side => 'right', -fill => 'y');
+        $canvas->pack(-side => 'left',  -fill => 'both', -expand => 1);
+        my $rows_f = $canvas->Frame;
+        my $rows_winid = $canvas->createWindow(0, 0,
+            -window => $rows_f, -anchor => 'nw');
+        # Keep the scrollregion in sync with the inner frame's natural
+        # size, and have the canvas request a height that fits the rows
+        # but is capped to ~70% of the screen so the window never grows
+        # past where the bottom controls would be off-screen.
+        my $cap_h = int($mw->screenheight * 0.70);
+        $rows_f->bind('<Configure>', sub {
+            $canvas->configure(-scrollregion => [ $canvas->bbox('all') ]);
+            my $req_w = $rows_f->reqwidth;
+            my $req_h = $rows_f->reqheight;
+            $canvas->configure(-width  => $req_w);
+            $canvas->configure(-height => $req_h > $cap_h ? $cap_h : $req_h);
+        });
+        # Mouse wheel scrolls the canvas (X11 buttons 4/5; MouseWheel for
+        # systems that send a delta).
+        $canvas->Tk::bind('<Button-4>',
+                          sub { $canvas->yview('scroll', -3, 'units') });
+        $canvas->Tk::bind('<Button-5>',
+                          sub { $canvas->yview('scroll',  3, 'units') });
+        $canvas->Tk::bind('<MouseWheel>', sub {
+            my $d = $Tk::event ? $Tk::event->D : 0;
+            $canvas->yview('scroll', $d > 0 ? -3 : 3, 'units');
+        });
 
         # "Hidden" hosts (Forget'd in a previous run) stay out of the
         # picker until the user clicks "Show all", which switches mode
