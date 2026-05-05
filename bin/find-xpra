@@ -1292,14 +1292,32 @@ for my $s (@sessions) {
         -command => sub {
             my $pid = spawn_attach(_attach_cmd($sess));
             $sess->{pid} = $pid;
+            $sess->{_disc_count} = 0;
             $attach_btn->configure(-state => 'disabled');
-            $disc_btn->configure(-state => 'normal');
+            $disc_btn->configure(-state => 'normal', -text => 'Disconnect');
         });
+    # Escalating disconnect.  The xpra viewer occasionally ignores a plain
+    # TERM (mid-handshake, stuck in a modal, ssh transport hung, ...), so
+    # repeated clicks ramp up the force:
+    #   1st: TERM the viewer pid
+    #   2nd: TERM the whole process group (catches ssh + xpra workers)
+    #   3rd+: KILL the process group, then KILL the pid
     $disc_btn = $mw->Button(-text => 'Disconnect', -state => 'disabled',
         -command => sub {
             my $pid = $sess->{pid} or return;
-            kill 'TERM', $pid;          # closes the local viewer; remote
-                                        # xpra session keeps running.
+            my $n   = ++$sess->{_disc_count};
+            if ($n == 1) {
+                kill 'TERM', $pid;
+                $disc_btn->configure(-text => 'Disconnect!');
+            } elsif ($n == 2) {
+                kill 'TERM', -$pid;     # negative = process group
+                kill 'TERM',  $pid;
+                $disc_btn->configure(-text => 'Force kill');
+            } else {
+                kill 'KILL', -$pid;
+                kill 'KILL',  $pid;
+                $disc_btn->configure(-text => 'KILL');
+            }
         });
     $attach_btn->grid(-row => $r, -column => 8, -padx => 6, -pady => 1, -sticky => 'ew');
     $disc_btn  ->grid(-row => $r, -column => 9, -padx => 6, -pady => 1, -sticky => 'ew');
@@ -1316,8 +1334,10 @@ $mw->repeat(750, sub {
         my $r = waitpid($pid, POSIX::WNOHANG());
         if ($r != 0) {
             $s->{pid} = undef;
+            $s->{_disc_count} = 0;
             $s->{_attach_btn}->configure(-state => 'normal');
-            $s->{_disc_btn}  ->configure(-state => 'disabled');
+            $s->{_disc_btn}  ->configure(-state => 'disabled',
+                                         -text  => 'Disconnect');
         }
     }
 });
