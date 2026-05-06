@@ -36,11 +36,12 @@ my $PIDFILE      = do {
     "$base/find-xpra-keys.pid";
 };
 
-my ($do_reset, $do_unmount, $do_status, $help);
+my ($do_reset, $do_unmount, $do_status, $force_askpass, $help);
 GetOptions(
     'reset|r'    => \$do_reset,
     'unmount|u'  => \$do_unmount,
     'status|s'   => \$do_status,
+    'askpass|a'  => \$force_askpass,
     'idle|i=i'   => \$IDLE_SECS,
     'help|h'     => \$help,
 ) or die "see --help\n";
@@ -55,6 +56,8 @@ usage: find-xpra-gocryptfs [--idle SEC]
   --reset      SIGUSR1 a running mount script to reset its idle timer.
   --unmount    SIGHUP a running mount script (unmount + exit now).
   --status     print mount-script pid + mount state; exit 0 if mounted.
+  --askpass    force the gocryptfs password prompt to use ssh-askpass
+               (X11 popup) even when stdin is a tty.
   --idle SEC   idle window before auto-unmount (default 60 s).
 
 env:
@@ -165,7 +168,16 @@ END {
 }
 
 my @cmd = ('gocryptfs');
-push @cmd, '-extpass', '/usr/bin/ssh-askpass' if -x '/usr/bin/ssh-askpass';
+# On a tty let gocryptfs prompt directly (nicer UX standalone); when
+# detached (find-xpra spawns us with stdin=/dev/null) fall back to
+# ssh-askpass.  --askpass forces the X11 popup even from a tty.
+# gocryptfs's repeated -extpass= form passes extra args to the helper,
+# so we get a custom prompt instead of ssh-askpass's default
+# "Enter your OpenSSH passphrase".
+if (($force_askpass || !-t 0) && -x '/usr/bin/ssh-askpass') {
+    push @cmd, '-extpass=/usr/bin/ssh-askpass',
+               "-extpass=gocryptfs password for $cipher:";
+}
 push @cmd, $cipher, $MNT;
 
 my $rc = system(@cmd);
