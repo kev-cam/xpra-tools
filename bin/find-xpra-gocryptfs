@@ -1,0 +1,200 @@
+#!/usr/bin/perl
+# find-xpra-gocryptfs — one-shot mount of an ssh-key gocryptfs vault.
+#
+# Resolves ~/.ssh/keys-gocryptfs (a symlink to a gocryptfs cipher dir),
+# mounts the cleartext at ~/.keys (or $FIND_XPRA_KEYS_MNT), then waits.
+# When idle for 60 s the mount is dropped and the script exits.
+#
+#   SIGUSR1  reset the idle timer (caller is still using ~/.keys)
+#   SIGHUP   unmount and exit immediately
+#
+# Usable standalone:
+#   find-xpra-gocryptfs            mount + wait until idle/unmount
+#   find-xpra-gocryptfs --reset    SIGUSR1 the running mount script
+#   find-xpra-gocryptfs --unmount  SIGHUP the running mount script
+#   find-xpra-gocryptfs --status   print pid + mount state, exit 0/1
+#   find-xpra-gocryptfs --idle SEC override the 60 s default
+#
+# find-xpra spawns this in a double-forked child so it survives the
+# parent.  It writes a pidfile under $XDG_RUNTIME_DIR (or ~/.cache) so
+# concurrent invocations can find each other.
+
+use strict;
+use warnings;
+use POSIX ();
+use Fcntl qw(O_WRONLY O_CREAT O_EXCL O_TRUNC);
+use Getopt::Long qw(GetOptions :config no_ignore_case);
+
+my $METHOD       = 'gocryptfs';
+my $LINK         = ($ENV{HOME} // '') . "/.ssh/keys-$METHOD";
+my $MNT          = $ENV{FIND_XPRA_KEYS_MNT}
+                 // ($ENV{HOME} // '') . '/.keys';
+my $IDLE_SECS    = $ENV{FIND_XPRA_KEYS_IDLE} || 60;
+my $PIDFILE      = do {
+    my $base = $ENV{XDG_RUNTIME_DIR}
+            // ($ENV{HOME} ? "$ENV{HOME}/.cache" : '/tmp');
+    "$base/find-xpra-keys.pid";
+};
+
+my ($do_reset, $do_unmount, $do_status, $help);
+GetOptions(
+    'reset|r'    => \$do_reset,
+    'unmount|u'  => \$do_unmount,
+    'status|s'   => \$do_status,
+    'idle|i=i'   => \$IDLE_SECS,
+    'help|h'     => \$help,
+) or die "see --help\n";
+
+if ($help) {
+    print <<'EOF';
+usage: find-xpra-gocryptfs [--idle SEC]
+       find-xpra-gocryptfs --reset | --unmount | --status
+
+  (no flags)   mount ~/.ssh/keys-gocryptfs cleartext at ~/.keys, then
+               sleep until idle for SEC seconds (default 60) or SIGHUP.
+  --reset      SIGUSR1 a running mount script to reset its idle timer.
+  --unmount    SIGHUP a running mount script (unmount + exit now).
+  --status     print mount-script pid + mount state; exit 0 if mounted.
+  --idle SEC   idle window before auto-unmount (default 60 s).
+
+env:
+  FIND_XPRA_KEYS_MNT     mount point         (default: ~/.keys)
+  FIND_XPRA_KEYS_IDLE    idle window in s    (default: 60)
+EOF
+    exit 0;
+}
+
+# --- control verbs -------------------------------------------------------
+
+sub mount_pid {
+    open my $fh, '<', $PIDFILE or return undef;
+    my $pid = <$fh>;
+    close $fh;
+    chomp $pid if defined $pid;
+    return undef unless defined $pid && $pid =~ /^\d+$/;
+    return $pid + 0 if kill 0, $pid;
+    unlink $PIDFILE;
+    return undef;
+}
+
+sub is_mounted {
+    return 0 unless -d $MNT;
+    open my $fh, '<', '/proc/mounts' or return 0;
+    while (<$fh>) {
+        my @f = split / /;
+        return 1 if @f >= 2 && $f[1] eq $MNT;
+    }
+    return 0;
+}
+
+if ($do_status) {
+    my $pid = mount_pid();
+    my $mnt = is_mounted();
+    printf "pid:    %s\nmount:  %s at %s\n",
+        ($pid // '-'),
+        ($mnt ? 'yes' : 'no'),
+        $MNT;
+    exit($mnt ? 0 : 1);
+}
+
+if ($do_reset || $do_unmount) {
+    my $pid = mount_pid();
+    if (!$pid) {
+        warn "find-xpra-gocryptfs: no mount script running\n";
+        exit 1;
+    }
+    my $sig = $do_reset ? 'USR1' : 'HUP';
+    kill($sig, $pid) or do {
+        warn "find-xpra-gocryptfs: kill $sig $pid: $!\n";
+        exit 1;
+    };
+    exit 0;
+}
+
+# --- mount + wait --------------------------------------------------------
+
+# If a previous invocation is still alive, just reset its timer and exit.
+# This makes `find-xpra-gocryptfs` a no-op refresh on subsequent runs and
+# matches what find-xpra does when it finds a live pidfile.
+if (my $pid = mount_pid()) {
+    kill 'USR1', $pid;
+    exit 0;
+}
+
+die "find-xpra-gocryptfs: $LINK is not a symlink (point it at the "
+  . "gocryptfs cipher directory)\n"
+    unless -l $LINK;
+
+my $cipher = readlink $LINK
+    or die "find-xpra-gocryptfs: cannot readlink $LINK: $!\n";
+$cipher = ($ENV{HOME} // '') . "/.ssh/$cipher" unless $cipher =~ m{^/};
+
+if (! -d $MNT) {
+    mkdir $MNT or die "find-xpra-gocryptfs: mkdir $MNT: $!\n";
+}
+
+# Atomic pidfile create.  If another invocation beat us to it, just bail.
+{
+    my $pf;
+    if (sysopen($pf, $PIDFILE, O_WRONLY|O_CREAT|O_EXCL, 0644)) {
+        print $pf "$$\n";
+        close $pf;
+    } else {
+        if (my $other = mount_pid()) {
+            kill 'USR1', $other;     # bump existing timer
+            exit 0;
+        }
+        # Stale.  Replace.
+        sysopen($pf, $PIDFILE, O_WRONLY|O_CREAT|O_TRUNC, 0644)
+            or die "find-xpra-gocryptfs: $PIDFILE: $!\n";
+        print $pf "$$\n";
+        close $pf;
+    }
+}
+
+# Make sure we always remove the pidfile on exit, however we got there.
+END {
+    if (defined $PIDFILE && -f $PIDFILE) {
+        if (open my $fh, '<', $PIDFILE) {
+            my $pid = <$fh>;
+            close $fh;
+            chomp $pid if defined $pid;
+            unlink $PIDFILE if defined $pid && $pid =~ /^\d+$/ && $pid == $$;
+        }
+    }
+}
+
+my @cmd = ('gocryptfs');
+push @cmd, '-extpass', '/usr/bin/ssh-askpass' if -x '/usr/bin/ssh-askpass';
+push @cmd, $cipher, $MNT;
+
+my $rc = system(@cmd);
+if ($rc != 0 || !is_mounted()) {
+    warn "find-xpra-gocryptfs: mount of $cipher failed"
+       . ($rc != 0 ? " (exit @{[$rc>>8]})" : '') . "\n";
+    exit 3;
+}
+
+# --- persist -------------------------------------------------------------
+
+my $stop  = 0;
+my $reset = 0;
+$SIG{USR1} = sub { $reset = 1 };
+$SIG{HUP}  = sub { $stop  = 1 };
+$SIG{TERM} = sub { $stop  = 1 };
+$SIG{INT}  = sub { $stop  = 1 };
+
+my $deadline = time + $IDLE_SECS;
+while (!$stop) {
+    if ($reset) {
+        $reset = 0;
+        $deadline = time + $IDLE_SECS;
+        next;
+    }
+    my $remaining = $deadline - time;
+    last if $remaining <= 0;
+    sleep $remaining;
+}
+
+system('fusermount', '-u', $MNT);
+exit 0;

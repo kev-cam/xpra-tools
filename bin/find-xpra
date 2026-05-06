@@ -100,6 +100,121 @@ sub _dbg {
     print {$DEBUG_LOG_FH} $msg if $DEBUG_LOG_FH;
 }
 
+# --- on-demand encrypted key store ---------------------------------------
+# If ~/.ssh/keys-<method> is a symlink to the cipher directory, run a
+# one-shot mount script (`find-xpra-<method>`) that mounts the cleartext
+# at ~/.keys, waits until either it's been idle for 60s or it gets
+# SIGHUP, then unmounts and exits.  Concurrent find-xpras share the
+# mount: while the script is alive we just SIGUSR1 it to bump its idle
+# timeout instead of starting a second mount.  The script owns its own
+# unmount, so find-xpra never has to clean up on exit.
+#
+# Currently `gocryptfs` is the only supported method.
+
+our $KEYS_MNT       = ($ENV{HOME} // '') . '/.keys';
+our $KEYS_PIDFILE   = do {
+    my $base = $ENV{XDG_RUNTIME_DIR}
+            // ($ENV{HOME} ? "$ENV{HOME}/.cache" : '/tmp');
+    "$base/find-xpra-keys.pid";
+};
+
+sub _keys_link {
+    # Pick the first .ssh/keys-<method> symlink we know how to mount.
+    my $home = $ENV{HOME} // '';
+    return unless length $home;
+    for my $method ('gocryptfs') {
+        my $link = "$home/.ssh/keys-$method";
+        return ($method, $link) if -l $link;
+    }
+    return;
+}
+
+sub _keys_is_mounted {
+    return 0 unless -d $KEYS_MNT;
+    open my $fh, '<', '/proc/mounts' or return 0;
+    while (<$fh>) {
+        my @f = split / /;
+        return 1 if @f >= 2 && $f[1] eq $KEYS_MNT;
+    }
+    return 0;
+}
+
+# Read pidfile -> live mount-script pid, or undef (cleans stale files).
+sub _keys_mount_pid {
+    open my $fh, '<', $KEYS_PIDFILE or return undef;
+    my $pid = <$fh>;
+    close $fh;
+    chomp $pid if defined $pid;
+    return undef unless defined $pid && $pid =~ /^\d+$/;
+    return $pid + 0 if kill 0, $pid;
+    unlink $KEYS_PIDFILE;
+    return undef;
+}
+
+# Locate the per-method mount script (find-xpra-<method>).  Prefer the
+# binary alongside us in the source / install tree; fall back to PATH.
+sub _keys_helper {
+    my ($method) = @_;
+    my $name = "find-xpra-$method";
+    require File::Basename;
+    my $dir = File::Basename::dirname($0);
+    return "$dir/$name" if -x "$dir/$name";
+    return $name;     # let exec resolve via PATH
+}
+
+# Foreground: ensure ~/.keys is mounted.  Returns 1 on success, 0 if no
+# keys-<method> symlink is configured, the helper failed to mount, or
+# the mount didn't appear within the timeout.
+sub _keys_ensure {
+    my ($method, $link) = _keys_link() or return 0;
+
+    # Mount script already running?  Bump its idle timeout and wait.
+    if (my $pid = _keys_mount_pid()) {
+        kill 'USR1', $pid;
+        _dbg("[debug] keys: USR1 -> $pid");
+        return _keys_wait_ready($pid);
+    }
+
+    # Nobody home.  Double-fork the helper script for this method so it
+    # outlives us — find-xpra exiting must not tear the mount down.
+    my $helper = _keys_helper($method);
+    _dbg("[debug] keys: spawning $helper");
+    my $kid = fork;
+    if (!defined $kid) { warn "find-xpra: keys fork: $!\n"; return 0 }
+    if ($kid == 0) {
+        POSIX::setsid();
+        my $kid2 = fork;
+        POSIX::_exit(0) if !defined $kid2 || $kid2 != 0;
+        open STDIN,  '<', '/dev/null';
+        open STDOUT, '>>', '/dev/null';
+        # Leave STDERR attached so a mount failure is visible.
+        { exec { $helper } $helper };
+        POSIX::_exit(127);
+    }
+    waitpid($kid, 0);
+    return _keys_wait_ready();
+}
+
+# Poll until ~/.keys is mounted, the helper exits, or we time out.
+# Returns 1 on mount success, 0 otherwise.  $expect_pid (optional) is
+# the pre-existing helper we just signalled — if it dies before the
+# mount appears we abort early.
+sub _keys_wait_ready {
+    my ($expect_pid) = @_;
+    my $deadline = time + 30;
+    while (time < $deadline) {
+        return 1 if _keys_is_mounted();
+        if (defined $expect_pid) {
+            return 0 if !kill 0, $expect_pid;
+        } else {
+            return 0 if !defined _keys_mount_pid();
+        }
+        select undef, undef, undef, 0.1;
+    }
+    warn "find-xpra: timed out waiting for $KEYS_MNT to mount\n";
+    return 0;
+}
+
 sub ssh_opts {
     my @opts = (
         '-o', "ConnectTimeout=$ssh_to",
@@ -863,6 +978,10 @@ sub _tk_mw {
 
 # --- parallel show-x11 probe ----------------------------------------------
 
+# Mount the on-demand key store (if configured) before we fork — child
+# probes inherit the mount and we avoid N races to mount the same path.
+_keys_ensure();
+
 my $sel = IO::Select->new;
 my %pid_for;
 for my $c (@candidates) {
@@ -1282,7 +1401,10 @@ for my $s (@sessions) {
                 -command => sub { _show_procs($sess) })
        ->grid(-row => $r, -column => 5, -padx => 6, -pady => 1, -sticky => 'ew');
     $mw->Button(-text => 'Terminal',
-                -command => sub { spawn_detached(_term_cmd($sess)) })
+                -command => sub {
+                    _keys_ensure() unless $sess->{local};
+                    spawn_detached(_term_cmd($sess));
+                })
        ->grid(-row => $r, -column => 6, -padx => 6, -pady => 1, -sticky => 'ew');
     $mw->Button(-text => 'Settings',
                 -command => sub { _show_settings($sess) })
@@ -1290,6 +1412,7 @@ for my $s (@sessions) {
     my ($attach_btn, $disc_btn);
     $attach_btn = $mw->Button(-text => 'Attach',
         -command => sub {
+            _keys_ensure() unless $sess->{local};
             my $pid = spawn_attach(_attach_cmd($sess));
             $sess->{pid} = $pid;
             $sess->{_disc_count} = 0;

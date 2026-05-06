@@ -16,7 +16,7 @@ DESTDIR          ?=
 # you know your package manager differs from Debian/Ubuntu — e.g. Cygwin).
 FORCE            ?=
 
-BINS = launch-xpra show-x11 find-xpra
+BINS = launch-xpra show-x11 find-xpra find-xpra-gocryptfs
 
 INSTALL ?= install
 
@@ -74,6 +74,8 @@ check '[ -x /usr/bin/ssh-askpass ]' ssh-askpass-gnome \
                          'ssh-askpass GUI (find-xpra password prompts; any /usr/bin/ssh-askpass provider works: ssh-askpass-gnome, ssh-askpass, ksshaskpass, ...)'; \
 check_opt 'command -v nmap'   nmap   'nmap — fallback discovery if NET_MGR_LISTEN unset'; \
 check_opt 'command -v sudo-cat' sudo-cat 'sudo-cat — required by show-x11 to read /proc/*/cmdline'; \
+check_opt 'command -v gocryptfs' gocryptfs 'gocryptfs — needed only if ~/.ssh/keys-gocryptfs is configured (find-xpra-gocryptfs mounts the cleartext at ~/.keys on demand)'; \
+check_opt 'command -v fusermount' fuse 'fusermount — companion to gocryptfs; same condition as above'; \
 miss=$$(echo $$miss | tr ' ' '\n' | sort -u | tr '\n' ' '); \
 miss=$${miss% }; miss=$${miss# }
 endef
