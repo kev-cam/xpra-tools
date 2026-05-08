@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=xpra-helper
+GenericName=Cross-session URL/file router
+Comment=Route URLs and files to a chosen xpra session
+Exec=xpra-helper %u
+Terminal=false
+NoDisplay=true
+StartupNotify=false
+Categories=Utility;
+MimeType=x-scheme-handler/mailto;x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/ftp;text/calendar;text/x-vcalendar;application/pdf;

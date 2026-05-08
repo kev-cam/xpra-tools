@@ -11,12 +11,15 @@
 PREFIX           ?= /usr/local
 BINDIR           ?= $(PREFIX)/bin
 NETMGR_PERL5DIR  ?= $(PREFIX)/share/perl5
+APPSDIR          ?= $(PREFIX)/share/applications
 DESTDIR          ?=
 # Set FORCE=1 to skip the dependency prompt entirely (useful in CI or when
 # you know your package manager differs from Debian/Ubuntu — e.g. Cygwin).
 FORCE            ?=
 
-BINS = launch-xpra show-x11 find-xpra find-xpra-gocryptfs
+BINS = launch-xpra show-x11 find-xpra find-xpra-gocryptfs xpra-helper
+
+APPS = xpra-helper.desktop
 
 INSTALL ?= install
 
@@ -33,11 +36,13 @@ help:
 	@echo '  PREFIX            ($(PREFIX))'
 	@echo '  BINDIR            ($(BINDIR))'
 	@echo '  NETMGR_PERL5DIR   ($(NETMGR_PERL5DIR))    — where NetMgr/*.pm lives'
+	@echo '  APPSDIR           ($(APPSDIR))'
 	@echo '  DESTDIR           ($(DESTDIR))'
 	@echo '  FORCE             (set to 1 to skip the deps prompt)'
 
 list:
 	@for f in $(BINS); do echo "  bin/$$f → $(DESTDIR)$(BINDIR)/$$f"; done
+	@for f in $(APPS); do echo "  share/applications/$$f → $(DESTDIR)$(APPSDIR)/$$f"; done
 
 # --- shared dependency-check shell snippet --------------------------------
 # Sets $$miss to the space-separated list of missing required packages and
@@ -112,6 +117,12 @@ install:
 	  mv $(DESTDIR)$(BINDIR)/$$f.tmp $(DESTDIR)$(BINDIR)/$$f && \
 	  chmod 755 $(DESTDIR)$(BINDIR)/$$f; \
 	done
+	@$(INSTALL) -d $(DESTDIR)$(APPSDIR)
+	@for f in $(APPS); do \
+	  echo "  share/applications/$$f → $(DESTDIR)$(APPSDIR)/$$f"; \
+	  $(INSTALL) -m 644 share/applications/$$f $(DESTDIR)$(APPSDIR)/$$f; \
+	done
 
 uninstall:
 	@for f in $(BINS); do rm -fv $(DESTDIR)$(BINDIR)/$$f; done
+	@for f in $(APPS); do rm -fv $(DESTDIR)$(APPSDIR)/$$f; done

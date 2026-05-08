@@ -1,0 +1,183 @@
+#!/usr/bin/perl
+# xpra-helper — route a URL or file to one of your xpra sessions.
+#
+# Set as the default handler for whatever schemes/MIME types want
+# routing (xdg-mime default ...).  When invoked with an argument the
+# helper looks at ~/.xpra-start for the available sessions and either:
+#
+#   - dispatches automatically when a sticky choice exists for this
+#     "kind" of argument (URL scheme like `mailto`/`https`, or file
+#     extension like `ics`), or
+#   - pops up a Tk chooser listing every session in ~/.xpra-start;
+#     pick a row to send the argument to that session.  Tick "Remember
+#     this choice for [kind]" before clicking to make it sticky.
+#
+# ~/.xpra-start format: one session per line, `<display#>: <command>`.
+# Lines starting with `#` and blank lines are ignored.  Example:
+#     20: thunderbird -P mail
+#     21: thunderbird -P calendar
+#     22: firefox -P main
+#
+# Dispatch runs `<command> <arg>` with DISPLAY=:<n>, double-forked so
+# the caller (the desktop app that invoked us) doesn't block.
+#
+# The sticky cache lives at ~/.config/xpra-helper/sticky.json — delete
+# entries to re-prompt for that kind.
+
+use strict;
+use warnings;
+use POSIX ();
+use JSON::PP;
+use File::Path qw(make_path);
+
+my $START_FILE = "$ENV{HOME}/.xpra-start";
+my $CONFIG_DIR = "$ENV{HOME}/.config/xpra-helper";
+my $CACHE_FILE = "$CONFIG_DIR/sticky.json";
+
+# --- session list --------------------------------------------------------
+
+sub load_sessions {
+    my @s;
+    open my $fh, '<', $START_FILE or return @s;
+    while (<$fh>) {
+        s/#.*//;
+        next if /^\s*$/;
+        # Allow `20:`, `:20:`, plus any whitespace.
+        if (/^\s*:?(\d+)\s*:\s*(\S.*?)\s*$/) {
+            push @s, { display => ":$1", cmd => $2 };
+        }
+    }
+    return @s;
+}
+
+# --- sticky cache --------------------------------------------------------
+
+sub load_cache {
+    return {} unless -f $CACHE_FILE;
+    open my $fh, '<', $CACHE_FILE or return {};
+    local $/; my $j = <$fh>; close $fh;
+    return eval { decode_json($j) } // {};
+}
+
+sub save_cache {
+    my ($c) = @_;
+    make_path($CONFIG_DIR);
+    open my $fh, '>', $CACHE_FILE or do { warn "save: $!"; return };
+    print $fh encode_json($c);
+    close $fh;
+}
+
+# Pick a stable cache key for $arg:
+#   - URL-ish (scheme:rest)        -> the lower-cased scheme
+#   - bare path with an extension  -> the lower-cased extension
+#   - anything else                -> "default"
+sub kind_of {
+    my ($a) = @_;
+    return lc($1) if $a =~ /^([A-Za-z][A-Za-z0-9+.\-]*):/;
+    return lc($1) if $a =~ /\.([A-Za-z0-9]+)\z/;
+    return 'default';
+}
+
+# --- dispatch ------------------------------------------------------------
+
+# Run $session->{cmd} with $arg appended on $session->{display}, fully
+# detached from the parent so xdg-open / the mailer / whatever doesn't
+# block on us.
+sub dispatch {
+    my ($session, $arg) = @_;
+    my $pid = fork;
+    die "fork: $!" unless defined $pid;
+    return if $pid;     # parent: leave dispatch behind, return
+    POSIX::setsid();
+    my $pid2 = fork;
+    POSIX::_exit(0) if !defined $pid2 || $pid2 != 0;
+    open STDIN,  '<', '/dev/null';
+    open STDOUT, '>>', '/dev/null';
+    open STDERR, '>>', '/dev/null';
+    $ENV{DISPLAY} = $session->{display};
+    my @cmd = split /\s+/, $session->{cmd};
+    push @cmd, $arg;
+    { exec { $cmd[0] } @cmd };
+    POSIX::_exit(127);
+}
+
+# --- chooser (Tk) --------------------------------------------------------
+
+sub chooser {
+    my ($arg, $kind, $sessions, $cache) = @_;
+    require Tk;
+    Tk->import;
+
+    my $mw = MainWindow->new(-title => 'xpra-helper');
+    $mw->optionAdd('*Font' => 'sans-serif 11');
+
+    my $shown = length($arg) > 80 ? substr($arg, 0, 77) . '…' : $arg;
+    $mw->Label(-text   => $shown,
+               -font   => 'sans-serif 11 bold',
+               -anchor => 'w', -padx => 10, -pady => (8, 2),
+               -justify => 'left')
+       ->pack(-fill => 'x');
+    $mw->Label(-text   => "kind: $kind   —   pick a session",
+               -anchor => 'w', -padx => 10, -pady => (0, 6),
+               -fg     => '#555')
+       ->pack(-fill => 'x');
+
+    my $save = 0;
+    $mw->Checkbutton(
+        -text     => "Remember this choice for [$kind]",
+        -variable => \$save,
+        -anchor   => 'w', -padx => 10,
+    )->pack(-fill => 'x');
+
+    my $rows = $mw->Frame->pack(-fill => 'x', -padx => 10, -pady => 4);
+    for my $s (@$sessions) {
+        my $sess = $s;
+        $rows->Button(
+            -text    => sprintf('%-5s  %s', $sess->{display}, $sess->{cmd}),
+            -anchor  => 'w',
+            -command => sub {
+                if ($save) {
+                    $cache->{$kind} = $sess->{display};
+                    save_cache($cache);
+                }
+                dispatch($sess, $arg);
+                $mw->destroy;
+            },
+        )->pack(-fill => 'x', -pady => 2);
+    }
+
+    $mw->Button(-text => 'Cancel',
+                -command => sub { $mw->destroy; exit 1 })
+       ->pack(-pady => (4, 8));
+
+    Tk::MainLoop();
+}
+
+# --- main ----------------------------------------------------------------
+
+my $arg = shift @ARGV;
+die "usage: xpra-helper <url|file>\n" unless defined $arg;
+warn "xpra-helper: extra arguments ignored: @ARGV\n" if @ARGV;
+
+my @sessions = load_sessions();
+unless (@sessions) {
+    warn "xpra-helper: no sessions in $START_FILE; falling back to xdg-open\n";
+    { exec 'xdg-open', $arg };
+    POSIX::_exit(127);
+}
+
+my $cache = load_cache();
+my $kind  = kind_of($arg);
+
+# Sticky hit: dispatch directly if the cached display still exists in
+# the start file.  Otherwise drop to the chooser so the user can re-pick.
+if (defined $cache->{$kind}) {
+    my ($matched) = grep { $_->{display} eq $cache->{$kind} } @sessions;
+    if ($matched) {
+        dispatch($matched, $arg);
+        exit 0;
+    }
+}
+
+chooser($arg, $kind, \@sessions, $cache);
+exit 0;
