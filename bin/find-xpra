@@ -42,6 +42,7 @@ my $no_scan;
 my $scan;
 my $pick;
 my $no_prompt;
+my $no_mount;
 my $ssh_key;
 my $debug;
 my $all;
@@ -57,6 +58,7 @@ GetOptions(
     'no-local'   => \$no_local,
     'no-scan'    => \$no_scan,
     'no-prompt|keys-only' => \$no_prompt,
+    'no-mount'   => \$no_mount,
     'scan'       => \$scan,
     'pick'       => \$pick,
     'debug'      => \$debug,
@@ -166,6 +168,7 @@ sub _keys_helper {
 # keys-<method> symlink is configured, the helper failed to mount, or
 # the mount didn't appear within the timeout.
 sub _keys_ensure {
+    return 0 if $no_mount;
     my ($method, $link) = _keys_link() or return 0;
 
     # Mount script already running?  Bump its idle timeout and wait.
@@ -383,6 +386,9 @@ usage: find-xpra [options]
   --no-prompt, --keys-only
                         never prompt for an ssh password (BatchMode=yes,
                         publickey-only); default is to allow ssh-askpass
+  --no-mount            don't try to mount an encrypted ~/.ssh/keys-*
+                        store; assume any keys ssh needs are already
+                        available (or use --keys-only to fail fast)
   --scan                force nmap scan even if local net-mgr is up
   --pick                pop up a host chooser before any ssh probe;
                         sorted by favorite, last-known session count,
