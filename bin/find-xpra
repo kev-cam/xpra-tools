@@ -56,7 +56,7 @@ GetOptions(
     'list'       => \$list_only,
     'no-local'   => \$no_local,
     'no-scan'    => \$no_scan,
-    'no-prompt'  => \$no_prompt,
+    'no-prompt|keys-only' => \$no_prompt,
     'scan'       => \$scan,
     'pick'       => \$pick,
     'debug'      => \$debug,
@@ -380,7 +380,8 @@ usage: find-xpra [options]
   --user USER           ssh as USER and only show sessions owned by USER
   --ssh-user USER       override ssh user only (default: from ssh_config(5))
   --ssh-key FILE        ssh -i FILE (private key to authenticate with)
-  --no-prompt           never prompt for an ssh password (BatchMode=yes,
+  --no-prompt, --keys-only
+                        never prompt for an ssh password (BatchMode=yes,
                         publickey-only); default is to allow ssh-askpass
   --scan                force nmap scan even if local net-mgr is up
   --pick                pop up a host chooser before any ssh probe;
