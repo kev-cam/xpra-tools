@@ -17,7 +17,7 @@ DESTDIR          ?=
 # you know your package manager differs from Debian/Ubuntu — e.g. Cygwin).
 FORCE            ?=
 
-BINS = launch-xpra show-x11 find-xpra find-xpra-gocryptfs xpra-helper
+BINS = launch-xpra show-x11 find-xpra find-xpra-gocryptfs xpra-helper xpra-web
 
 APPS = xpra-helper.desktop
 

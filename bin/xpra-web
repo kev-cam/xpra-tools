@@ -1,0 +1,163 @@
+#!/usr/bin/perl
+# xpra-web — start (or reuse) an xpra session running mate-terminal
+# (or any command), served over HTTPS+WebSocket via xpra's HTML5 client
+# on loopback with PAM auth, then point the default browser at it.
+#
+# Defaults:
+#   display      :100
+#   port         14501
+#   cert         ~/.config/xpra/ssl-cert.pem  (auto-generated if missing)
+#   pam service  xpra
+#   command      mate-terminal     (override with --start)
+
+use strict;
+use warnings;
+use Getopt::Long qw(:config no_ignore_case no_bundling);
+use IO::Socket::INET;
+use File::Path qw(make_path);
+use File::Basename qw(dirname);
+
+my $DISPLAY_BASE = 100;
+my $PORT_BASE    = 14501;
+
+my $display;     # undef -> next free at/after $DISPLAY_BASE
+my $port;        # undef -> next free at/after $PORT_BASE
+my $cert        = "$ENV{HOME}/.config/xpra/ssl-cert.pem";
+my $pam_service = 'xpra';
+my $start_cmd   = 'mate-terminal';
+my $no_browser;
+my $help;
+
+sub usage { <<EOF }
+usage: xpra-web [options]
+  --display N      xpra display (default: next free :$DISPLAY_BASE+)
+  --port N         loopback https port (default: next free $PORT_BASE+)
+  --cert FILE      ssl cert + key, self-signed and generated if missing
+                   (default ~/.config/xpra/ssl-cert.pem)
+  --pam-service N  PAM service name (default $pam_service; falls back
+                   gracefully if /etc/pam.d/$pam_service is absent —
+                   try `--pam-service login` then)
+  -c, --command CMD command to run in the session (default $start_cmd)
+  --no-browser     don't open the browser; just start the session
+  -h, --help       this message
+EOF
+
+GetOptions(
+    'display=s'     => \$display,
+    'port=i'        => \$port,
+    'cert=s'        => \$cert,
+    'pam-service=s' => \$pam_service,
+    'c|command=s'   => \$start_cmd,
+    'no-browser'    => \$no_browser,
+    'h|help'        => \$help,
+) or die usage();
+print(usage()), exit 0 if $help;
+
+# A display is "in use" if either the X11 lock or the unix socket is
+# present.  This catches both live xpra/X servers and stale leftovers
+# (xpra start would refuse a stale display without --clobber).
+sub display_in_use {
+    my ($n) = @_;
+    return -e "/tmp/.X${n}-lock" || -e "/tmp/.X11-unix/X${n}";
+}
+
+# A port is "in use" if we can't bind it.  ReuseAddr keeps a recent
+# TIME_WAIT from making us skip a port we could have used.  Tiny TOCTOU
+# between the close here and xpra binding it later — accept it.
+sub port_in_use {
+    my ($p) = @_;
+    my $s = IO::Socket::INET->new(
+        LocalAddr => '127.0.0.1', LocalPort => $p,
+        Proto => 'tcp', ReuseAddr => 1, Listen => 1);
+    return 1 unless $s;
+    close $s;
+    return 0;
+}
+
+if (defined $display) {
+    $display = ":$display" if $display =~ /^\d+$/;
+} else {
+    my $n = $DISPLAY_BASE;
+    $n++ while display_in_use($n) && $n < $DISPLAY_BASE + 200;
+    die "xpra-web: no free display in :$DISPLAY_BASE..:" . ($DISPLAY_BASE+199) . "\n"
+        if display_in_use($n);
+    $display = ":$n";
+}
+
+if (!defined $port) {
+    my $p = $PORT_BASE;
+    $p++ while port_in_use($p) && $p < $PORT_BASE + 200;
+    die "xpra-web: no free port in $PORT_BASE.." . ($PORT_BASE+199) . "\n"
+        if port_in_use($p);
+    $port = $p;
+}
+
+sub port_open {
+    my $s = IO::Socket::INET->new(
+        PeerAddr => '127.0.0.1', PeerPort => $port,
+        Proto => 'tcp', Timeout => 1);
+    return 0 unless $s;
+    close $s;
+    return 1;
+}
+
+# 1. Cert: generate one if it isn't there.  Self-signed, key + cert in
+#    the same PEM (which is what xpra's --ssl-cert wants).
+if (! -f $cert) {
+    my $dir = dirname($cert);
+    make_path($dir, { mode => 0700 }) unless -d $dir;
+    print "Generating self-signed cert at $cert\n";
+    my $rc = system('openssl', 'req', '-x509', '-newkey', 'rsa:2048',
+                    '-nodes', '-days', '3650',
+                    '-keyout', $cert,
+                    '-out',    $cert,
+                    '-subj',   '/CN=localhost');
+    die "openssl failed (exit @{[$rc>>8]})\n" if $rc != 0;
+    chmod 0600, $cert;
+}
+
+# 2. Anything already running on this display?  `xpra list` is the
+#    authoritative source; matching on the display string keeps us
+#    independent of system vs user xpra layout.
+my $live = 0;
+if (open my $fh, '-|', 'xpra', 'list') {
+    while (<$fh>) {
+        $live = 1 if /\bLIVE session at\s+\Q$display\E\b/;
+    }
+    close $fh;
+}
+
+if ($live) {
+    print "xpra $display already running\n";
+    die "xpra $display is up but nothing's listening on port $port — "
+      . "wrong --port?\n" unless port_open();
+} else {
+    print "Starting xpra $display\n";
+    my $auth = "pam:service=$pam_service";
+    my @cmd = ('xpra', 'start', $display,
+               "--start=$start_cmd",
+               "--bind-ssl=127.0.0.1:$port",
+               "--ssl-cert=$cert",
+               '--html=on',
+               "--auth=$auth",
+               '--no-mdns');
+    my $rc = system(@cmd);
+    die "xpra start failed (exit @{[$rc>>8]})\n" if $rc != 0;
+
+    # `xpra start` daemonizes; poll for the port instead of guessing.
+    my $deadline = time + 15;
+    while (time < $deadline) {
+        last if port_open();
+        select undef, undef, undef, 0.2;
+    }
+    die "xpra started but $port never came up — check ~/.xpra/$display.log\n"
+        unless port_open();
+}
+
+my $url = "https://127.0.0.1:$port/";
+print "URL: $url\n";
+unless ($no_browser) {
+    system('xdg-open', $url) == 0
+        or warn "xdg-open failed; open the URL manually\n";
+}
+exit 0;
