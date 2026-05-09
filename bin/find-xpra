@@ -1388,8 +1388,11 @@ for my $host (keys %xs_for_host) {
 
 # Build display rows: pick a main cmd and format it.  An xpra-listed
 # session with no surviving non-daemon procs reads as "(empty xpra)" so
-# the user can still attach to it.
+# the user can still attach to it.  Rows sourced from a remote
+# ~/.xpra-start are exempt — their apps text is the user's intended
+# command, regardless of what's actually running on the display.
 for my $s (@sessions) {
+    next if defined $s->{_xs_cmd};
     my $main = _main_cmd(@{ $s->{cmds} });
     $s->{apps} = length $main           ? _fmt_cmd($main, 60)
                : $s->{xpra_listed}      ? '(empty xpra)'
