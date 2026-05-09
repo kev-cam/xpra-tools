@@ -394,7 +394,9 @@ usage: find-xpra [options]
   --list                print rows to stdout instead of popping a chooser
   --no-local            skip local show-x11 probe; also skip our own IP
                         when scanning for net-mgr
-  -a, --all             include displays under :20 (presumed plain X)
+  -a, --all             show everything otherwise hidden: displays under
+                        :20 (presumed plain X), displays over :1000, and
+                        sessions whose only contents are session plumbing
   --debug               print the probe command for each candidate and
                         leave ssh's stderr attached so failures show why
   -h, --help            this message
@@ -1013,14 +1015,21 @@ for my $c (@candidates) {
         # the parent picker and crash both processes.
         $SIG{ALRM} = sub { POSIX::_exit(1) };
         alarm($overall_to + 1);
-        # Run both:
+        # Run three stages:
         #   show-x11 -ns -id   -> per-display proc list (apps + machine-id)
         #   xpra list          -> authoritative list of xpra displays, even
         #                         empty ones that show-x11 would miss
-        # Separator marks the boundary so the parser can switch modes.
+        #   cat ~/.xpra-start  -> user's "intended sessions" map; if
+        #                         present we'll pivot the picker to show
+        #                         these entries (green/red by running)
+        # Separators mark the boundaries so the parser can switch modes.
         # No `2>/dev/null` -- a csh/tcsh login shell on the remote chokes
         # on bash-style redirection and the whole probe returns nothing.
-        my $remote = 'show-x11 -ns -id; echo __XPRA__; xpra list';
+        # The cat is `cat -- ~/.xpra-start || true` so a missing file
+        # doesn't tank the pipeline; the surrounding parens make it work
+        # in both bourne-style and csh-style shells.
+        my $remote = 'show-x11 -ns -id; echo __XPRA__; xpra list; '
+                   . 'echo __XSTART__; cat ~/.xpra-start';
         my @cmd = $c->{local}
             ? ('sh', '-c', $remote)
             : ('ssh', ssh_opts(), ssh_target($c), $remote);
@@ -1028,11 +1037,23 @@ for my $c (@candidates) {
              join(' ', map { /\s/ ? "'$_'" : $_ } @cmd));
         if (open my $oh, '-|', @cmd) {
             my $disp;
-            my $in_xpra = 0;
+            my $in_xpra   = 0;
+            my $in_xstart = 0;
             while (defined(my $line = <$oh>)) {
                 chomp $line;
                 _dbg("[debug] $c->{name}> $line");
-                if ($line eq '__XPRA__') { $in_xpra = 1; next }
+                if ($line eq '__XPRA__')   { $in_xpra = 1; $in_xstart = 0; next }
+                if ($line eq '__XSTART__') { $in_xpra = 0; $in_xstart = 1; next }
+                if ($in_xstart) {
+                    # ~/.xpra-start lines: "<n>: <cmd>" or ":<n>: <cmd>".
+                    # Skip blanks and comments.  Strip inline `#` comments.
+                    (my $l = $line) =~ s/#.*//;
+                    next if $l =~ /^\s*$/;
+                    if ($l =~ /^\s*:?(\d+)\s*:\s*(\S.*?)\s*$/) {
+                        print { $pipe } join("\t", '__xs__', $c->{name}, $1, $2), "\n";
+                    }
+                    next;
+                }
                 if ($in_xpra) {
                     # `xpra list` lines like:  "\tLIVE session at :20"
                     # Dedup happens parent-side via the row hash.
@@ -1073,6 +1094,7 @@ my @rows;
 my %xpra_listed;     # "$host\t$disp" -> 1 (display reported by `xpra list`)
 my %remote_id;       # candidate-name -> machine-id (from `show-x11 -id`)
 my %remote_host;     # candidate-name -> remote `hostname`
+my %xs_for_host;     # candidate-name -> [ {disp_n, cmd}, ... ]
 my %buf;
 my $deadline = time + $overall_to;
 while ($sel->count) {
@@ -1091,6 +1113,9 @@ while ($sel->count) {
                 $remote_id{$1}   = $3;
             } elsif ($line =~ /^__xpra__\t([^\t]*)\t([^\t]*)$/) {
                 $xpra_listed{"$1\t$2"} = 1;
+            } elsif ($line =~ /^__xs__\t([^\t]*)\t([^\t]*)\t([^\t]*)$/) {
+                push @{ $xs_for_host{$1} },
+                    { disp_n => $2 + 0, cmd => $3 };
             } else {
                 my @f = split /\t/, $line, 5;
                 push @rows, \@f if @f == 5;
@@ -1156,6 +1181,12 @@ for my $pid (keys %pid_for) {
             $relabelled{"$h2\t$d"} = 1;
         }
         %xpra_listed = %relabelled;
+        my %xs_relabelled;
+        for my $h (keys %xs_for_host) {
+            my $h2 = $canonical{$h} // $h;
+            push @{ $xs_relabelled{$h2} }, @{ $xs_for_host{$h} };
+        }
+        %xs_for_host = %xs_relabelled;
     }
 }
 
@@ -1287,10 +1318,66 @@ for my $s (@sessions) {
     $s->{local}    = $local_for_name{$s->{host}} ? 1 : 0;
 }
 unless ($all) {
-    @sessions = grep { defined $_->{disp_n} && $_->{disp_n} >= 20 } @sessions;
+    @sessions = grep {
+        defined $_->{disp_n} && $_->{disp_n} >= 20 && $_->{disp_n} <= 1000
+    } @sessions;
 }
 if (defined $user) {
     @sessions = grep { defined $_->{user} && $_->{user} eq $user } @sessions;
+}
+
+# If a host published a ~/.xpra-start file, pivot the picker to its
+# entries.  For each line we either:
+#   - reuse the live session detected at that display, or
+#   - synthesize a stub session if nothing's running there yet,
+# then mark _xs_running based on whether a process matching the
+# expected command is observed on that display.  Sessions detected on
+# the host but absent from .xpra-start are dropped — the start file is
+# the source of truth when present.
+for my $host (keys %xs_for_host) {
+    my @entries = @{ $xs_for_host{$host} };
+    next unless @entries;
+    my @host_existing = grep { $_->{host} eq $host } @sessions;
+    my %by_disp = map { $_->{disp_n} => $_ } @host_existing;
+    my $h_local  = $host_existing[0] && $host_existing[0]{local};
+    my $h_ip     = $local_for_name{$host} ? '127.0.0.1' : $ip_for_name{$host};
+    my $h_user   = $local_for_name{$host}
+                 ? ($ENV{USER} // '')
+                 : ($ssh_user // $user_for_name{$host} // $ENV{USER} // '');
+    my @new;
+    for my $e (@entries) {
+        my $existing = $by_disp{$e->{disp_n}};
+        my $base = lc(_argv0_basename($e->{cmd}));
+        my $running = 0;
+        if ($existing && length $base) {
+            for my $p (@{ $existing->{procs} }) {
+                if (index(lc(_argv0_basename($p->{cmd})), $base) >= 0
+                 || index(lc($p->{cmd}), $base) >= 0) {
+                    $running = 1;
+                    last;
+                }
+            }
+        }
+        my $s = $existing // {
+            host        => $host,
+            disp        => ":$e->{disp_n}",
+            disp_n      => $e->{disp_n},
+            kind        => 'xpra',
+            user        => $h_user,
+            n           => 0,
+            cmds        => [],
+            procs       => [],
+            xpra_listed => 0,
+            local       => $h_local ? 1 : 0,
+            ip          => $h_ip,
+        };
+        $s->{apps}        = $e->{cmd};
+        $s->{_xs_cmd}     = $e->{cmd};
+        $s->{_xs_running} = $running;
+        push @new, $s;
+    }
+    @sessions = grep { $_->{host} ne $host } @sessions;
+    push @sessions, @new;
 }
 
 @sessions = sort {
@@ -1393,20 +1480,32 @@ for my $i (0 .. $#cols) {
 my $r = 2;
 for my $s (@sessions) {
     my @vals = ($s->{host}, $s->{disp}, $s->{kind}, $s->{user}, $s->{apps});
+    # When the row was sourced from a remote ~/.xpra-start, color it
+    # green if the listed app appears to be running on its display, red
+    # otherwise.  Plain detected sessions stay the default colour.
+    my %fg;
+    if (defined $s->{_xs_cmd}) {
+        %fg = (-foreground => $s->{_xs_running} ? '#0a7d10' : '#c00000');
+    }
     for my $c (0 .. $#vals) {
-        $mw->Label(-text => $vals[$c], -anchor => 'w', -padx => 6)
+        $mw->Label(-text => $vals[$c], -anchor => 'w', -padx => 6, %fg)
            ->grid(-row => $r, -column => $c, -sticky => 'ew');
     }
     my $sess = $s;     # closure capture
     $mw->Button(-text => 'Apps',
                 -command => sub { _show_procs($sess) })
        ->grid(-row => $r, -column => 5, -padx => 6, -pady => 1, -sticky => 'ew');
-    $mw->Button(-text => 'Terminal',
+    # Terminal only makes sense once we've actually attached to the
+    # display — opening one against an unattached session pops a window
+    # the user can't see.  Enabled by Attach, disabled again by
+    # Disconnect / child reap (below).
+    my $term_btn = $mw->Button(-text => 'Terminal',
+                -state   => 'disabled',
                 -command => sub {
                     _keys_ensure() unless $sess->{local};
                     spawn_detached(_term_cmd($sess));
-                })
-       ->grid(-row => $r, -column => 6, -padx => 6, -pady => 1, -sticky => 'ew');
+                });
+    $term_btn->grid(-row => $r, -column => 6, -padx => 6, -pady => 1, -sticky => 'ew');
     $mw->Button(-text => 'Settings',
                 -command => sub { _show_settings($sess) })
        ->grid(-row => $r, -column => 7, -padx => 6, -pady => 1, -sticky => 'ew');
@@ -1419,6 +1518,7 @@ for my $s (@sessions) {
             $sess->{_disc_count} = 0;
             $attach_btn->configure(-state => 'disabled');
             $disc_btn->configure(-state => 'normal', -text => 'Disconnect');
+            $term_btn->configure(-state => 'normal');
         });
     # Escalating disconnect.  The xpra viewer occasionally ignores a plain
     # TERM (mid-handshake, stuck in a modal, ssh transport hung, ...), so
@@ -1447,6 +1547,7 @@ for my $s (@sessions) {
     $disc_btn  ->grid(-row => $r, -column => 9, -padx => 6, -pady => 1, -sticky => 'ew');
     $sess->{_attach_btn} = $attach_btn;
     $sess->{_disc_btn}   = $disc_btn;
+    $sess->{_term_btn}   = $term_btn;
     $r++;
 }
 
@@ -1462,6 +1563,8 @@ $mw->repeat(750, sub {
             $s->{_attach_btn}->configure(-state => 'normal');
             $s->{_disc_btn}  ->configure(-state => 'disabled',
                                          -text  => 'Disconnect');
+            $s->{_term_btn}  ->configure(-state => 'disabled')
+                if $s->{_term_btn};
         }
     }
 });
