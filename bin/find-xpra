@@ -1470,7 +1470,7 @@ my $mw = _tk_mw();
 _dbg("[debug] parent: MainWindow created");
 $mw->title('find-xpra: attach to X11 session');
 $mw->deiconify;
-my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '', '', '', '', '');
+my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '', '', '', '', '', '');
 
 # Rescan: re-exec self with the same args.  Discovery runs again and the
 # UI rebuilds.  In-flight xpra-attach children are setsid'd so they
@@ -1518,6 +1518,17 @@ for my $s (@sessions) {
     $mw->Button(-text => 'Settings',
                 -command => sub { _show_settings($sess) })
        ->grid(-row => $r, -column => 7, -padx => 6, -pady => 1, -sticky => 'ew');
+    # HTML5 client button — points the default browser at xpra-web's
+    # https endpoint for this session.  Starts disabled; enabled
+    # asynchronously (below) once a TCP probe of host:14500+disp_n
+    # comes back open.  Click → xdg-open the cached URL.
+    my $html_btn = $mw->Button(-text => 'HTML',
+                -state   => 'disabled',
+                -command => sub {
+                    my $url = $sess->{_html_url} or return;
+                    spawn_detached('xdg-open', $url);
+                });
+    $html_btn->grid(-row => $r, -column => 8, -padx => 6, -pady => 1, -sticky => 'ew');
     my ($attach_btn, $disc_btn);
     $attach_btn = $mw->Button(-text => 'Attach',
         -command => sub {
@@ -1552,12 +1563,105 @@ for my $s (@sessions) {
                 $disc_btn->configure(-text => 'KILL');
             }
         });
-    $attach_btn->grid(-row => $r, -column => 8, -padx => 6, -pady => 1, -sticky => 'ew');
-    $disc_btn  ->grid(-row => $r, -column => 9, -padx => 6, -pady => 1, -sticky => 'ew');
+    $attach_btn->grid(-row => $r, -column => 9, -padx => 6, -pady => 1, -sticky => 'ew');
+    $disc_btn  ->grid(-row => $r, -column => 10, -padx => 6, -pady => 1, -sticky => 'ew');
     $sess->{_attach_btn} = $attach_btn;
     $sess->{_disc_btn}   = $disc_btn;
     $sess->{_term_btn}   = $term_btn;
+    $sess->{_html_btn}   = $html_btn;
     $r++;
+}
+
+# Background HTML5-port probe.  We can't synchronously TCP-connect from
+# the Tk thread without freezing the UI on closed/firewalled ports
+# (1s × N), so a forked child does the probes serially and writes
+# "host\tdisp_n\tport\tfound\n" back through a pipe.  Plain pipe() +
+# typeglobs (rather than IO::Pipe) so Tk's fileevent has no doubt about
+# what filehandle it's polling — empirically the IO::Pipe variant
+# stayed silent.  sysread + line-buffer drain handles the "multiple
+# lines arrived in one read" case (Smak Gotcha #11).
+{
+    pipe(my $html_r, my $html_w) or warn "find-xpra: html pipe: $!\n";
+    # Snapshot every IPv4 we own so the probe can also try the real
+    # interface for "local" sessions — xpra-web bound to a specific
+    # NIC (eg 192.168.x.y) won't be reachable on 127.0.0.1.
+    my @local_ips = sort grep {
+        /^\d+\.\d+\.\d+\.\d+\z/ && !/^127\./
+    } keys %{ _local_ips_set() };
+    if ($html_r && $html_w) {
+        my $html_kid = fork;
+        if (!defined $html_kid) {
+            warn "find-xpra: html probe fork: $!\n";
+            close $html_r; close $html_w;
+        } elsif ($html_kid == 0) {
+            close $html_r;
+            select((select($html_w), $|=1)[0]);
+            POSIX::setsid();
+            open STDIN, '<', '/dev/null';
+            for my $s (@sessions) {
+                next unless defined $s->{disp_n};
+                my $port = 14500 + $s->{disp_n};
+                # Try several addresses; the first to accept wins and
+                # becomes the URL host.  Loopback first for local
+                # sessions (covers xpra-web on 127.0.0.1); then the
+                # session's IP and hostname (covers xpra-web bound to
+                # a real interface, e.g. 192.168.x.y, even when the
+                # session is "local" to find-xpra).
+                my @addrs;
+                if ($s->{local}) {
+                    push @addrs, '127.0.0.1', @local_ips;
+                }
+                for my $a ($s->{ip}, $s->{host}) {
+                    next unless defined $a && length $a;
+                    push @addrs, $a unless grep { $_ eq $a } @addrs;
+                }
+                my $found = '';
+                for my $addr (@addrs) {
+                    my $sock = IO::Socket::INET->new(
+                        PeerAddr => $addr, PeerPort => $port,
+                        Proto => 'tcp', Timeout => 1);
+                    if ($sock) { close $sock; $found = $addr; last }
+                }
+                _dbg("[debug] html: $s->{host} :$s->{disp_n} port=$port "
+                   . "addrs=[@addrs] found=" . ($found // '-'));
+                print $html_w
+                    join("\t", $s->{host}, $s->{disp_n}, $port, $found), "\n";
+            }
+            close $html_w;
+            POSIX::_exit(0);
+        } else {
+            close $html_w;
+            my $buf = '';
+            $mw->fileevent($html_r, 'readable', sub {
+                my $n = sysread($html_r, my $chunk, 4096);
+                if (!$n) {
+                    $mw->fileevent($html_r, 'readable', '');
+                    close $html_r;
+                    waitpid($html_kid, 0);
+                    _dbg("[debug] html: probe child reaped");
+                    return;
+                }
+                $buf .= $chunk;
+                while ($buf =~ s/^([^\n]*)\n//) {
+                    my ($h, $d, $p, $found) = split /\t/, $1, 4;
+                    _dbg("[debug] html: result host=$h disp=$d port=$p "
+                       . "found=" . (defined $found && length $found ? $found : '-'));
+                    next unless defined $found && length $found;
+                    for my $s (@sessions) {
+                        next unless $s->{host} eq $h
+                                 && defined $s->{disp_n}
+                                 && $s->{disp_n} == $d;
+                        next unless $s->{_html_btn};
+                        $s->{_html_url} = "https://$found:$p/";
+                        $s->{_html_btn}->configure(-state => 'normal');
+                        _dbg("[debug] html: enabled button for $h :$d -> "
+                           . $s->{_html_url});
+                        last;
+                    }
+                }
+            });
+        }
+    }
 }
 
 # Reap exited xpra-attach children so the UI flips back when the viewer

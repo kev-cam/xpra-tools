@@ -34,7 +34,9 @@ my $help;
 sub usage { <<EOF }
 usage: xpra-web [options]
   --display N      xpra display (default: next free :$DISPLAY_BASE+)
-  --port N         https port (default: next free $PORT_BASE+)
+  --port N         https port (default: 14500 + display number, e.g.
+                   :100 → 14600; falls back to next free $PORT_BASE+
+                   if the display-aligned port is taken)
   -i, --interface ADDR
                    bind address (default $iface — loopback only).
                    Use 0.0.0.0 to expose on every interface, or a
@@ -105,11 +107,22 @@ if (defined $display) {
 }
 
 if (!defined $port) {
-    my $p = $PORT_BASE;
-    $p++ while port_in_use($p) && $p < $PORT_BASE + 200;
-    die "xpra-web: no free port in $PORT_BASE.." . ($PORT_BASE+199) . "\n"
-        if port_in_use($p);
-    $port = $p;
+    # Prefer the display-aligned port (14500 + N) so the URL is
+    # predictable from the display number — find-xpra and friends can
+    # construct it without asking us.  Fall back to scan only if it's
+    # already taken.
+    my ($disp_n) = $display =~ /^:(\d+)$/;
+    if (defined $disp_n) {
+        my $aligned = 14500 + $disp_n;
+        $port = $aligned if $aligned >= 1024 && !port_in_use($aligned);
+    }
+    if (!defined $port) {
+        my $p = $PORT_BASE;
+        $p++ while port_in_use($p) && $p < $PORT_BASE + 200;
+        die "xpra-web: no free port in $PORT_BASE.." . ($PORT_BASE+199) . "\n"
+            if port_in_use($p);
+        $port = $p;
+    }
 }
 
 sub port_open {
