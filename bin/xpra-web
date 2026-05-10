@@ -16,24 +16,38 @@ use Getopt::Long qw(:config no_ignore_case no_bundling);
 use IO::Socket::INET;
 use File::Path qw(make_path);
 use File::Basename qw(dirname);
+use Sys::Hostname qw(hostname);
 
 my $DISPLAY_BASE = 100;
 my $PORT_BASE    = 14501;
 
 my $display;     # undef -> next free at/after $DISPLAY_BASE
 my $port;        # undef -> next free at/after $PORT_BASE
+my $iface       = '127.0.0.1';
 my $cert        = "$ENV{HOME}/.config/xpra/ssl-cert.pem";
 my $pam_service = 'xpra';
 my $start_cmd   = 'mate-terminal';
+my $new_key;
 my $no_browser;
 my $help;
 
 sub usage { <<EOF }
 usage: xpra-web [options]
   --display N      xpra display (default: next free :$DISPLAY_BASE+)
-  --port N         loopback https port (default: next free $PORT_BASE+)
-  --cert FILE      ssl cert + key, self-signed and generated if missing
+  --port N         https port (default: next free $PORT_BASE+)
+  -i, --interface ADDR
+                   bind address (default $iface — loopback only).
+                   Use 0.0.0.0 to expose on every interface, or a
+                   specific IP / hostname to expose on just that one.
+                   PAM auth is the only thing between callers and your
+                   desktop; pick a strong account password.
+  --cert FILE      ssl cert + key, self-signed and generated if missing.
+                   The auto-gen cert includes localhost, 127.0.0.1, and
+                   `hostname` as SANs; if you pass --interface with an
+                   IP / hostname not already covered, it's added too.
                    (default ~/.config/xpra/ssl-cert.pem)
+  --new-key        regenerate the cert at --cert even if it exists
+                   (forces a fresh key + SAN list)
   --pam-service N  PAM service name (default $pam_service; falls back
                    gracefully if /etc/pam.d/$pam_service is absent —
                    try `--pam-service login` then)
@@ -45,13 +59,18 @@ EOF
 GetOptions(
     'display=s'     => \$display,
     'port=i'        => \$port,
+    'i|interface=s' => \$iface,
     'cert=s'        => \$cert,
     'pam-service=s' => \$pam_service,
     'c|command=s'   => \$start_cmd,
+    'new-key'       => \$new_key,
     'no-browser'    => \$no_browser,
     'h|help'        => \$help,
 ) or die usage();
 print(usage()), exit 0 if $help;
+
+my $is_loopback = $iface eq '127.0.0.1' || $iface eq '::1';
+my $is_wildcard = $iface eq '0.0.0.0'   || $iface eq '::';
 
 # A display is "in use" if either the X11 lock or the unix socket is
 # present.  This catches both live xpra/X servers and stale leftovers
@@ -61,13 +80,14 @@ sub display_in_use {
     return -e "/tmp/.X${n}-lock" || -e "/tmp/.X11-unix/X${n}";
 }
 
-# A port is "in use" if we can't bind it.  ReuseAddr keeps a recent
-# TIME_WAIT from making us skip a port we could have used.  Tiny TOCTOU
-# between the close here and xpra binding it later — accept it.
+# A port is "in use" if we can't bind it on the chosen interface.
+# ReuseAddr keeps a recent TIME_WAIT from making us skip a port we
+# could have used.  Tiny TOCTOU between the close here and xpra binding
+# it later — accept it.
 sub port_in_use {
     my ($p) = @_;
     my $s = IO::Socket::INET->new(
-        LocalAddr => '127.0.0.1', LocalPort => $p,
+        LocalAddr => $iface, LocalPort => $p,
         Proto => 'tcp', ReuseAddr => 1, Listen => 1);
     return 1 unless $s;
     close $s;
@@ -93,8 +113,11 @@ if (!defined $port) {
 }
 
 sub port_open {
+    # Loopback always works for wildcard binds and for 127.0.0.1 binds;
+    # a specific external interface needs to be probed directly.
+    my $probe = ($is_loopback || $is_wildcard) ? '127.0.0.1' : $iface;
     my $s = IO::Socket::INET->new(
-        PeerAddr => '127.0.0.1', PeerPort => $port,
+        PeerAddr => $probe, PeerPort => $port,
         Proto => 'tcp', Timeout => 1);
     return 0 unless $s;
     close $s;
@@ -102,16 +125,32 @@ sub port_open {
 }
 
 # 1. Cert: generate one if it isn't there.  Self-signed, key + cert in
-#    the same PEM (which is what xpra's --ssl-cert wants).
+#    the same PEM (which is what xpra's --ssl-cert wants).  SANs cover
+#    the common ways someone will reach this host (loopback + own
+#    hostname), plus whatever --interface said if it's an extra
+#    name/address.  Requires OpenSSL 1.1.1+ for -addext.
+if ($new_key && -f $cert) {
+    print "Removing existing cert at $cert\n";
+    unlink $cert or die "unlink $cert: $!\n";
+}
 if (! -f $cert) {
     my $dir = dirname($cert);
     make_path($dir, { mode => 0700 }) unless -d $dir;
-    print "Generating self-signed cert at $cert\n";
+    my $host = hostname();
+    my @sans = ('DNS:localhost', 'IP:127.0.0.1');
+    push @sans, "DNS:$host" if length $host;
+    if (!$is_loopback && !$is_wildcard) {
+        my $tag = $iface =~ /^[\d.]+$|:/ ? 'IP' : 'DNS';
+        my $san = "$tag:$iface";
+        push @sans, $san unless grep { $_ eq $san } @sans;
+    }
+    print "Generating self-signed cert at $cert (SAN: @sans)\n";
     my $rc = system('openssl', 'req', '-x509', '-newkey', 'rsa:2048',
                     '-nodes', '-days', '3650',
                     '-keyout', $cert,
                     '-out',    $cert,
-                    '-subj',   '/CN=localhost');
+                    '-subj',   '/CN=' . (length $host ? $host : 'localhost'),
+                    '-addext', 'subjectAltName=' . join(',', @sans));
     die "openssl failed (exit @{[$rc>>8]})\n" if $rc != 0;
     chmod 0600, $cert;
 }
@@ -132,11 +171,14 @@ if ($live) {
     die "xpra $display is up but nothing's listening on port $port — "
       . "wrong --port?\n" unless port_open();
 } else {
-    print "Starting xpra $display\n";
+    print "Starting xpra $display on $iface:$port\n";
+    warn "xpra-web: WARNING — exposing $display on $iface; "
+       . "PAM ($pam_service) is the only barrier between callers and "
+       . "your desktop\n" unless $is_loopback;
     my $auth = "pam:service=$pam_service";
     my @cmd = ('xpra', 'start', $display,
                "--start=$start_cmd",
-               "--bind-ssl=127.0.0.1:$port",
+               "--bind-ssl=$iface:$port",
                "--ssl-cert=$cert",
                '--html=on',
                "--auth=$auth",
@@ -154,8 +196,17 @@ if ($live) {
         unless port_open();
 }
 
-my $url = "https://127.0.0.1:$port/";
+# Pick a URL that's most useful to the caller.  For loopback / wildcard
+# binds the browser on this host can hit 127.0.0.1; for a specific
+# external bind it has to go through that address.
+my $url_host = $is_loopback ? '127.0.0.1'
+             : $is_wildcard ? (hostname() || '127.0.0.1')
+             :                $iface;
+my $url = "https://$url_host:$port/";
 print "URL: $url\n";
+if ($is_wildcard) {
+    print "      (also reachable on every other local interface)\n";
+}
 unless ($no_browser) {
     system('xdg-open', $url) == 0
         or warn "xdg-open failed; open the URL manually\n";
