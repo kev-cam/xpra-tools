@@ -1,0 +1,319 @@
+#!/usr/bin/perl
+# xpra-pod-build — build a minimal podman image that runs xpra over ssh.
+#
+# Default: detect the host's flavor from /etc/os-release and build the
+# matching image.  Override with --flavor.  The image bakes in:
+#   * xpra
+#   * openssh-server (key-auth only, password+root login disabled)
+#   * a non-root user matching the host UID/username, with the host
+#     user's public keys preloaded into ~/.ssh/authorized_keys
+#   * xterm (for the truly-minimal default app)
+#
+# Image is tagged 'xpra-pod:<flavor>'.  Build context is built up under
+# ~/.cache/xpra-pod/<flavor>/ so it's diffable between rebuilds.
+
+use strict;
+use warnings;
+use Getopt::Long qw(:config no_ignore_case no_bundling);
+use File::Path   qw(make_path);
+use File::Basename qw(dirname);
+
+# -- flavor presets -------------------------------------------------------
+#
+# Keep this hash compact and add a new entry rather than special-casing
+# downstream.  'packages' must include xpra, openssh-server, xterm, sudo,
+# and ca-certificates; the install/clean lines are flavor-specific.
+my %FLAVORS = (
+    'ubuntu-jammy' => {
+        from        => 'docker.io/library/ubuntu:22.04',
+        install     => 'export DEBIAN_FRONTEND=noninteractive && '
+                     . 'apt-get update && '
+                     . 'apt-get install -y --no-install-recommends '
+                     . 'xpra openssh-server xterm sudo ca-certificates '
+                     . 'dbus-x11 && '
+                     . 'apt-get clean && rm -rf /var/lib/apt/lists/*',
+        adduser     => 'useradd -m -s /bin/bash -u %UID% %USER% && '
+                     . 'usermod -p \'*\' %USER% && '
+                     . 'usermod -aG sudo %USER% && '
+                     . 'echo "%USER% ALL=(ALL) NOPASSWD:ALL" '
+                     . '> /etc/sudoers.d/%USER%',
+    },
+    'ubuntu-noble' => {
+        from        => 'docker.io/library/ubuntu:24.04',
+        install     => 'export DEBIAN_FRONTEND=noninteractive && '
+                     . 'apt-get update && '
+                     . 'apt-get install -y --no-install-recommends '
+                     . 'xpra openssh-server xterm sudo ca-certificates '
+                     . 'dbus-x11 && '
+                     . 'apt-get clean && rm -rf /var/lib/apt/lists/*',
+        adduser     => 'useradd -m -s /bin/bash -u %UID% %USER% && '
+                     . 'usermod -p \'*\' %USER% && '
+                     . 'usermod -aG sudo %USER% && '
+                     . 'echo "%USER% ALL=(ALL) NOPASSWD:ALL" '
+                     . '> /etc/sudoers.d/%USER%',
+    },
+    'debian-bookworm' => {
+        from        => 'docker.io/library/debian:12',
+        install     => 'export DEBIAN_FRONTEND=noninteractive && '
+                     . 'apt-get update && '
+                     . 'apt-get install -y --no-install-recommends '
+                     . 'xpra openssh-server xterm sudo ca-certificates '
+                     . 'dbus-x11 && '
+                     . 'apt-get clean && rm -rf /var/lib/apt/lists/*',
+        adduser     => 'useradd -m -s /bin/bash -u %UID% %USER% && '
+                     . 'usermod -p \'*\' %USER% && '
+                     . 'usermod -aG sudo %USER% && '
+                     . 'echo "%USER% ALL=(ALL) NOPASSWD:ALL" '
+                     . '> /etc/sudoers.d/%USER%',
+    },
+    'fedora' => {
+        from        => 'registry.fedoraproject.org/fedora:latest',
+        install     => 'dnf -y install xpra openssh-server xterm sudo '
+                     . 'ca-certificates dbus-x11 && '
+                     . 'dnf clean all && '
+                     . 'ssh-keygen -A',
+        adduser     => 'useradd -m -s /bin/bash -u %UID% %USER% && '
+                     . 'usermod -p \'*\' %USER% && '
+                     . 'usermod -aG wheel %USER% && '
+                     . 'echo "%USER% ALL=(ALL) NOPASSWD:ALL" '
+                     . '> /etc/sudoers.d/%USER%',
+    },
+    'arch' => {
+        from        => 'docker.io/library/archlinux:latest',
+        install     => 'pacman -Syu --noconfirm xpra openssh xterm sudo '
+                     . 'ca-certificates dbus && '
+                     . 'pacman -Scc --noconfirm && '
+                     . 'ssh-keygen -A',
+        adduser     => 'useradd -m -s /bin/bash -u %UID% %USER% && '
+                     . 'usermod -p \'*\' %USER% && '
+                     . 'usermod -aG wheel %USER% && '
+                     . 'echo "%USER% ALL=(ALL) NOPASSWD:ALL" '
+                     . '> /etc/sudoers.d/%USER%',
+    },
+);
+
+my $flavor;
+my $rebuild;
+my $list;
+my $print_only;   # --print: dump the Containerfile to stdout, don't build
+my $help;
+
+sub usage { <<EOF }
+usage: xpra-pod-build [options]
+  --flavor NAME    flavor preset (default: detect from /etc/os-release)
+  --list           list known flavor presets and exit
+  --rebuild        force rebuild even if xpra-pod:<flavor> already exists
+  --print          print the generated Containerfile and build context
+                   path; don't run podman
+  -h, --help       this message
+
+Detected flavor on this host: @{[ detect_flavor() // '(none)' ]}
+EOF
+
+GetOptions(
+    'flavor=s' => \$flavor,
+    'list'     => \$list,
+    'rebuild'  => \$rebuild,
+    'print'    => \$print_only,
+    'h|help'   => \$help,
+) or die usage();
+print(usage()), exit 0 if $help;
+
+if ($list) {
+    for my $f (sort keys %FLAVORS) {
+        printf "  %-18s  %s\n", $f, $FLAVORS{$f}{from};
+    }
+    exit 0;
+}
+
+# /etc/os-release maps cleanly onto our preset names for the most part.
+# The interesting case is downstreams (Mint, Pop!, etc.) where ID isn't
+# itself a preset — fall back to UBUNTU_CODENAME / VERSION_CODENAME plus
+# ID_LIKE for the package family.
+sub read_os_release {
+    my %r;
+    open my $fh, '<', '/etc/os-release' or return %r;
+    while (<$fh>) {
+        chomp;
+        next unless /^([A-Z_]+)=(.*)$/;
+        my ($k, $v) = ($1, $2);
+        $v =~ s/^"(.*)"$/$1/;
+        $r{$k} = $v;
+    }
+    close $fh;
+    return %r;
+}
+
+sub detect_flavor {
+    my %os = read_os_release();
+    my $id   = $os{ID}      // '';
+    my $like = $os{ID_LIKE} // '';
+
+    # On a downstream (Mint, Pop, …), VERSION_CODENAME is the *downstream*
+    # codename (e.g. "virginia") which means nothing to us — UBUNTU_CODENAME
+    # / DEBIAN_CODENAME hold the upstream we actually need.  On stock
+    # Ubuntu/Debian the upstream-named field is missing and VERSION_CODENAME
+    # *is* the upstream name; fall through to it.
+    my $code = $os{UBUNTU_CODENAME}
+            // $os{DEBIAN_CODENAME}
+            // $os{VERSION_CODENAME}
+            // '';
+
+    return 'ubuntu-jammy'    if $id eq 'ubuntu' && $code eq 'jammy';
+    return 'ubuntu-noble'    if $id eq 'ubuntu' && $code eq 'noble';
+    return 'debian-bookworm' if $id eq 'debian' && $code eq 'bookworm';
+    return 'fedora'          if $id eq 'fedora';
+    return 'arch'            if $id eq 'arch' || $id eq 'archlinux';
+
+    if ($like =~ /\bubuntu\b/ || $like =~ /\bdebian\b/) {
+        return 'ubuntu-jammy'    if $code eq 'jammy';
+        return 'ubuntu-noble'    if $code eq 'noble';
+        return 'debian-bookworm' if $code eq 'bookworm';
+    }
+    return undef;
+}
+
+$flavor //= detect_flavor()
+    or die "xpra-pod-build: couldn't detect host flavor; pass --flavor "
+         . "(see --list)\n";
+exists $FLAVORS{$flavor}
+    or die "xpra-pod-build: unknown flavor '$flavor' (see --list)\n";
+
+# -- build context --------------------------------------------------------
+#
+# A real directory rather than a heredoc — keeps things diffable, lets
+# you `podman build` it manually if something goes wrong, and gives the
+# COPY step a stable source for authorized_keys + sshd_config.
+my $cache = "$ENV{HOME}/.cache/xpra-pod/$flavor";
+make_path($cache, { mode => 0700 }) unless -d $cache;
+
+my $user = $ENV{USER} || (getpwuid($<))[0]
+    or die "xpra-pod-build: can't determine \$USER\n";
+my $uid  = $<;
+my $home_authkeys = collect_authorized_keys();
+length $home_authkeys
+    or die "xpra-pod-build: no public keys found under ~/.ssh; "
+         . "run ssh-keygen first (the pod must be reachable by key)\n";
+
+# Write authorized_keys for the in-container user.  Done at build time
+# so the image carries the keys; rebuild to add new ones.
+write_file("$cache/authorized_keys", $home_authkeys);
+
+# Minimal sshd_config: keys only, no root, no password.  Sshd will use
+# the host keys that were generated during install.
+write_file("$cache/sshd_config", <<'SSHD');
+# xpra-pod sshd config — key auth only, no root, no passwords.
+Port 22
+PermitRootLogin no
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+X11Forwarding no
+PrintMotd no
+AcceptEnv LANG LC_*
+Subsystem sftp /usr/lib/openssh/sftp-server
+SSHD
+
+# Generate Containerfile.  Each command stays on its own RUN so a
+# rebuild caches the package install separately from the user setup —
+# tweaking authorized_keys doesn't reinstall xpra.
+my $f       = $FLAVORS{$flavor};
+my $install = $f->{install};
+my $adduser = $f->{adduser};
+$adduser =~ s/%USER%/$user/g;
+$adduser =~ s/%UID%/$uid/g;
+
+my $containerfile = <<CF;
+# Generated by xpra-pod-build for flavor '$flavor'.  Do not edit by hand
+# — re-run xpra-pod-build (or pass --print to inspect).
+FROM $f->{from}
+
+RUN $install
+
+RUN $adduser
+
+# sshd needs a privilege-separation dir at runtime; openssh-server's
+# postinst usually creates it but we run as a fresh image so make sure.
+RUN mkdir -p /run/sshd && chmod 0755 /run/sshd
+
+# Drop in the locked-down sshd_config and the host user's pubkeys.
+COPY sshd_config /etc/ssh/sshd_config
+COPY authorized_keys /home/$user/.ssh/authorized_keys
+RUN chown -R $user:$user /home/$user/.ssh \\
+ && chmod 0700 /home/$user/.ssh \\
+ && chmod 0600 /home/$user/.ssh/authorized_keys
+
+EXPOSE 22
+
+# Entrypoint runs sshd in the foreground.  xpra is started per-session
+# by the user once they ssh in (or by xpra-pod's run subcommand calling
+# `xpra start :N` over the ssh connection).
+CMD ["/usr/sbin/sshd", "-D", "-e"]
+CF
+
+write_file("$cache/Containerfile", $containerfile);
+
+if ($print_only) {
+    print "Build context: $cache\n";
+    print "---- Containerfile ----\n";
+    print $containerfile;
+    exit 0;
+}
+
+my $tag = "xpra-pod:$flavor";
+if (!$rebuild && image_exists($tag)) {
+    print "xpra-pod-build: $tag already present (use --rebuild to force)\n";
+    exit 0;
+}
+
+print "Building $tag from $cache ...\n";
+my @cmd = ('podman', 'build', '-t', $tag, $cache);
+my $rc  = system(@cmd);
+die "podman build failed (exit @{[$rc>>8]})\n" if $rc != 0;
+
+print "Built $tag\n";
+exit 0;
+
+# -- helpers --------------------------------------------------------------
+
+sub write_file {
+    my ($path, $content) = @_;
+    open my $fh, '>', $path or die "write $path: $!\n";
+    print $fh $content;
+    close $fh or die "close $path: $!\n";
+}
+
+# Collect every "id_*.pub" plus any existing authorized_keys.  De-dup
+# by full key text so we don't end up with three copies of the same key
+# from different sources.
+sub collect_authorized_keys {
+    my $sshdir = "$ENV{HOME}/.ssh";
+    return '' unless -d $sshdir;
+    my @sources;
+    push @sources, "$sshdir/authorized_keys" if -f "$sshdir/authorized_keys";
+    if (opendir my $dh, $sshdir) {
+        push @sources, "$sshdir/$_"
+            for sort grep { /^id_.*\.pub$/ } readdir $dh;
+        closedir $dh;
+    }
+    my %seen;
+    my @keys;
+    for my $src (@sources) {
+        open my $fh, '<', $src or next;
+        while (my $line = <$fh>) {
+            chomp $line;
+            next if $line =~ /^\s*(#|$)/;
+            next if $seen{$line}++;
+            push @keys, $line;
+        }
+        close $fh;
+    }
+    return join("\n", @keys) . (@keys ? "\n" : '');
+}
+
+sub image_exists {
+    my ($tag) = @_;
+    my $rc = system('podman', 'image', 'exists', $tag);
+    return $rc == 0;
+}

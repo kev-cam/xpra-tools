@@ -11,13 +11,17 @@
 PREFIX           ?= /usr/local
 BINDIR           ?= $(PREFIX)/bin
 NETMGR_PERL5DIR  ?= $(PREFIX)/share/perl5
+XPRATOOLS_PERL5DIR ?= $(PREFIX)/share/perl5
 APPSDIR          ?= $(PREFIX)/share/applications
 DESTDIR          ?=
 # Set FORCE=1 to skip the dependency prompt entirely (useful in CI or when
 # you know your package manager differs from Debian/Ubuntu — e.g. Cygwin).
 FORCE            ?=
 
-BINS = launch-xpra show-x11 find-xpra find-xpra-gocryptfs xpra-helper xpra-web
+BINS = launch-xpra show-x11 find-xpra find-xpra-gocryptfs xpra-helper xpra-web \
+       xpra-pod xpra-pod-build
+
+LIBS = lib/XpraPod/Registry.pm
 
 APPS = xpra-helper.desktop
 
@@ -42,6 +46,7 @@ help:
 
 list:
 	@for f in $(BINS); do echo "  bin/$$f → $(DESTDIR)$(BINDIR)/$$f"; done
+	@for f in $(LIBS); do echo "  $$f → $(DESTDIR)$(XPRATOOLS_PERL5DIR)/$${f#lib/}"; done
 	@for f in $(APPS); do echo "  share/applications/$$f → $(DESTDIR)$(APPSDIR)/$$f"; done
 
 # --- shared dependency-check shell snippet --------------------------------
@@ -113,9 +118,15 @@ install:
 	@for f in $(BINS); do \
 	  echo "  bin/$$f → $(DESTDIR)$(BINDIR)/$$f"; \
 	  sed -e "s|^use lib '/usr/local/src/net-mgr/lib';|use lib '$(NETMGR_PERL5DIR)';|" \
+	      -e "s|^use lib '/usr/local/src/xpra-tools/lib';|use lib '$(XPRATOOLS_PERL5DIR)';|" \
 	      bin/$$f > $(DESTDIR)$(BINDIR)/$$f.tmp && \
 	  mv $(DESTDIR)$(BINDIR)/$$f.tmp $(DESTDIR)$(BINDIR)/$$f && \
 	  chmod 755 $(DESTDIR)$(BINDIR)/$$f; \
+	done
+	@$(INSTALL) -d $(DESTDIR)$(XPRATOOLS_PERL5DIR)/XpraPod
+	@for f in $(LIBS); do \
+	  echo "  $$f → $(DESTDIR)$(XPRATOOLS_PERL5DIR)/$${f#lib/}"; \
+	  $(INSTALL) -m 644 $$f $(DESTDIR)$(XPRATOOLS_PERL5DIR)/$${f#lib/}; \
 	done
 	@$(INSTALL) -d $(DESTDIR)$(APPSDIR)
 	@for f in $(APPS); do \
@@ -125,4 +136,5 @@ install:
 
 uninstall:
 	@for f in $(BINS); do rm -fv $(DESTDIR)$(BINDIR)/$$f; done
+	@for f in $(LIBS); do rm -fv $(DESTDIR)$(XPRATOOLS_PERL5DIR)/$${f#lib/}; done
 	@for f in $(APPS); do rm -fv $(DESTDIR)$(APPSDIR)/$$f; done

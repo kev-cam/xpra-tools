@@ -1,0 +1,815 @@
+#!/usr/bin/perl
+# xpra-pod — manage a pool of physically-isolated podman containers each
+# running xpra over ssh.  Containers are addressed by a logical name
+# (independent of which host owns the pod) and tracked in a local
+# registry now / NetMgr::Pod later.
+#
+# Usage:
+#   xpra-pod run [NAME] [opts]    create + start + register a pod
+#   xpra-pod list                 list pods owned by this user
+#   xpra-pod attach NAME [opts]   xpra-attach to a pod over ssh
+#   xpra-pod stop NAME            stop the container (registry kept)
+#   xpra-pod start NAME           start a stopped pod (re-uses old port)
+#   xpra-pod rm NAME              stop + remove container + unregister
+#   xpra-pod info NAME            print registry record + podman state
+#   xpra-pod --custom [PROFILE]   Tk dialog: edit a per-user profile
+#
+# The image (xpra-pod:<flavor>) is built lazily by calling xpra-pod-build
+# the first time a flavor is needed.
+
+use strict;
+use warnings;
+use Getopt::Long qw(:config no_ignore_case no_bundling pass_through);
+use Sys::Hostname qw(hostname);
+use IO::Socket::INET;
+use File::Basename qw(dirname);
+use File::Path     qw(make_path);
+use JSON::PP       qw(decode_json encode_json);
+use FindBin qw($RealBin);
+use lib "$RealBin/../lib";
+use lib '/usr/local/src/xpra-tools/lib';
+use XpraPod::Registry;
+
+my $PORT_BASE      = 22500;
+my $PORT_MAX_SCAN  = 200;
+my $DEFAULT_DISPLAY = 100;
+my $DEFAULT_APP     = 'xterm';
+my $BUILD_TOOL     = "$RealBin/xpra-pod-build";
+
+# Top-level options that can appear before the subcommand.
+my $custom;
+my $help;
+GetOptions(
+    'custom:s'   => \$custom,    # arg optional → '' if bare
+    'h|help'     => \$help,
+) or die usage();
+
+sub usage { <<EOF }
+usage: xpra-pod <subcommand> [options]
+  run [NAME]           create + start + register a pod (NAME auto if omitted)
+    --flavor F           image flavor (default: host-detected)
+    --profile P          per-user profile (see --custom)
+    --port N             host ssh port (default: next free \$PORT_BASE+)
+    --display N          xpra display inside the pod (default :$DEFAULT_DISPLAY)
+    -c, --command CMD    app to start in the session (default $DEFAULT_APP)
+    --no-attach          don't auto-attach after starting
+
+  list                 list pods owned by this user (registry)
+  attach NAME          xpra-attach to a pod over ssh
+    --display N          display to attach (default :$DEFAULT_DISPLAY)
+    -c, --command CMD    start CMD if no session present
+  start NAME           start a stopped pod (reuses original ssh port)
+  stop NAME            stop the container; keep it (and registry) around
+  rm NAME              stop + remove container + drop registry entry
+  info NAME            print registry record + podman state
+  migrate NAME HOST    move pod NAME from this host to HOST (ssh-based)
+
+  --custom [PROFILE]   Tk dialog to edit a per-user profile (creates if
+                       absent).  Profiles are layered on the base image
+                       at run time.
+  -h, --help           this message
+EOF
+print(usage()), exit 0 if $help;
+
+if (defined $custom) {
+    run_custom_editor($custom);
+    exit 0;
+}
+
+my $cmd = shift @ARGV;
+defined $cmd or die usage();
+
+my %dispatch = (
+    run     => \&cmd_run,
+    list    => \&cmd_list,
+    attach  => \&cmd_attach,
+    start   => \&cmd_start,
+    stop    => \&cmd_stop,
+    rm      => \&cmd_rm,
+    info    => \&cmd_info,
+    migrate => \&cmd_migrate,
+);
+
+my $fn = $dispatch{$cmd}
+    or die "xpra-pod: unknown subcommand '$cmd'\n" . usage();
+
+$fn->();
+exit 0;
+
+# -- subcommands ----------------------------------------------------------
+
+sub cmd_run {
+    my ($flavor, $profile, $port, $display, $app, $no_attach);
+    $display = $DEFAULT_DISPLAY;
+    GetOptions(
+        'flavor=s'    => \$flavor,
+        'profile=s'   => \$profile,
+        'port=i'      => \$port,
+        'display=i'   => \$display,
+        'c|command=s' => \$app,
+        'no-attach'   => \$no_attach,
+    ) or die usage();
+
+    my $name = shift @ARGV;
+    $name //= auto_name();
+    valid_name($name) or die "xpra-pod run: invalid name '$name' "
+                           . "(use [a-zA-Z0-9_-]+, no spaces)\n";
+
+    if (XpraPod::Registry->get($name)) {
+        die "xpra-pod run: pod '$name' already registered "
+          . "(use 'xpra-pod start $name' or 'xpra-pod rm $name')\n";
+    }
+    if (container_exists("xpod-$name")) {
+        die "xpra-pod run: container 'xpod-$name' already exists in podman "
+          . "but isn't in the registry; remove it manually first "
+          . "(podman rm -f xpod-$name)\n";
+    }
+
+    $flavor //= detect_flavor()
+        or die "xpra-pod run: couldn't detect flavor; pass --flavor\n";
+
+    # Auto-build base image if missing.  Profile overlay (if any) is built
+    # on top after.  Both go through xpra-pod-build for consistency.
+    ensure_image("xpra-pod:$flavor", sub {
+        run_or_die($BUILD_TOOL, '--flavor', $flavor);
+    });
+
+    my $tag      = "xpra-pod:$flavor";
+    my $prof_data;
+    if (defined $profile && length $profile) {
+        $tag       = ensure_profile_image($flavor, $profile);
+        $prof_data = load_profile($profile);
+    }
+
+    # CLI -c wins; otherwise the profile's default_app; otherwise xterm.
+    $app //= ($prof_data->{default_app} // $DEFAULT_APP);
+
+    $port //= pick_free_port();
+    print "xpra-pod: starting '$name' (flavor=$flavor"
+        . (defined $profile ? ", profile=$profile" : '')
+        . ", port=$port)\n";
+
+    my @run = ('podman', 'run', '-d',
+               '--name'    => "xpod-$name",
+               '--hostname' => $name,
+               '-p'        => "$port:22",
+               '--restart' => 'unless-stopped');
+    # Profile env + mounts attach here (image-independent): -e for env,
+    # -v for bind mounts.  Mount specs are kept verbatim ("src:dst[:ro]")
+    # so "Z" / ":U" / other podman extras pass through unchanged.
+    if ($prof_data) {
+        for my $k (sort keys %{ $prof_data->{env} || {} }) {
+            push @run, '-e', "$k=$prof_data->{env}{$k}";
+        }
+        for my $m (@{ $prof_data->{mounts} || [] }) {
+            push @run, '-v', $m;
+        }
+    }
+    push @run, $tag;
+    run_or_die(@run);
+
+    wait_for_ssh('127.0.0.1', $port, 30)
+        or die "xpra-pod: container started but ssh on port $port "
+             . "never came up — check 'podman logs xpod-$name'\n";
+
+    XpraPod::Registry->register(
+        name        => $name,
+        host        => hostname(),
+        ssh_port    => $port,
+        user        => $ENV{USER} || (getpwuid($<))[0],
+        flavor      => $flavor,
+        parent_host => hostname(),
+        defined $profile ? (profile => $profile) : (),
+    );
+
+    print "Registered '$name' on " . hostname() . ":$port\n";
+    print "  ssh:   ssh -p $port $ENV{USER}\@" . hostname() . "\n";
+    print "  attach: xpra-pod attach $name -c '$app' --display $display\n";
+
+    unless ($no_attach) {
+        attach($name, $display, $app);
+    }
+}
+
+sub cmd_list {
+    GetOptions() or die usage();
+    my $pods = XpraPod::Registry->list();
+    if (!%$pods) {
+        print "(no pods registered)\n";
+        return;
+    }
+    printf "%-16s %-22s %-6s %-12s %-16s %s\n",
+        'NAME', 'HOST', 'PORT', 'FLAVOR', 'PARENT', 'STATE';
+    for my $name (sort keys %$pods) {
+        my $p = $pods->{$name};
+        my $state = $p->{host} eq hostname()
+                  ? container_state("xpod-$name") : 'remote';
+        printf "%-16s %-22s %-6d %-12s %-16s %s\n",
+            $name, $p->{host}, $p->{ssh_port}, $p->{flavor},
+            ($p->{parent_host} // '-'), $state;
+    }
+}
+
+sub cmd_attach {
+    my $display = $DEFAULT_DISPLAY;
+    my $app     = $DEFAULT_APP;
+    GetOptions(
+        'display=i'   => \$display,
+        'c|command=s' => \$app,
+    ) or die usage();
+    my $name = shift @ARGV
+        or die "xpra-pod attach: missing NAME\n" . usage();
+    attach($name, $display, $app);
+}
+
+sub cmd_start {
+    GetOptions() or die usage();
+    my $name = shift @ARGV
+        or die "xpra-pod start: missing NAME\n" . usage();
+    my $rec = XpraPod::Registry->get($name)
+        or die "xpra-pod start: '$name' not in registry\n";
+    if ($rec->{host} ne hostname()) {
+        die "xpra-pod start: '$name' is on $rec->{host}, not here "
+          . "(@{[hostname()]})\n";
+    }
+    run_or_die('podman', 'start', "xpod-$name");
+    wait_for_ssh('127.0.0.1', $rec->{ssh_port}, 30)
+        or die "xpra-pod start: ssh on $rec->{ssh_port} never came up\n";
+    print "Started '$name' on @{[hostname()]}:$rec->{ssh_port}\n";
+}
+
+sub cmd_stop {
+    GetOptions() or die usage();
+    my $name = shift @ARGV
+        or die "xpra-pod stop: missing NAME\n" . usage();
+    my $rec = XpraPod::Registry->get($name)
+        or die "xpra-pod stop: '$name' not in registry\n";
+    if ($rec->{host} ne hostname()) {
+        die "xpra-pod stop: '$name' is on $rec->{host}, not here\n";
+    }
+    run_or_die('podman', 'stop', "xpod-$name");
+    print "Stopped '$name'\n";
+}
+
+sub cmd_rm {
+    GetOptions() or die usage();
+    my $name = shift @ARGV
+        or die "xpra-pod rm: missing NAME\n" . usage();
+    my $rec = XpraPod::Registry->get($name)
+        or die "xpra-pod rm: '$name' not in registry\n";
+    if ($rec->{host} ne hostname()) {
+        die "xpra-pod rm: '$name' is on $rec->{host}; ssh there to remove\n";
+    }
+    if (container_exists("xpod-$name")) {
+        system('podman', 'rm', '-f', "xpod-$name");
+    }
+    XpraPod::Registry->remove($name);
+    print "Removed '$name'\n";
+}
+
+sub cmd_migrate {
+    my ($keep_data, $remote_port);
+    GetOptions(
+        'keep-data' => \$keep_data,    # reserved for when volumes land
+        'port=i'    => \$remote_port,  # override remote ssh port
+    ) or die usage();
+    my $name   = shift @ARGV
+        or die "xpra-pod migrate: missing NAME\n" . usage();
+    my $raw    = shift @ARGV
+        or die "xpra-pod migrate: missing target HOST\n" . usage();
+
+    # Accept "user@host" or "host".  The ssh invocation uses the full
+    # original (so ssh-config / user gets respected); the registry only
+    # stores the hostname so attach can rebuild ssh://user@host:port
+    # cleanly from the user/host fields separately.
+    my ($ssh_target, $target_host);
+    if ($raw =~ /^([^@]+)\@(.+)$/) {
+        $ssh_target  = $raw;
+        $target_host = $2;
+    } else {
+        $ssh_target  = $raw;
+        $target_host = $raw;
+    }
+
+    my $rec = XpraPod::Registry->get($name)
+        or die "xpra-pod migrate: '$name' not in registry\n";
+
+    # Two directions, picked automatically based on which side this host
+    # is on.  Push (we own the pod, send it elsewhere) is the obvious
+    # case; pull (we want it here, fetch it from a remote that may not
+    # have ssh keys back to us) covers the reverse without requiring
+    # bidirectional trust.
+    my $here = hostname();
+    my $direction;
+    if    ($rec->{host} eq $here)    { $direction = 'push' }
+    elsif ($target_host eq $here)    { $direction = 'pull' }
+    else {
+        die "xpra-pod migrate: pod is on $rec->{host} and target is "
+          . "$target_host; neither is this host ($here).  Run migrate "
+          . "from one of the two ends.\n";
+    }
+
+    # Cold migration in both directions: the pod's home + xpra session
+    # live inside the ephemeral filesystem and are recreated fresh on
+    # the other side.  Volumes are a TODO; warn loudly.
+    print "xpra-pod: cold-$direction of '$name' "
+        . "(ephemeral state inside the container will be lost; "
+        . "volume support is TODO)\n";
+
+    # The "source" is wherever the pod currently lives — that's where we
+    # stop it.  Push: source is here; pull: source is remote.
+    # Likewise the "target" is the new home.
+    my $source_ssh = $direction eq 'push'
+        ? undef                              # local
+        : sprintf '%s@%s', $rec->{user}, $rec->{host};
+    my $target_ssh = $direction eq 'push'
+        ? $ssh_target
+        : undef;                             # local
+
+    # Stop on the source.
+    if ($direction eq 'push') {
+        if (container_exists("xpod-$name")) {
+            system('podman', 'stop', "xpod-$name");
+        }
+    } else {
+        system('ssh', $source_ssh, "podman stop xpod-$name 2>&1");
+    }
+
+    # Recreate on the target.  Both ends run xpra-pod-build to make sure
+    # the base image exists, then xpra-pod run.
+    my @ssh = $target_ssh ? ('ssh', $target_ssh) : ();
+    # On the remote, xpra-pod may be in /usr/local/bin (system install)
+    # or /usr/local/src/xpra-tools/bin (source tree).  The non-interactive
+    # ssh shell only sees the system PATH, so prepend the source-tree
+    # bin so source-tree-only deploys work too.
+    # Build the run command — either local or wrapped in ssh.  The
+    # PATH= prefix lets source-tree installs work when ssh's non-login
+    # shell doesn't see /usr/local/src/xpra-tools/bin.
+    my @run_args = ('run', $name,
+                    '--flavor', $rec->{flavor},
+                    '--no-attach');
+    push @run_args, '--port', $remote_port if defined $remote_port;
+    push @run_args, '--profile', $rec->{profile} if $rec->{profile};
+
+    my $rc;
+    if ($direction eq 'push') {
+        my $cmdline = 'PATH=/usr/local/src/xpra-tools/bin:$PATH xpra-pod '
+                    . join(' ', map { quotemeta } @run_args);
+        print "xpra-pod: ssh $target_ssh -- $cmdline\n";
+        $rc = system(@ssh, $cmdline);
+    } else {
+        # In pull mode the pod is already registered (with the remote
+        # as host).  cmd_run refuses to start when the name is taken,
+        # so drop the stale entry first.  Push mode gets history append
+        # "for free" from Registry->register's host-change logic; in
+        # pull mode we have to merge it back manually after the run.
+        XpraPod::Registry->remove($name);
+        my $self = "$RealBin/xpra-pod";
+        print "xpra-pod: running $self @run_args locally\n";
+        $rc = system($self, @run_args);
+    }
+    if ($rc != 0) {
+        die "xpra-pod migrate: $direction target run failed "
+          . "(exit @{[$rc>>8]}); source pod is stopped, "
+          . "registry unchanged\n";
+    }
+
+    # Pull the new ssh_port + user from the *target* registry so we can
+    # update ours.  Push reads remote via ssh; pull reads local directly.
+    my ($new_port, $new_user);
+    if ($direction eq 'push') {
+        my $info_cmd = "PATH=/usr/local/src/xpra-tools/bin:\$PATH "
+                     . "xpra-pod info " . quotemeta($name);
+        my $info_raw = qx{ssh \Q$target_ssh\E $info_cmd};
+        ($new_port) = $info_raw =~ /^\s*ssh_port:\s*(\d+)\s*$/m;
+        ($new_user) = $info_raw =~ /^\s*user:\s*(\S+)\s*$/m;
+    } else {
+        my $local = XpraPod::Registry->get($name);
+        $new_port = $local->{ssh_port};
+        $new_user = $local->{user};
+    }
+    $new_port //= ($remote_port // 0);
+    $new_user //= $rec->{user};
+    if (!$new_port) {
+        warn "xpra-pod migrate: couldn't read remote ssh_port; "
+           . "registry will be incomplete\n";
+    }
+
+    # Update *our* registry.  Push: append previous home into history
+    # automatically (Registry->register handles host-change).
+    # Pull: cmd_run already registered a fresh entry locally; we need
+    # to manually splice in the prior history + the just-migrated hop.
+    if ($direction eq 'push') {
+        XpraPod::Registry->register(
+            name        => $name,
+            host        => $target_host,
+            ssh_port    => $new_port,
+            user        => $new_user,
+            flavor      => $rec->{flavor},
+            parent_host => $rec->{parent_host},
+            $rec->{profile} ? (profile => $rec->{profile}) : (),
+        );
+    } else {
+        my $local = XpraPod::Registry->get($name)
+            or die "xpra-pod migrate: local entry vanished after pull\n";
+        my @history = @{ $rec->{history} || [] };
+        push @history, {
+            host     => $rec->{host},
+            ssh_port => $rec->{ssh_port},
+            left     => time,
+        };
+        $local->{history}     = \@history;
+        $local->{parent_host} = $rec->{parent_host};
+        XpraPod::Registry->register(%$local);
+    }
+
+    # Tear down the now-unused source container.  Image stays — likely
+    # needed again.
+    if ($direction eq 'push') {
+        if (container_exists("xpod-$name")) {
+            system('podman', 'rm', "xpod-$name");
+        }
+    } else {
+        # Pull: clean up the remote side via ssh.  The remote registry
+        # entry needs to go too, since the pod no longer lives there.
+        system('ssh', $source_ssh,
+               "podman rm xpod-$name 2>&1; "
+             . "PATH=/usr/local/src/xpra-tools/bin:\$PATH "
+             . "xpra-pod rm " . quotemeta($name) . " 2>&1");
+    }
+
+    print "Migrated '$name' to $target_host:$new_port "
+        . "(user $new_user) via $direction\n";
+    print "  attach: xpra-pod attach $name\n";
+}
+
+sub cmd_info {
+    GetOptions() or die usage();
+    my $name = shift @ARGV
+        or die "xpra-pod info: missing NAME\n" . usage();
+    my $rec = XpraPod::Registry->get($name)
+        or die "xpra-pod info: '$name' not in registry\n";
+    print "Pod '$name':\n";
+    for my $k (sort keys %$rec) {
+        my $v = $rec->{$k};
+        if (ref $v eq 'ARRAY') {
+            print "  $k:\n";
+            for my $h (@$v) {
+                print "    - " . join(' ', map { "$_=$h->{$_}" }
+                                      sort keys %$h) . "\n";
+            }
+        } else {
+            print "  $k: " . ($v // '') . "\n";
+        }
+    }
+    if ($rec->{host} eq hostname()) {
+        print "  podman state: " . container_state("xpod-$name") . "\n";
+    }
+}
+
+# -- attach plumbing ------------------------------------------------------
+#
+# xpra natively grok ssh:// URIs that look like
+#   ssh://user@host:port/:DISPLAY
+# and will start a session on the far side if one isn't running, given
+# --start.  We rely on that rather than re-inventing the dispatch.
+
+sub attach {
+    my ($name, $display, $app) = @_;
+    my $rec = XpraPod::Registry->get($name)
+        or die "xpra-pod attach: '$name' not in registry\n";
+    my $uri = sprintf 'ssh://%s@%s:%d/:%d',
+        $rec->{user}, $rec->{host}, $rec->{ssh_port}, $display;
+    print "xpra attach $uri (start=$app if needed)\n";
+    my @cmd = ('xpra', 'attach', $uri, "--start=$app");
+    exec @cmd or die "exec xpra: $!\n";
+}
+
+# -- helpers --------------------------------------------------------------
+
+sub auto_name {
+    my $pods = XpraPod::Registry->list();
+    for (my $i = 1; $i < 1000; $i++) {
+        my $candidate = sprintf 'xpod-%03d', $i;
+        return $candidate
+            if !$pods->{$candidate} && !container_exists("xpod-$candidate");
+    }
+    die "xpra-pod: no free auto-name in xpod-001..xpod-999\n";
+}
+
+sub valid_name {
+    my ($n) = @_;
+    return $n =~ /^[A-Za-z0-9_-]+\z/;
+}
+
+# Match xpra-pod-build's detection.  Slightly duplicated, but pulling
+# this into XpraPod::OS would be over-engineering for a 25-line function.
+sub detect_flavor {
+    open my $fh, '<', '/etc/os-release' or return undef;
+    my %os;
+    while (<$fh>) {
+        chomp;
+        next unless /^([A-Z_]+)=(.*)$/;
+        my ($k, $v) = ($1, $2);
+        $v =~ s/^"(.*)"$/$1/;
+        $os{$k} = $v;
+    }
+    close $fh;
+    my $id   = $os{ID}      // '';
+    my $like = $os{ID_LIKE} // '';
+    my $code = $os{UBUNTU_CODENAME}
+            // $os{DEBIAN_CODENAME}
+            // $os{VERSION_CODENAME}
+            // '';
+    return 'ubuntu-jammy'    if $id eq 'ubuntu' && $code eq 'jammy';
+    return 'ubuntu-noble'    if $id eq 'ubuntu' && $code eq 'noble';
+    return 'debian-bookworm' if $id eq 'debian' && $code eq 'bookworm';
+    return 'fedora'          if $id eq 'fedora';
+    return 'arch'            if $id eq 'arch' || $id eq 'archlinux';
+    if ($like =~ /\bubuntu\b/ || $like =~ /\bdebian\b/) {
+        return 'ubuntu-jammy'    if $code eq 'jammy';
+        return 'ubuntu-noble'    if $code eq 'noble';
+        return 'debian-bookworm' if $code eq 'bookworm';
+    }
+    return undef;
+}
+
+sub ensure_image {
+    my ($tag, $build_cb) = @_;
+    return if image_exists($tag);
+    print "xpra-pod: image '$tag' not found, building ...\n";
+    $build_cb->();
+    image_exists($tag) or die "xpra-pod: build of '$tag' didn't produce "
+                            . "the expected tag\n";
+}
+
+sub image_exists {
+    my ($tag) = @_;
+    return system('podman', 'image', 'exists', $tag) == 0;
+}
+
+sub container_exists {
+    my ($name) = @_;
+    my $rc = system('podman', 'container', 'exists', $name);
+    return $rc == 0;
+}
+
+sub container_state {
+    my ($name) = @_;
+    open my $fh, '-|', 'podman', 'inspect', '--format', '{{.State.Status}}',
+                       $name or return 'unknown';
+    chomp(my $s = <$fh> // '');
+    close $fh;
+    return $s || 'absent';
+}
+
+sub pick_free_port {
+    my $p = $PORT_BASE;
+    while ($p < $PORT_BASE + $PORT_MAX_SCAN) {
+        my $s = IO::Socket::INET->new(
+            LocalAddr => '0.0.0.0', LocalPort => $p,
+            Proto => 'tcp', ReuseAddr => 1, Listen => 1);
+        if ($s) { close $s; return $p }
+        $p++;
+    }
+    die "xpra-pod: no free port in $PORT_BASE.."
+      . ($PORT_BASE+$PORT_MAX_SCAN-1) . "\n";
+}
+
+sub wait_for_ssh {
+    my ($host, $port, $deadline_sec) = @_;
+    my $deadline = time + $deadline_sec;
+    while (time < $deadline) {
+        my $s = IO::Socket::INET->new(
+            PeerAddr => $host, PeerPort => $port,
+            Proto => 'tcp', Timeout => 1);
+        if ($s) { close $s; return 1 }
+        select undef, undef, undef, 0.25;
+    }
+    return 0;
+}
+
+sub run_or_die {
+    my @cmd = @_;
+    my $rc = system(@cmd);
+    die "xpra-pod: '@cmd' failed (exit @{[$rc>>8]})\n" if $rc != 0;
+}
+
+# -- profile overlay ------------------------------------------------------
+#
+# A profile is a JSON file at ~/.config/xpra-pod/profiles/NAME.json:
+#   { name, description, extra_packages: [...], default_app, env: {...},
+#     mounts: [ "src:dst[:ro]", ... ] }
+#
+# extra_packages get installed on top of the base image (via the same
+# package manager the flavor uses) and tagged xpra-pod:<flavor>-<name>.
+# env and mounts are run-time concerns and are applied by cmd_run when
+# launching the container; they don't affect the image.
+
+sub profile_dir { "$ENV{HOME}/.config/xpra-pod/profiles" }
+sub profile_path {
+    my ($profile) = @_;
+    return profile_dir() . "/$profile.json";
+}
+
+sub load_profile {
+    my ($profile) = @_;
+    my $path = profile_path($profile);
+    -f $path or die "xpra-pod: profile '$profile' not found at $path "
+                  . "(create with: xpra-pod --custom $profile)\n";
+    open my $fh, '<', $path or die "open $path: $!\n";
+    local $/; my $raw = <$fh>; close $fh;
+    my $data = eval { decode_json($raw) };
+    die "xpra-pod: profile '$profile' is not valid JSON: $@" unless ref $data;
+    return $data;
+}
+
+sub save_profile {
+    my ($profile, $data) = @_;
+    my $dir = profile_dir();
+    make_path($dir, { mode => 0700 }) unless -d $dir;
+    my $path = profile_path($profile);
+    open my $fh, '>', "$path.tmp" or die "open $path.tmp: $!\n";
+    print $fh encode_json($data);
+    close $fh or die "close: $!\n";
+    rename "$path.tmp", $path or die "rename: $!\n";
+    chmod 0600, $path;
+}
+
+# Build (if needed) a derived image xpra-pod:<flavor>-<profile> on top
+# of the base image.  Uses the same package-manager incantation as the
+# base flavor, so adding flavors keeps profile builds working.
+sub ensure_profile_image {
+    my ($flavor, $profile) = @_;
+    my $tag  = "xpra-pod:$flavor-$profile";
+    my $base = "xpra-pod:$flavor";
+    return $tag if image_exists($tag);
+
+    ensure_image($base, sub {
+        run_or_die($BUILD_TOOL, '--flavor', $flavor);
+    });
+
+    my $prof = load_profile($profile);
+    my @pkgs = @{ $prof->{extra_packages} || [] };
+    my $cache = "$ENV{HOME}/.cache/xpra-pod/$flavor-$profile";
+    make_path($cache, { mode => 0700 }) unless -d $cache;
+
+    # Reuse the base flavor's installer style.  Two flavors (Ubuntu/
+    # Debian) share apt; Fedora uses dnf; Arch uses pacman.  Anything
+    # else defaults to apt and will be rebuilt against the wrong PM —
+    # add a branch here when adding a flavor in xpra-pod-build.
+    my $install_line;
+    if ($flavor =~ /^(ubuntu|debian)/) {
+        $install_line = 'export DEBIAN_FRONTEND=noninteractive && '
+                      . 'apt-get update && '
+                      . 'apt-get install -y --no-install-recommends '
+                      . join(' ', @pkgs) . ' && '
+                      . 'apt-get clean && rm -rf /var/lib/apt/lists/*';
+    } elsif ($flavor eq 'fedora') {
+        $install_line = 'dnf -y install ' . join(' ', @pkgs)
+                      . ' && dnf clean all';
+    } elsif ($flavor eq 'arch') {
+        $install_line = 'pacman -Syu --noconfirm ' . join(' ', @pkgs)
+                      . ' && pacman -Scc --noconfirm';
+    } else {
+        die "xpra-pod: don't know how to install packages on flavor "
+          . "'$flavor' for profile '$profile'\n";
+    }
+
+    my $cf = "FROM $base\n";
+    $cf .= "RUN $install_line\n" if @pkgs;
+    open my $fh, '>', "$cache/Containerfile" or die $!;
+    print $fh $cf; close $fh;
+
+    print "xpra-pod: building profile image $tag (extras: "
+        . (@pkgs ? "@pkgs" : "none") . ")\n";
+    run_or_die('podman', 'build', '-t', $tag, $cache);
+    return $tag;
+}
+
+# Tk profile editor.  Loads $profile if it exists; saves on OK.  Empty
+# arg → blank form, the user names it themselves.
+sub run_custom_editor {
+    my ($profile) = @_;
+    eval { require Tk; 1 }
+        or die "xpra-pod --custom: Perl/Tk not installed (apt install "
+             . "libtk-perl)\n";
+
+    my $existing = (defined $profile && length $profile
+                    && -f profile_path($profile))
+                 ? load_profile($profile)
+                 : { name => $profile // '', description => '',
+                     extra_packages => [], default_app => $DEFAULT_APP,
+                     env => {}, mounts => [] };
+
+    my $mw = MainWindow->new(-title => 'xpra-pod profile');
+    $mw->geometry('520x520');
+
+    # Two-column form with stretchy text widgets for the multi-line
+    # fields — packages, env, and mounts are line-oriented in the file
+    # to keep diffs sane.
+    my $row = 0;
+    my %vars;
+
+    sub _label_entry {
+        my ($mw, $row, $label, $varref, $width) = @_;
+        $mw->Label(-text => $label, -anchor => 'e')
+           ->grid(-row => $row, -column => 0, -sticky => 'e', -padx => 4);
+        my $e = $mw->Entry(-textvariable => $varref, -width => ($width // 50));
+        $e->grid(-row => $row, -column => 1, -sticky => 'we', -padx => 4,
+                 -pady => 2);
+        return $e;
+    }
+
+    $vars{name}        = $existing->{name};
+    $vars{description} = $existing->{description};
+    $vars{default_app} = $existing->{default_app};
+
+    _label_entry($mw, $row++, 'Name:',         \$vars{name});
+    _label_entry($mw, $row++, 'Description:',  \$vars{description});
+    _label_entry($mw, $row++, 'Default app:',  \$vars{default_app});
+
+    $mw->Label(-text => 'Extra packages (one per line):', -anchor => 'e')
+       ->grid(-row => $row, -column => 0, -sticky => 'ne', -padx => 4,
+              -pady => 4);
+    my $pkg_text = $mw->Scrolled('Text',
+                       -scrollbars => 'oe', -height => 6, -width => 50);
+    $pkg_text->grid(-row => $row++, -column => 1, -sticky => 'nsew',
+                    -padx => 4, -pady => 2);
+    $pkg_text->insert('end',
+        join("\n", @{ $existing->{extra_packages} || [] }));
+
+    $mw->Label(-text => 'Env (KEY=VALUE per line):', -anchor => 'e')
+       ->grid(-row => $row, -column => 0, -sticky => 'ne', -padx => 4,
+              -pady => 4);
+    my $env_text = $mw->Scrolled('Text',
+                       -scrollbars => 'oe', -height => 4, -width => 50);
+    $env_text->grid(-row => $row++, -column => 1, -sticky => 'nsew',
+                    -padx => 4, -pady => 2);
+    $env_text->insert('end',
+        join("\n", map { "$_=$existing->{env}{$_}" }
+                   sort keys %{ $existing->{env} || {} }));
+
+    $mw->Label(-text => 'Mounts (src:dst[:ro] per line):', -anchor => 'e')
+       ->grid(-row => $row, -column => 0, -sticky => 'ne', -padx => 4,
+              -pady => 4);
+    my $mnt_text = $mw->Scrolled('Text',
+                       -scrollbars => 'oe', -height => 4, -width => 50);
+    $mnt_text->grid(-row => $row++, -column => 1, -sticky => 'nsew',
+                    -padx => 4, -pady => 2);
+    $mnt_text->insert('end',
+        join("\n", @{ $existing->{mounts} || [] }));
+
+    $mw->gridColumnconfigure(1, -weight => 1);
+    $mw->gridRowconfigure($_, -weight => 1) for (3, 4, 5);
+
+    my $btnframe = $mw->Frame;
+    $btnframe->grid(-row => $row, -column => 0, -columnspan => 2,
+                    -sticky => 'e', -padx => 4, -pady => 6);
+
+    my $saved;
+    $btnframe->Button(-text => 'Cancel',
+        -command => sub { $mw->destroy })->pack(-side => 'right', -padx => 4);
+    $btnframe->Button(-text => 'Save',
+        -command => sub {
+            my $name = $vars{name};
+            unless (defined $name && $name =~ /^[A-Za-z0-9_-]+\z/) {
+                $mw->messageBox(-type => 'ok', -icon => 'error',
+                    -message => "Profile name must be [A-Za-z0-9_-]+");
+                return;
+            }
+            my @pkgs = grep { length }
+                       map  { s/^\s+|\s+$//gr }
+                       split /\n/, $pkg_text->get('1.0', 'end-1c');
+            my %env;
+            for my $ln (split /\n/, $env_text->get('1.0', 'end-1c')) {
+                $ln =~ s/^\s+|\s+$//g;
+                next unless length $ln;
+                if ($ln =~ /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/) {
+                    $env{$1} = $2;
+                } else {
+                    $mw->messageBox(-type => 'ok', -icon => 'error',
+                        -message => "Bad env line (need KEY=VAL): $ln");
+                    return;
+                }
+            }
+            my @mnts = grep { length }
+                       map  { s/^\s+|\s+$//gr }
+                       split /\n/, $mnt_text->get('1.0', 'end-1c');
+            save_profile($name, {
+                name           => $name,
+                description    => $vars{description} // '',
+                default_app    => $vars{default_app} // $DEFAULT_APP,
+                extra_packages => \@pkgs,
+                env            => \%env,
+                mounts         => \@mnts,
+            });
+            $saved = $name;
+            $mw->destroy;
+        })->pack(-side => 'right', -padx => 4);
+
+    Tk::MainLoop();
+    if (defined $saved) {
+        print "Saved profile '$saved' to " . profile_path($saved) . "\n";
+    }
+}
