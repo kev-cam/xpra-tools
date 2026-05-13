@@ -139,22 +139,47 @@ sub load_sessions {
     return @s;
 }
 
-# Project a session list down to deduped targets and apps.  Always
-# guarantees `self` and `root` targets are present so the chooser can
-# offer them even if the file uses only xpra entries.
-sub derive_targets_apps {
+# Project a session list down to deduped target choices and apps.
+# Target choices include the suggested app from ~/.xpra-start as a
+# hint, e.g. ":20  thunderbird -P mail".  `self` and `root` are
+# guaranteed to appear so the chooser can offer them even when the
+# file uses only xpra entries.
+sub derive_choices {
     my ($sessions) = @_;
-    my (%t_seen, @targets, %a_seen, @apps);
+    my (@target_choices, %t_seen, @apps, %a_seen);
     for my $s (@$sessions) {
-        my $tid = $s->{target}{id};
-        push @targets, $s->{target} unless $t_seen{$tid}++;
-        push @apps, $s->{app}       unless $a_seen{$s->{app}}++;
+        my $label = sprintf('%s  %s', $s->{target}{id}, $s->{app});
+        push @target_choices, $label unless $t_seen{$label}++;
+        push @apps, $s->{app}        unless $a_seen{$s->{app}}++;
     }
     for my $extra (qw(self root)) {
-        next if $t_seen{$extra}++;
-        push @targets, make_target($extra, local_display());
+        push @target_choices, $extra
+            unless grep { /^\Q$extra\E(?:\s|$)/ } @target_choices;
     }
-    return (\@targets, \@apps);
+    return (\@target_choices, \@apps);
+}
+
+# Pull the bare target id out of a chooser label.  Anything matching
+# `:N`, `self`, or `root` at the head wins; trailing text is the app
+# suggestion.  Free-form input is returned as-is for the id and "" for
+# the app.
+sub parse_target_choice {
+    my ($s) = @_;
+    return ('', '') unless defined $s && length $s;
+    if ($s =~ /^\s*(:\d+|self|root)\s*(.*?)\s*$/) {
+        return ($1, $2);
+    }
+    return ($s, '');
+}
+
+sub label_for_target_id {
+    my ($id, $choices) = @_;
+    return $id unless defined $id && length $id;
+    for my $c (@$choices) {
+        my ($cid) = parse_target_choice($c);
+        return $c if $cid eq $id;
+    }
+    return $id;
 }
 
 # --- sticky cache --------------------------------------------------------
@@ -312,12 +337,11 @@ sub dispatch_pair {
 # --- chooser (Tk) --------------------------------------------------------
 
 sub chooser {
-    my ($arg, $kind, $targets, $apps, $cache) = @_;
+    my ($arg, $kind, $target_choices, $apps, $cache) = @_;
     require Tk;
     require Tk::BrowseEntry;
     Tk->import;
 
-    my @target_ids = map { $_->{id} } @$targets;
     my $mw = MainWindow->new(-title => 'xpra-helper');
     $mw->optionAdd('*Font' => 'sans-serif 11');
 
@@ -348,16 +372,21 @@ sub chooser {
     $fframe->Entry(-textvariable => \$pattern, -width => 32)
            ->pack(-side => 'left', -padx => 4, -fill => 'x', -expand => 1);
 
-    my $tgt = $target_ids[0];
-    my $app = $apps->[0];
+    my $tgt = $target_choices->[0];
+    my (undef, $tgt_app) = parse_target_choice($tgt);
+    my $app = length $tgt_app ? $tgt_app : $apps->[0];
 
     my $picker = $mw->Frame->pack(-fill => 'x', -padx => 10, -pady => [6, 0]);
     $picker->Label(-text => 'Target:', -width => 12, -anchor => 'e')
            ->pack(-side => 'left');
-    $picker->BrowseEntry(-variable => \$tgt,
-                         -choices  => \@target_ids,
-                         -width    => 10)
-           ->pack(-side => 'left', -padx => 4);
+    $picker->BrowseEntry(-variable  => \$tgt,
+                         -choices   => $target_choices,
+                         -width     => 28,
+                         -browsecmd => sub {
+                            my (undef, $a) = parse_target_choice($tgt);
+                            $app = $a if length $a;
+                         })
+           ->pack(-side => 'left', -padx => 4, -fill => 'x', -expand => 1);
     $picker->Label(-text => 'Application:', -anchor => 'e')
            ->pack(-side => 'left', -padx => [12, 0]);
     $picker->BrowseEntry(-variable => \$app,
@@ -370,23 +399,24 @@ sub chooser {
         -text    => 'Open',
         -default => 'active',
         -command => sub {
-            unless (length($tgt // '') && length($app // '')) {
+            my ($tid) = parse_target_choice($tgt);
+            unless (length($tid // '') && length($app // '')) {
                 $mw->messageBox(-type => 'OK', -icon => 'error',
                                 -message => 'Pick a target and an application.');
                 return;
             }
             my $dirty = 0;
             if ($save_sticky) {
-                $cache->{sticky}{$kind} = { target => $tgt, app => $app };
+                $cache->{sticky}{$kind} = { target => $tid, app => $app };
                 $dirty = 1;
             }
             if ($save_filter && length($pattern // '')) {
                 push @{ $cache->{url_filters} },
-                     { pattern => $pattern, target => $tgt, app => $app };
+                     { pattern => $pattern, target => $tid, app => $app };
                 $dirty = 1;
             }
             save_cache($cache) if $dirty;
-            dispatch_pair($tgt, $app, $arg);
+            dispatch_pair($tid, $app, $arg);
             $mw->destroy;
         },
     )->pack(-side => 'right', -padx => 4);
@@ -400,12 +430,11 @@ sub chooser {
 # --- preferences editor (Tk) ---------------------------------------------
 
 sub edit_ui {
-    my ($cache, $targets, $apps) = @_;
+    my ($cache, $target_choices, $apps) = @_;
     require Tk;
     require Tk::BrowseEntry;
     Tk->import;
 
-    my @target_ids = map { $_->{id} } @$targets;
     my $mw = MainWindow->new(-title => 'xpra-helper — preferences');
     $mw->optionAdd('*Font' => 'sans-serif 11');
 
@@ -430,15 +459,19 @@ sub edit_ui {
         for my $k (@kinds) {
             my $key = $k;
             my $v   = $cache->{sticky}{$key};
-            my $tgt = $v->{target};
+            my $tgt = label_for_target_id($v->{target}, $target_choices);
             my $app = $v->{app};
             my $row = $sf->Frame->pack(-fill => 'x', -pady => 1);
             $row->Label(-text => sprintf('%-10s →', $key),
                         -anchor => 'w', -width => 12)
                 ->pack(-side => 'left');
-            $row->BrowseEntry(-variable => \$tgt,
-                              -choices  => \@target_ids,
-                              -width    => 8)
+            $row->BrowseEntry(-variable  => \$tgt,
+                              -choices   => $target_choices,
+                              -width     => 24,
+                              -browsecmd => sub {
+                                  my (undef, $a) = parse_target_choice($tgt);
+                                  $app = $a if length $a;
+                              })
                 ->pack(-side => 'left', -padx => [0, 4]);
             $row->BrowseEntry(-variable => \$app,
                               -choices  => $apps,
@@ -446,8 +479,9 @@ sub edit_ui {
                 ->pack(-side => 'left', -fill => 'x', -expand => 1);
             $row->Button(-text => 'Apply',
                          -command => sub {
+                            my ($tid) = parse_target_choice($tgt);
                             $cache->{sticky}{$key}
-                                = { target => $tgt, app => $app };
+                                = { target => $tid, app => $app };
                             save_cache($cache);
                             $rebuild->();
                          })->pack(-side => 'left', -padx => [6, 0]);
@@ -473,15 +507,19 @@ sub edit_ui {
             my $idx = $i;
             my $f   = $filters->[$idx];
             my $pat = $f->{pattern};
-            my $tgt = $f->{target};
+            my $tgt = label_for_target_id($f->{target}, $target_choices);
             my $app = $f->{app};
             my $row = $ff->Frame->pack(-fill => 'x', -pady => 1);
             $row->Entry(-textvariable => \$pat, -width => 22)
                 ->pack(-side => 'left', -padx => [0, 4]);
             $row->Label(-text => '→')->pack(-side => 'left');
-            $row->BrowseEntry(-variable => \$tgt,
-                              -choices  => \@target_ids,
-                              -width    => 8)
+            $row->BrowseEntry(-variable  => \$tgt,
+                              -choices   => $target_choices,
+                              -width     => 22,
+                              -browsecmd => sub {
+                                  my (undef, $a) = parse_target_choice($tgt);
+                                  $app = $a if length $a;
+                              })
                 ->pack(-side => 'left', -padx => [4, 4]);
             $row->BrowseEntry(-variable => \$app,
                               -choices  => $apps,
@@ -489,8 +527,9 @@ sub edit_ui {
                 ->pack(-side => 'left', -fill => 'x', -expand => 1);
             $row->Button(-text => 'Apply',
                          -command => sub {
+                            my ($tid) = parse_target_choice($tgt);
                             $filters->[$idx] = { pattern => $pat,
-                                                 target  => $tgt,
+                                                 target  => $tid,
                                                  app     => $app };
                             save_cache($cache);
                             $rebuild->();
@@ -523,14 +562,19 @@ sub edit_ui {
         my $af = $body->Frame->pack(-fill => 'x', -padx => 12, -pady => [4, 0]);
         $af->Label(-text => 'Add:')->pack(-side => 'left');
         my $pat = '';
-        my $tgt = $target_ids[0];
-        my $app = $apps->[0];
+        my $tgt = $target_choices->[0];
+        my (undef, $tgt_app) = parse_target_choice($tgt);
+        my $app = length $tgt_app ? $tgt_app : $apps->[0];
         $af->Entry(-textvariable => \$pat, -width => 22)
            ->pack(-side => 'left', -padx => [4, 0]);
         $af->Label(-text => '→')->pack(-side => 'left', -padx => 4);
-        $af->BrowseEntry(-variable => \$tgt,
-                         -choices  => \@target_ids,
-                         -width    => 8)
+        $af->BrowseEntry(-variable  => \$tgt,
+                         -choices   => $target_choices,
+                         -width     => 22,
+                         -browsecmd => sub {
+                             my (undef, $a) = parse_target_choice($tgt);
+                             $app = $a if length $a;
+                         })
            ->pack(-side => 'left', -padx => [0, 4]);
         $af->BrowseEntry(-variable => \$app,
                          -choices  => $apps,
@@ -539,9 +583,10 @@ sub edit_ui {
         $af->Button(-text => 'Add',
                     -command => sub {
                         return unless length $pat;
-                        return unless length($tgt // '') && length($app // '');
+                        my ($tid) = parse_target_choice($tgt);
+                        return unless length($tid // '') && length($app // '');
                         push @$filters, { pattern => $pat,
-                                          target  => $tgt,
+                                          target  => $tid,
                                           app     => $app };
                         save_cache($cache);
                         $rebuild->();
@@ -592,11 +637,11 @@ while (@ARGV && $ARGV[0] =~ /^-/) {
 my @sessions = load_sessions();
 die "xpra-helper: no sessions in $START_FILE and no browsers found in PATH\n"
     unless @sessions;
-my ($targets, $apps) = derive_targets_apps(\@sessions);
+my ($target_choices, $apps) = derive_choices(\@sessions);
 
 if ($edit_mode) {
     my $cache = load_cache(\@sessions);
-    edit_ui($cache, $targets, $apps);
+    edit_ui($cache, $target_choices, $apps);
     exit 0;
 }
 
@@ -626,5 +671,5 @@ if (my $s = $cache->{sticky}{$kind}) {
 }
 
 # 3) Fall through to the chooser.
-chooser($arg, $kind, $targets, $apps, $cache);
+chooser($arg, $kind, $target_choices, $apps, $cache);
 exit 0;
