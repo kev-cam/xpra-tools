@@ -14,8 +14,10 @@
 #     there.  Tick the remember boxes to record a sticky default
 #     and/or a URL filter.
 #
-# `xpra-helper --edit` opens a preferences window to inspect, change,
-# or remove existing sticky defaults and URL filters.
+# Invoking with no argument opens the chooser with an empty URL
+# entry, so the URL can be typed in.  The chooser also lists the
+# last 50 dispatched URLs, each with a Lock toggle (pins it past the
+# cap) and a Delete button; click a row to re-fill the URL entry.
 #
 # ~/.xpra-start format: one target+app pair per line.  Prefix forms:
 #     20: thunderbird -P mail        # xpra display :20
@@ -39,12 +41,18 @@
 #                                 "app":    "firefox -P main" } },
 #     "url_filters": [ { "pattern": "*github.com*",
 #                        "target":  "self",
-#                        "app":     "chromium" } ]
+#                        "app":     "chromium" } ],
+#     "history":     [ { "arg":    "https://...",
+#                        "target": ":22",
+#                        "app":    "firefox -P main",
+#                        "ts":     1700000000,
+#                        "locked": 0 } ]
 #   }
 # The `target` field holds a target id — `:N` for xpra sessions or
 # `self` / `root` for local-display.  Older cache formats (flat
 # `{ "https": ":22" }` and the intermediate `display: "self:firefox"`
-# style) are migrated on read.
+# style) are migrated on read.  History is capped at 50 entries, newest
+# first; unlocked entries are evicted when the cap is hit.
 
 use strict;
 use warnings;
@@ -184,7 +192,9 @@ sub label_for_target_id {
 
 # --- sticky cache --------------------------------------------------------
 
-sub empty_cache { { sticky => {}, url_filters => [] } }
+sub empty_cache { { sticky => {}, url_filters => [], history => [] } }
+
+my $HISTORY_CAP = 50;
 
 # Resolve an old-style id ("/.N", "self:cmd", "root:cmd") to a
 # {target, app} pair, consulting $sessions to recover the app on xpra
@@ -241,10 +251,51 @@ sub load_cache {
         } else {
             $c->{sticky}      = $raw->{sticky}      || {};
             $c->{url_filters} = $raw->{url_filters} || [];
+            $c->{history}     = $raw->{history}     || [];
         }
     }
     _migrate_cache($c, $sessions);
+    $c->{history} //= [];
     return $c;
+}
+
+# Prepend $arg+$tid+$app to history, dedupe (preserving lock state),
+# and trim to $HISTORY_CAP by evicting oldest *unlocked* entries.  Locked
+# entries are kept even if doing so puts the list over the cap.
+sub record_history {
+    my ($cache, $arg, $tid, $app) = @_;
+    return unless defined $arg && length $arg;
+    $cache->{history} //= [];
+    my $h = $cache->{history};
+
+    my $locked = 0;
+    @$h = grep {
+        my $same = ($_->{arg} // '')    eq $arg
+                && ($_->{target} // '') eq $tid
+                && ($_->{app} // '')    eq $app;
+        $locked ||= ($_->{locked} ? 1 : 0) if $same;
+        !$same;
+    } @$h;
+
+    unshift @$h, { arg    => $arg,
+                   target => $tid,
+                   app    => $app,
+                   ts     => time(),
+                   locked => $locked };
+
+    if (@$h > $HISTORY_CAP) {
+        my $n_locked = grep { $_->{locked} } @$h;
+        my $room     = $HISTORY_CAP - $n_locked;
+        $room = 0 if $room < 0;
+        my $kept = 0;
+        my @new;
+        for my $e (@$h) {
+            if ($e->{locked})        { push @new, $e }
+            elsif ($kept < $room)    { push @new, $e; $kept++ }
+        }
+        @$h = @new;
+    }
+    save_cache($cache);
 }
 
 sub save_cache {
@@ -337,32 +388,32 @@ sub dispatch_pair {
 # --- chooser (Tk) --------------------------------------------------------
 
 sub chooser {
-    my ($arg, $kind, $target_choices, $apps, $cache) = @_;
+    my ($arg, $target_choices, $apps, $cache) = @_;
     require Tk;
     require Tk::BrowseEntry;
     Tk->import;
 
+    my $url = $arg // '';
+
     my $mw = MainWindow->new(-title => 'xpra-helper');
     $mw->optionAdd('*Font' => 'sans-serif 11');
 
-    my $shown = length($arg) > 80 ? substr($arg, 0, 77) . '…' : $arg;
-    $mw->Label(-text   => $shown,
-               -font   => 'sans-serif 11 bold',
-               -anchor => 'w', -padx => 10, -justify => 'left')
-       ->pack(-fill => 'x', -pady => [8, 2]);
-    $mw->Label(-text   => "kind: $kind   —   pick target and application",
-               -anchor => 'w', -padx => 10, -fg => '#555')
-       ->pack(-fill => 'x', -pady => [0, 6]);
+    my $uframe = $mw->Frame->pack(-fill => 'x', -padx => 10, -pady => [8, 2]);
+    $uframe->Label(-text => 'URL:', -width => 6, -anchor => 'e')
+           ->pack(-side => 'left');
+    my $uent = $uframe->Entry(-textvariable => \$url, -width => 60)
+                      ->pack(-side => 'left', -padx => [4, 0],
+                             -fill => 'x', -expand => 1);
 
     my $save_sticky = 0;
     $mw->Checkbutton(
-        -text     => "Remember as default for [$kind]",
+        -text     => 'Remember as default for this URL kind',
         -variable => \$save_sticky,
         -anchor   => 'w', -padx => 10,
     )->pack(-fill => 'x');
 
     my $save_filter = 0;
-    my $pattern     = host_glob($arg);
+    my $pattern     = host_glob($url);
     my $fframe      = $mw->Frame->pack(-fill => 'x', -padx => 10);
     $fframe->Checkbutton(
         -text     => 'Also add URL filter:',
@@ -376,8 +427,16 @@ sub chooser {
     my (undef, $tgt_app) = parse_target_choice($tgt);
     my $app = length $tgt_app ? $tgt_app : $apps->[0];
 
+    # Snapshot for the Reset button.
+    my $initial_url         = $url;
+    my $initial_pattern     = $pattern;
+    my $initial_tgt         = $tgt;
+    my $initial_app         = $app;
+    my $initial_save_sticky = $save_sticky;
+    my $initial_save_filter = $save_filter;
+
     my $picker = $mw->Frame->pack(-fill => 'x', -padx => 10, -pady => [6, 0]);
-    $picker->Label(-text => 'Target:', -width => 12, -anchor => 'e')
+    $picker->Label(-text => 'Target:', -width => 6, -anchor => 'e')
            ->pack(-side => 'left');
     $picker->BrowseEntry(-variable  => \$tgt,
                          -choices   => $target_choices,
@@ -387,24 +446,120 @@ sub chooser {
                             $app = $a if length $a;
                          })
            ->pack(-side => 'left', -padx => 4, -fill => 'x', -expand => 1);
-    $picker->Label(-text => 'Application:', -anchor => 'e')
+    $picker->Label(-text => 'App:', -anchor => 'e')
            ->pack(-side => 'left', -padx => [12, 0]);
     $picker->BrowseEntry(-variable => \$app,
                          -choices  => $apps,
                          -width    => 28)
            ->pack(-side => 'left', -padx => 4, -fill => 'x', -expand => 1);
 
+    # --- history ---
+    $mw->Label(-text => "History (last $HISTORY_CAP, newest first)",
+               -font => 'sans-serif 11 bold', -anchor => 'w', -padx => 10)
+       ->pack(-fill => 'x', -pady => [10, 0]);
+    # Scrollable area: Canvas hosts an inner Frame; we pack rows into $hp.
+    my $hframe = $mw->Frame->pack(-fill => 'both', -expand => 1,
+                                  -padx => 10, -pady => [0, 6]);
+    my $hcan = $hframe->Canvas(-height             => 240,
+                               -borderwidth        => 0,
+                               -highlightthickness => 0)
+                      ->pack(-side => 'left', -fill => 'both', -expand => 1);
+    my $hvsb = $hframe->Scrollbar(-orient  => 'vertical',
+                                  -command => [$hcan, 'yview'])
+                      ->pack(-side => 'right', -fill => 'y');
+    $hcan->configure(-yscrollcommand => [$hvsb, 'set']);
+    my $hp = $hcan->Frame;
+    my $hwin = $hcan->createWindow(0, 0, -window => $hp, -anchor => 'nw');
+    $hp->bind('<Configure>'   => sub {
+        $hcan->configure(-scrollregion => [$hcan->bbox('all')]);
+    });
+    # When the canvas grows wider (user resize), stretch the inner Frame
+    # so rows fill the width.  We never shrink it below its reqwidth.
+    $hcan->bind('<Configure>' => sub {
+        my $cw = $hcan->width;
+        my $fw = $hp->reqwidth;
+        $hcan->itemconfigure($hwin, -width => $cw > $fw ? $cw : $fw);
+    });
+    for my $b ('<Button-4>', '<Button-5>') {
+        $hcan->Tk::bind($b => sub {
+            $hcan->yviewScroll($b eq '<Button-4>' ? -3 : 3, 'units');
+        });
+    }
+    # Set canvas's requested width from the inner Frame's natural width
+    # so the window auto-sizes to fit the rows horizontally.
+    my $autosize_canvas = sub {
+        $hp->idletasks;
+        my $w = $hp->reqwidth;
+        $hcan->configure(-width => $w) if $w > 1;
+        $hcan->configure(-scrollregion => [$hcan->bbox('all')]);
+    };
+
+    my $history = $cache->{history} //= [];
+    my $rebuild_history;
+    $rebuild_history = sub {
+        $_->destroy for $hp->children;
+        if (!@$history) {
+            $hp->Label(-text => '(empty)', -anchor => 'w', -fg => '#777')
+               ->pack(-fill => 'x');
+            return;
+        }
+        for my $i (0 .. $#$history) {
+            my $idx = $i;
+            my $h   = $history->[$idx];
+            my $locked = $h->{locked} ? 1 : 0;
+            my $row = $hp->Frame->pack(-fill => 'x', -pady => 1);
+            $row->Checkbutton(-text     => 'Lock',
+                              -variable => \$locked,
+                              -command  => sub {
+                                  $history->[$idx]{locked} = $locked;
+                                  save_cache($cache);
+                              })->pack(-side => 'left');
+            my $a = $h->{arg} // '';
+            my $shown = length($a) > 50 ? substr($a, 0, 47).'…' : $a;
+            my $lab = $row->Label(-text => $shown,
+                                  -anchor => 'w', -width => 50,
+                                  -cursor => 'hand2')
+                          ->pack(-side => 'left', -padx => [4, 4]);
+            $lab->bind('<Button-1>' => sub {
+                $url = $h->{arg};
+                $pattern = host_glob($url);
+                $tgt = label_for_target_id($h->{target}, $target_choices);
+                $app = $h->{app};
+            });
+            my $where = sprintf('%s  %s',
+                                $h->{target} // '', $h->{app} // '');
+            $row->Label(-text => $where, -anchor => 'w', -fg => '#555')
+                ->pack(-side => 'left', -padx => [4, 4],
+                       -fill => 'x', -expand => 1);
+            $row->Button(-text => 'Delete',
+                         -command => sub {
+                             splice @$history, $idx, 1;
+                             save_cache($cache);
+                             $rebuild_history->();
+                         })->pack(-side => 'right');
+        }
+        $autosize_canvas->();
+    };
+    $rebuild_history->();
+    $mw->after(20, $autosize_canvas);
+
     my $btns = $mw->Frame->pack(-fill => 'x', -padx => 10, -pady => [8, 8]);
     $btns->Button(
         -text    => 'Open',
         -default => 'active',
         -command => sub {
+            unless (length $url) {
+                $mw->messageBox(-type => 'OK', -icon => 'error',
+                                -message => 'Enter a URL.');
+                return;
+            }
             my ($tid) = parse_target_choice($tgt);
             unless (length($tid // '') && length($app // '')) {
                 $mw->messageBox(-type => 'OK', -icon => 'error',
                                 -message => 'Pick a target and an application.');
                 return;
             }
+            my $kind = kind_of($url);
             my $dirty = 0;
             if ($save_sticky) {
                 $cache->{sticky}{$kind} = { target => $tid, app => $app };
@@ -416,201 +571,26 @@ sub chooser {
                 $dirty = 1;
             }
             save_cache($cache) if $dirty;
-            dispatch_pair($tid, $app, $arg);
+            record_history($cache, $url, $tid, $app);
+            dispatch_pair($tid, $app, $url);
             $mw->destroy;
         },
     )->pack(-side => 'right', -padx => 4);
     $btns->Button(-text => 'Cancel',
                   -command => sub { $mw->destroy; exit 1 })
          ->pack(-side => 'right');
+    $btns->Button(-text => 'Reset',
+                  -command => sub {
+                      $url         = $initial_url;
+                      $pattern     = $initial_pattern;
+                      $tgt         = $initial_tgt;
+                      $app         = $initial_app;
+                      $save_sticky = $initial_save_sticky;
+                      $save_filter = $initial_save_filter;
+                  })
+         ->pack(-side => 'left');
 
-    Tk::MainLoop();
-}
-
-# --- preferences editor (Tk) ---------------------------------------------
-
-sub edit_ui {
-    my ($cache, $target_choices, $apps) = @_;
-    require Tk;
-    require Tk::BrowseEntry;
-    Tk->import;
-
-    my $mw = MainWindow->new(-title => 'xpra-helper — preferences');
-    $mw->optionAdd('*Font' => 'sans-serif 11');
-
-    my $body   = $mw->Frame->pack(-fill => 'both', -expand => 1,
-                                  -padx => 8, -pady => 8);
-    my $bottom = $mw->Frame->pack(-fill => 'x', -padx => 8, -pady => [0, 8]);
-
-    my $rebuild;
-    $rebuild = sub {
-        $_->destroy for $body->children;
-
-        # --- sticky defaults ---
-        $body->Label(-text => 'Sticky defaults',
-                     -font => 'sans-serif 11 bold', -anchor => 'w')
-             ->pack(-fill => 'x');
-        my $sf = $body->Frame->pack(-fill => 'x', -padx => 12, -pady => [0, 6]);
-        my @kinds = sort keys %{ $cache->{sticky} };
-        if (!@kinds) {
-            $sf->Label(-text => '(none)', -anchor => 'w', -fg => '#777')
-               ->pack(-fill => 'x');
-        }
-        for my $k (@kinds) {
-            my $key = $k;
-            my $v   = $cache->{sticky}{$key};
-            my $tgt = label_for_target_id($v->{target}, $target_choices);
-            my $app = $v->{app};
-            my $row = $sf->Frame->pack(-fill => 'x', -pady => 1);
-            $row->Label(-text => sprintf('%-10s →', $key),
-                        -anchor => 'w', -width => 12)
-                ->pack(-side => 'left');
-            $row->BrowseEntry(-variable  => \$tgt,
-                              -choices   => $target_choices,
-                              -width     => 24,
-                              -browsecmd => sub {
-                                  my (undef, $a) = parse_target_choice($tgt);
-                                  $app = $a if length $a;
-                              })
-                ->pack(-side => 'left', -padx => [0, 4]);
-            $row->BrowseEntry(-variable => \$app,
-                              -choices  => $apps,
-                              -width    => 24)
-                ->pack(-side => 'left', -fill => 'x', -expand => 1);
-            $row->Button(-text => 'Apply',
-                         -command => sub {
-                            my ($tid) = parse_target_choice($tgt);
-                            $cache->{sticky}{$key}
-                                = { target => $tid, app => $app };
-                            save_cache($cache);
-                            $rebuild->();
-                         })->pack(-side => 'left', -padx => [6, 0]);
-            $row->Button(-text => 'Remove',
-                         -command => sub {
-                            delete $cache->{sticky}{$key};
-                            save_cache($cache);
-                            $rebuild->();
-                         })->pack(-side => 'left', -padx => [4, 0]);
-        }
-
-        # --- url filters ---
-        $body->Label(-text => 'URL filters (first match wins; runs before sticky)',
-                     -font => 'sans-serif 11 bold', -anchor => 'w')
-             ->pack(-fill => 'x', -pady => [10, 0]);
-        my $ff = $body->Frame->pack(-fill => 'x', -padx => 12, -pady => [0, 6]);
-        my $filters = $cache->{url_filters};
-        if (!@$filters) {
-            $ff->Label(-text => '(none)', -anchor => 'w', -fg => '#777')
-               ->pack(-fill => 'x');
-        }
-        for my $i (0 .. $#$filters) {
-            my $idx = $i;
-            my $f   = $filters->[$idx];
-            my $pat = $f->{pattern};
-            my $tgt = label_for_target_id($f->{target}, $target_choices);
-            my $app = $f->{app};
-            my $row = $ff->Frame->pack(-fill => 'x', -pady => 1);
-            $row->Entry(-textvariable => \$pat, -width => 22)
-                ->pack(-side => 'left', -padx => [0, 4]);
-            $row->Label(-text => '→')->pack(-side => 'left');
-            $row->BrowseEntry(-variable  => \$tgt,
-                              -choices   => $target_choices,
-                              -width     => 22,
-                              -browsecmd => sub {
-                                  my (undef, $a) = parse_target_choice($tgt);
-                                  $app = $a if length $a;
-                              })
-                ->pack(-side => 'left', -padx => [4, 4]);
-            $row->BrowseEntry(-variable => \$app,
-                              -choices  => $apps,
-                              -width    => 20)
-                ->pack(-side => 'left', -fill => 'x', -expand => 1);
-            $row->Button(-text => 'Apply',
-                         -command => sub {
-                            my ($tid) = parse_target_choice($tgt);
-                            $filters->[$idx] = { pattern => $pat,
-                                                 target  => $tid,
-                                                 app     => $app };
-                            save_cache($cache);
-                            $rebuild->();
-                         })->pack(-side => 'left', -padx => [6, 0]);
-            $row->Button(-text => 'Up',
-                         -state => $idx == 0 ? 'disabled' : 'normal',
-                         -command => sub {
-                            @{$filters}[$idx-1, $idx]
-                              = @{$filters}[$idx, $idx-1];
-                            save_cache($cache);
-                            $rebuild->();
-                         })->pack(-side => 'left', -padx => [4, 0]);
-            $row->Button(-text => 'Down',
-                         -state => $idx == $#$filters ? 'disabled' : 'normal',
-                         -command => sub {
-                            @{$filters}[$idx, $idx+1]
-                              = @{$filters}[$idx+1, $idx];
-                            save_cache($cache);
-                            $rebuild->();
-                         })->pack(-side => 'left', -padx => 2);
-            $row->Button(-text => 'Remove',
-                         -command => sub {
-                            splice @$filters, $idx, 1;
-                            save_cache($cache);
-                            $rebuild->();
-                         })->pack(-side => 'left');
-        }
-
-        # --- add filter form ---
-        my $af = $body->Frame->pack(-fill => 'x', -padx => 12, -pady => [4, 0]);
-        $af->Label(-text => 'Add:')->pack(-side => 'left');
-        my $pat = '';
-        my $tgt = $target_choices->[0];
-        my (undef, $tgt_app) = parse_target_choice($tgt);
-        my $app = length $tgt_app ? $tgt_app : $apps->[0];
-        $af->Entry(-textvariable => \$pat, -width => 22)
-           ->pack(-side => 'left', -padx => [4, 0]);
-        $af->Label(-text => '→')->pack(-side => 'left', -padx => 4);
-        $af->BrowseEntry(-variable  => \$tgt,
-                         -choices   => $target_choices,
-                         -width     => 22,
-                         -browsecmd => sub {
-                             my (undef, $a) = parse_target_choice($tgt);
-                             $app = $a if length $a;
-                         })
-           ->pack(-side => 'left', -padx => [0, 4]);
-        $af->BrowseEntry(-variable => \$app,
-                         -choices  => $apps,
-                         -width    => 20)
-           ->pack(-side => 'left', -fill => 'x', -expand => 1);
-        $af->Button(-text => 'Add',
-                    -command => sub {
-                        return unless length $pat;
-                        my ($tid) = parse_target_choice($tgt);
-                        return unless length($tid // '') && length($app // '');
-                        push @$filters, { pattern => $pat,
-                                          target  => $tid,
-                                          app     => $app };
-                        save_cache($cache);
-                        $rebuild->();
-                    })->pack(-side => 'left', -padx => [6, 0]);
-    };
-    $rebuild->();
-
-    $bottom->Button(
-        -text => 'Reset all',
-        -command => sub {
-            my $ok = $mw->messageBox(
-                -type    => 'OkCancel',
-                -icon    => 'warning',
-                -title   => 'Reset all',
-                -message => 'Clear all sticky defaults and URL filters?');
-            return unless lc $ok eq 'ok';
-            %$cache = %{ empty_cache() };
-            save_cache($cache);
-            $rebuild->();
-        })->pack(-side => 'left');
-    $bottom->Button(-text => 'Close',
-                    -command => sub { $mw->destroy })
-           ->pack(-side => 'right');
-
+    $uent->focus;
     Tk::MainLoop();
 }
 
@@ -619,17 +599,14 @@ sub edit_ui {
 sub usage {
     print <<'EOF';
 usage:
-  xpra-helper <url|file>   dispatch an argument to a session
-  xpra-helper --edit       open the preferences window
+  xpra-helper [url|file]   dispatch a URL/file (or open the chooser to type one)
   xpra-helper --help       this message
 EOF
 }
 
-my $edit_mode = 0;
 while (@ARGV && $ARGV[0] =~ /^-/) {
     my $opt = shift @ARGV;
-    if    ($opt eq '--edit')                  { $edit_mode = 1 }
-    elsif ($opt eq '--help' || $opt eq '-h')  { usage(); exit 0 }
+    if    ($opt eq '--help' || $opt eq '-h')  { usage(); exit 0 }
     elsif ($opt eq '--')                      { last }
     else { die "xpra-helper: unknown option $opt (try --help)\n" }
 }
@@ -639,37 +616,31 @@ die "xpra-helper: no sessions in $START_FILE and no browsers found in PATH\n"
     unless @sessions;
 my ($target_choices, $apps) = derive_choices(\@sessions);
 
-if ($edit_mode) {
-    my $cache = load_cache(\@sessions);
-    edit_ui($cache, $target_choices, $apps);
-    exit 0;
-}
-
 my $arg = shift @ARGV;
-die "usage: xpra-helper <url|file>  (or --edit / --help)\n"
-    unless defined $arg;
 warn "xpra-helper: extra arguments ignored: @ARGV\n" if @ARGV;
 
 my $cache = load_cache(\@sessions);
-my $kind  = kind_of($arg);
 
-# 1) URL filter wins if any pattern matches.
-if (my $f = match_filter($arg, $cache->{url_filters})) {
-    dispatch_pair($f->{target}, $f->{app}, $arg);
-    exit 0;
-}
-
-# 2) Sticky default by kind.
-if (my $s = $cache->{sticky}{$kind}) {
-    if (ref $s eq 'HASH'
-        && length($s->{target} // '')
-        && length($s->{app}    // ''))
-    {
-        dispatch_pair($s->{target}, $s->{app}, $arg);
+# With a URL, try the filter then the sticky default for auto-dispatch.
+if (defined $arg && length $arg) {
+    if (my $f = match_filter($arg, $cache->{url_filters})) {
+        record_history($cache, $arg, $f->{target}, $f->{app});
+        dispatch_pair($f->{target}, $f->{app}, $arg);
         exit 0;
+    }
+    my $kind = kind_of($arg);
+    if (my $s = $cache->{sticky}{$kind}) {
+        if (ref $s eq 'HASH'
+            && length($s->{target} // '')
+            && length($s->{app}    // ''))
+        {
+            record_history($cache, $arg, $s->{target}, $s->{app});
+            dispatch_pair($s->{target}, $s->{app}, $arg);
+            exit 0;
+        }
     }
 }
 
-# 3) Fall through to the chooser.
-chooser($arg, $kind, $target_choices, $apps, $cache);
+# Otherwise (or with no arg) open the chooser.
+chooser($arg, $target_choices, $apps, $cache);
 exit 0;
