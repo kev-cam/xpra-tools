@@ -6,6 +6,11 @@ if (defined $attach) {
     }
 }
 
+$xarg="";
+if (defined $dpi) {
+    $xarg .= "--dpi=$dpi";
+}
+
 open(XPRA,"xpra list 2>&1 |");
 
 $pid=-1;
@@ -41,7 +46,7 @@ while (<XPRA>) {
 	chmod 0700,"/tmp/$$-xpra-cmd";
 	$xmd="/tmp/$$-xpra-cmd";
 	if (! defined $xpra{$n = $1}) {
-	    open(NWXP,"xpra start --start='$xmd' :$n 2>&1 |");
+	    open(NWXP,"xpra start $xarg --start='$xmd' :$n 2>&1 |");
 	    while (<NWXP>) {
 		print;
 	    }
@@ -59,7 +64,7 @@ while (<XPRA>) {
 	    }
 	    if (! $running) {
 		print "Restarting $cmd on display $n\n";
-		open(NWXP,"xpra control :$n start /tmp/$$-xpra-cmd 2>&1 |");
+		open(NWXP,"xpra control :$n $xarg start /tmp/$$-xpra-cmd 2>&1 |");
 		while (<NWXP>) {
 		    print;
 		}
