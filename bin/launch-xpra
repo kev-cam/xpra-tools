@@ -1,82 +1,203 @@
-#!/usr/bin/perl -s
+#!/usr/bin/perl
+# launch-xpra — drive xpra sessions defined in ~/.xpra-start.
+#
+# ~/.xpra-start lines map a display number to the application that
+# should be running on it:
+#     20: thunderbird -P mail
+#     :20: thunderbird -P mail            # leading colon also OK
+#     30: chromium --new-window
+# Blank lines and `#` comments are skipped.
+#
+# Default behaviour (no mode flag): for every entry, ensure both the
+# xpra server on :N and the configured app are running.  Idempotent —
+# safe to re-run.
+#
+# Modes (mutually exclusive):
+#   --restart-app    kill the configured app on :N (TERM, then KILL
+#                    after 1s for stragglers) and relaunch it via
+#                    `xpra control :N start CMD`.  The xpra server
+#                    stays up so any other apps in the session survive.
+#   --restart-xpra   `xpra stop :N`, sleep 1, then `xpra start :N`
+#                    with --dpi (if given) and --start=CMD so the new
+#                    server picks up the DPI change.
+#
+# Options:
+#   --display N      restrict the actions to display :N (default: every
+#                    entry in ~/.xpra-start)
+#   --dpi D          pass --dpi=D to `xpra start` (server-side DPI;
+#                    --restart-xpra is the way to apply a DPI change to
+#                    a session that's already running)
+#   --attach[=:N]    after the work, run `xpra attach :N &` (default
+#                    :N = the affected display)
+#   --debug          print xpra/show-x11 output and leave temp files
 
-if (defined $attach) {
-    if (1 != $attach) {
-	$ENV{DISPLAY}=$attach;
+use strict;
+use warnings;
+use File::Temp qw(tempfile);
+use Getopt::Long;
+
+my ($display, $dpi, $restart_app, $restart_xpra, $attach, $debug, $help);
+GetOptions(
+    'display=i'    => \$display,
+    'dpi=i'        => \$dpi,
+    'restart-app'  => \$restart_app,
+    'restart-xpra' => \$restart_xpra,
+    'attach:s'     => \$attach,
+    'debug'        => \$debug,
+    'h|help'       => \$help,
+) or die _usage();
+if ($help) { print _usage(); exit 0 }
+die "launch-xpra: --restart-app and --restart-xpra are mutually exclusive\n"
+    if $restart_app && $restart_xpra;
+
+sub _usage { <<'EOF' }
+usage: launch-xpra [--display N] [--dpi D] [--attach[=:N]]
+                   [--restart-app | --restart-xpra] [--debug]
+EOF
+
+my $START_FILE = "$ENV{HOME}/.xpra-start";
+
+sub parse_xstart {
+    my %m;
+    open my $fh, '<', $START_FILE
+        or die "launch-xpra: can't read $START_FILE: $!\n";
+    while (<$fh>) {
+        chomp; s/#.*//;
+        next if /^\s*$/;
+        if (/^\s*:?(\d+)\s*:\s*(\S.*?)\s*$/) {
+            $m{$1} = $2;
+        } else {
+            warn "launch-xpra: $START_FILE: ignoring '$_'\n";
+        }
     }
+    return \%m;
 }
 
-$xarg="";
-if (defined $dpi) {
-    $xarg .= "--dpi=$dpi";
+sub live_sessions {
+    my %live;
+    open my $h, '-|', 'xpra', 'list' or die "launch-xpra: xpra list: $!\n";
+    while (<$h>) {
+        print if $debug;
+        $live{$1} = 1 if /LIVE\s+session\s+at\s+:(\d+)/i;
+    }
+    return \%live;
 }
 
-open(XPRA,"xpra list 2>&1 |");
-
-$pid=-1;
-while (<XPRA>) {
-    if ($debug) {
-	print;
+# Pids on display :N whose command's argv0 basename matches $argv0.
+sub pids_on_display {
+    my ($n, $argv0) = @_;
+    return () unless length $argv0;
+    open my $h, '-|', 'show-x11', '-ns' or return ();
+    my $cur = '';
+    my @pids;
+    while (<$h>) {
+        chomp;
+        if (/^(:\d+)\s*$/) { $cur = $1; next }
+        next unless $cur eq ":$n";
+        if (/^\s+(\d+)\s+\S+\s+(.+?)\s*$/) {
+            my ($pid, $cmd) = ($1, $2);
+            my ($a) = $cmd =~ /^(\S+)/;
+            $a =~ s{^.*/}{};
+            push @pids, $pid if $a eq $argv0;
+        }
     }
-    if (m=^/run/user/(\d+)=) {
-	$pid = $1;
-    }
-    if (/LIVE\s*session\s*at\s*:(\d+)/i) {
-	if ($debug) {
-	    print "$1=>$pid\n";
-	}
-	$xpra{$1} = $pid;
-    }
+    close $h;
+    return @pids;
 }
 
-open(XPRA,"$ENV{HOME}/.xpra-start");
+# `xpra start --start=…` and `xpra control … start …` each take a single
+# executable, so wrap $cmd in a tiny shell script — any quoting / args
+# in $cmd survive intact through xpra's argv handling.
+sub make_wrapper {
+    my ($cmd) = @_;
+    my ($fh, $path) = tempfile('xpra-startXXXX', DIR => '/tmp', UNLINK => 0);
+    print $fh "#!/bin/sh\nexec $cmd\n";
+    close $fh;
+    chmod 0700, $path;
+    return $path;
+}
 
-while (<XPRA>) {
-    chomp;
-    next if ("" eq $_);
-    
-    if (/\s*(\d+)\s*:\s*(.*)/) {
-	next if ($display && $1 ne $display);
-	
-	print "$1\t'$2' $xpra{$1}\n";
-	$cmd=$2;
-	open (CMD,">/tmp/$$-xpra-cmd");
-	print CMD "#!/bin/sh\nexec $cmd\n";
-	close CMD;
-	chmod 0700,"/tmp/$$-xpra-cmd";
-	$xmd="/tmp/$$-xpra-cmd";
-	if (! defined $xpra{$n = $1}) {
-	    open(NWXP,"xpra start $xarg --start='$xmd' :$n 2>&1 |");
-	    while (<NWXP>) {
-		print;
-	    }
-	} else {
-	    open(SHX,"show-x11 -ns -display=:$n 2>&1 |");
-	    $running = 0;
-	    while (<SHX>) {		
-		if (/$cmd/) {
-		    s/^\s+//;
-		    print "Running ",$_;
-		    $running = 1;
-		} elsif ($debug) {
-		    print;
-		}
-	    }
-	    if (! $running) {
-		print "Restarting $cmd on display $n\n";
-		open(NWXP,"xpra control :$n $xarg start /tmp/$$-xpra-cmd 2>&1 |");
-		while (<NWXP>) {
-		    print;
-		}
-	    }
-	    if ($attach) {
-		system("xpra attach :$n &")
-	    }
-	}
-	if (! $debug) {
-	    unlink("/tmp/$$-xpra-cmd");
-	}
+sub argv0 {
+    my ($cmd) = @_;
+    my ($a) = $cmd =~ /^(\S+)/;
+    return '' unless defined $a;
+    $a =~ s{^.*/}{};
+    return $a;
+}
+
+# --- main ----------------------------------------------------------------
+
+my $entries = parse_xstart();
+my $live    = live_sessions();
+
+my @displays = defined $display
+             ? ($display)
+             : sort { $a <=> $b } keys %$entries;
+
+for my $n (@displays) {
+    my $cmd = $entries->{$n};
+    unless (defined $cmd && length $cmd) {
+        warn "launch-xpra: no entry for :$n in $START_FILE\n";
+        next;
+    }
+    print "[:$n] $cmd\n";
+
+    my $wrap = make_wrapper($cmd);
+    my @dpi_args = defined $dpi ? ("--dpi=$dpi") : ();
+
+    if ($restart_xpra) {
+        if ($live->{$n}) {
+            print "  xpra stop :$n\n";
+            system 'xpra', 'stop', ":$n";
+            sleep 1;
+        }
+        my @c = ('xpra', 'start', "--start=$wrap", @dpi_args, ":$n");
+        print "  @c\n";
+        system @c;
+    } elsif ($restart_app) {
+        unless ($live->{$n}) {
+            warn "launch-xpra: :$n isn't live "
+               . "(use --restart-xpra to (re)create it)\n";
+            unlink $wrap;
+            next;
+        }
+        my @pids = pids_on_display($n, argv0($cmd));
+        if (@pids) {
+            print "  kill -TERM @pids\n";
+            kill 'TERM', @pids;
+            sleep 1;
+            my @still = grep { kill 0, $_ } @pids;
+            if (@still) {
+                print "  kill -KILL @still\n";
+                kill 'KILL', @still;
+            }
+        }
+        my @c = ('xpra', 'control', ":$n", 'start', $wrap);
+        print "  @c\n";
+        system @c;
     } else {
-	print "Bad line: $_\n";
+        # Default: ensure session + app.
+        if (!$live->{$n}) {
+            my @c = ('xpra', 'start', "--start=$wrap", @dpi_args, ":$n");
+            print "  @c\n";
+            system @c;
+        } else {
+            my @pids = pids_on_display($n, argv0($cmd));
+            if (@pids) {
+                print "  running (pids @pids)\n";
+            } else {
+                my @c = ('xpra', 'control', ":$n", 'start', $wrap);
+                print "  @c\n";
+                system @c;
+            }
+        }
+    }
+
+    unlink $wrap unless $debug;
+
+    if (defined $attach) {
+        my $adisp = length $attach ? $attach : ":$n";
+        print "  xpra attach $adisp &\n";
+        system "xpra attach $adisp &";
     }
 }
