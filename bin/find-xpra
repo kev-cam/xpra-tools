@@ -1598,7 +1598,10 @@ for my $s (@sessions) {
             }
             if ($picked eq 'Attach Browser') {
                 my $url = $sess->{_html_url};
-                spawn_detached('xdg-open', $url) if $url;
+                # Route through xpra-helper so the user's sticky/filter
+                # rules pick the target session + browser profile instead
+                # of dropping the URL on the local default handler.
+                spawn_detached('xpra-helper', $url) if $url;
             }
             elsif ($picked eq 'Terminal') {
                 _keys_ensure() unless $sess->{local};
