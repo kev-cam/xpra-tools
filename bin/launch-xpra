@@ -27,6 +27,9 @@
 #   --dpi D          pass --dpi=D to `xpra start` (server-side DPI;
 #                    --restart-xpra is the way to apply a DPI change to
 #                    a session that's already running)
+#   --web            when starting a session, also bind an HTML5 TCP
+#                    listener on port 14500+N (--bind-tcp=0.0.0.0:PORT
+#                    --html=on), so it's reachable from a browser
 #   --attach[=:N]    after the work, run `xpra attach :N &` (default
 #                    :N = the affected display)
 #   --debug          print xpra/show-x11 output and leave temp files
@@ -36,12 +39,13 @@ use warnings;
 use File::Temp qw(tempfile);
 use Getopt::Long;
 
-my ($display, $dpi, $restart_app, $restart_xpra, $attach, $debug, $help);
+my ($display, $dpi, $restart_app, $restart_xpra, $web, $attach, $debug, $help);
 GetOptions(
     'display=i'    => \$display,
     'dpi=i'        => \$dpi,
     'restart-app'  => \$restart_app,
     'restart-xpra' => \$restart_xpra,
+    'web'          => \$web,
     'attach:s'     => \$attach,
     'debug'        => \$debug,
     'h|help'       => \$help,
@@ -51,7 +55,7 @@ die "launch-xpra: --restart-app and --restart-xpra are mutually exclusive\n"
     if $restart_app && $restart_xpra;
 
 sub _usage { <<'EOF' }
-usage: launch-xpra [--display N] [--dpi D] [--attach[=:N]]
+usage: launch-xpra [--display N] [--dpi D] [--web] [--attach[=:N]]
                    [--restart-app | --restart-xpra] [--debug]
 EOF
 
@@ -144,6 +148,7 @@ for my $n (@displays) {
 
     my $wrap = make_wrapper($cmd);
     my @dpi_args = defined $dpi ? ("--dpi=$dpi") : ();
+    my @web_args = $web ? ("--bind-tcp=0.0.0.0:" . (14500 + $n), '--html=on') : ();
 
     if ($restart_xpra) {
         if ($live->{$n}) {
@@ -151,7 +156,7 @@ for my $n (@displays) {
             system 'xpra', 'stop', ":$n";
             sleep 1;
         }
-        my @c = ('xpra', 'start', "--start=$wrap", @dpi_args, ":$n");
+        my @c = ('xpra', 'start', "--start=$wrap", @dpi_args, @web_args, ":$n");
         print "  @c\n";
         system @c;
     } elsif ($restart_app) {
@@ -178,7 +183,7 @@ for my $n (@displays) {
     } else {
         # Default: ensure session + app.
         if (!$live->{$n}) {
-            my @c = ('xpra', 'start', "--start=$wrap", @dpi_args, ":$n");
+            my @c = ('xpra', 'start', "--start=$wrap", @dpi_args, @web_args, ":$n");
             print "  @c\n";
             system @c;
         } else {

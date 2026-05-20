@@ -1537,9 +1537,10 @@ for my $s (@sessions) {
     # (Terminal would pop a window on a display nobody's viewing if we
     # offered it before attaching).  "Attach Browser" is appended to both
     # lists when the async HTML5-port probe (below) finds xpra-web open.
-    my @ACTIONS_DETACHED = ('Attach', 'Restart app', 'Restart Xpra');
+    my @ACTIONS_DETACHED = ('Attach', 'Restart app',
+                            'Restart Xpra', 'Restart Xpra with web');
     my @ACTIONS_ATTACHED = ('Disconnect', 'Force kill', 'KILL', 'Terminal',
-                            'Restart app', 'Restart Xpra');
+                            'Restart app', 'Restart Xpra', 'Restart Xpra with web');
     my $action = 'Attach';
     my $current_opts = \@ACTIONS_DETACHED;
     # Default-action helper: the menu reverts to this after any Go click
@@ -1574,7 +1575,7 @@ for my $s (@sessions) {
         -relief       => 'raised',
         -borderwidth  => 1,
         -anchor       => 'w',
-        -width        => 14,
+        -width        => 21,
     );
     $action_menu = $action_mb->Menu(-tearoff => 0);
     $action_mb->configure(-menu => $action_menu);
@@ -1603,7 +1604,9 @@ for my $s (@sessions) {
                 _keys_ensure() unless $sess->{local};
                 spawn_detached(_term_cmd($sess));
             }
-            elsif ($picked eq 'Restart app' || $picked eq 'Restart Xpra') {
+            elsif ($picked eq 'Restart app'
+                || $picked eq 'Restart Xpra'
+                || $picked eq 'Restart Xpra with web') {
                 _keys_ensure() unless $sess->{local};
                 spawn_detached(_launch_xpra_cmd($sess, $picked));
             }
@@ -1891,12 +1894,13 @@ sub _attach_cmd {
 sub _launch_xpra_cmd {
     my ($s, $action) = @_;
     (my $disp_n = $s->{disp}) =~ s/^://;
-    my $mode = $action eq 'Restart Xpra' ? '--restart-xpra' : '--restart-app';
+    my $mode = $action eq 'Restart app' ? '--restart-app' : '--restart-xpra';
     my @lx = ('launch-xpra', $mode, "--display=$disp_n");
-    if ($action eq 'Restart Xpra') {
+    if ($mode eq '--restart-xpra') {
         if (defined(my $dpi = _dpi_for($s->{host}))) {
             push @lx, "--dpi=$dpi";
         }
+        push @lx, '--web' if $action eq 'Restart Xpra with web';
     }
     return @lx if $s->{local};
     return ('ssh', ssh_opts(),
