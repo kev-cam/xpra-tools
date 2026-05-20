@@ -1553,46 +1553,65 @@ for my $s (@sessions) {
                     spawn_detached('xdg-open', $url);
                 });
     $html_btn->grid(-row => $r, -column => 8, -padx => 6, -pady => 1, -sticky => 'ew');
-    my ($attach_btn, $disc_btn);
-    $attach_btn = $mw->Button(-text => 'Attach',
+    # Action menu + Go button.  The dropdown reflects what's possible for
+    # the session's current state — Attach when detached, Disconnect /
+    # Force kill / KILL when an xpra-attach child is alive.  More items
+    # can be added later (e.g. HTML, terminal, edit) without growing the
+    # per-row button count.
+    my $action = 'Attach';
+    my ($action_mb, $action_menu);
+    my $set_actions = sub {
+        my ($opts, $default) = @_;
+        $action_menu->delete(0, 'end');
+        for my $o (@$opts) {
+            my $val = $o;
+            $action_menu->add('command', -label => $o,
+                              -command => sub { $action = $val });
+        }
+        $action = $default;
+    };
+    $action_mb = $mw->Menubutton(
+        -textvariable => \$action,
+        -indicatoron  => 1,
+        -relief       => 'raised',
+        -borderwidth  => 1,
+        -anchor       => 'w',
+        -width        => 11,
+    );
+    $action_menu = $action_mb->Menu(-tearoff => 0);
+    $action_mb->configure(-menu => $action_menu);
+    $set_actions->(['Attach'], 'Attach');
+    # Escalating disconnect: xpra viewers occasionally ignore a plain TERM
+    # (mid-handshake, stuck modal, hung ssh transport, ...) so the user
+    # can step up explicitly via the menu — TERM pid, then TERM the whole
+    # process group (ssh + xpra workers), then KILL the group.
+    my $go_btn = $mw->Button(-text => 'Go',
         -command => sub {
-            _keys_ensure() unless $sess->{local};
-            my $pid = spawn_attach(_attach_cmd($sess));
-            $sess->{pid} = $pid;
-            $sess->{_disc_count} = 0;
-            $attach_btn->configure(-state => 'disabled');
-            $disc_btn->configure(-state => 'normal', -text => 'Disconnect');
-            $term_btn->configure(-state => 'normal');
-        });
-    # Escalating disconnect.  The xpra viewer occasionally ignores a plain
-    # TERM (mid-handshake, stuck in a modal, ssh transport hung, ...), so
-    # repeated clicks ramp up the force:
-    #   1st: TERM the viewer pid
-    #   2nd: TERM the whole process group (catches ssh + xpra workers)
-    #   3rd+: KILL the process group, then KILL the pid
-    $disc_btn = $mw->Button(-text => 'Disconnect', -state => 'disabled',
-        -command => sub {
+            if ($action eq 'Attach') {
+                _keys_ensure() unless $sess->{local};
+                my $pid = spawn_attach(_attach_cmd($sess));
+                $sess->{pid} = $pid;
+                $term_btn->configure(-state => 'normal');
+                $set_actions->(['Disconnect', 'Force kill', 'KILL'],
+                               'Disconnect');
+                return;
+            }
             my $pid = $sess->{pid} or return;
-            my $n   = ++$sess->{_disc_count};
-            if ($n == 1) {
-                kill 'TERM', $pid;
-                $disc_btn->configure(-text => 'Disconnect!');
-            } elsif ($n == 2) {
-                kill 'TERM', -$pid;     # negative = process group
+            if    ($action eq 'Disconnect') { kill 'TERM', $pid }
+            elsif ($action eq 'Force kill') {
+                kill 'TERM', -$pid;
                 kill 'TERM',  $pid;
-                $disc_btn->configure(-text => 'Force kill');
-            } else {
+            }
+            elsif ($action eq 'KILL') {
                 kill 'KILL', -$pid;
                 kill 'KILL',  $pid;
-                $disc_btn->configure(-text => 'KILL');
             }
         });
-    $attach_btn->grid(-row => $r, -column => 9, -padx => 6, -pady => 1, -sticky => 'ew');
-    $disc_btn  ->grid(-row => $r, -column => 10, -padx => 6, -pady => 1, -sticky => 'ew');
-    $sess->{_attach_btn} = $attach_btn;
-    $sess->{_disc_btn}   = $disc_btn;
-    $sess->{_term_btn}   = $term_btn;
-    $sess->{_html_btn}   = $html_btn;
+    $action_mb->grid(-row => $r, -column => 9,  -padx => 6, -pady => 1, -sticky => 'ew');
+    $go_btn   ->grid(-row => $r, -column => 10, -padx => 6, -pady => 1, -sticky => 'ew');
+    $sess->{_set_actions} = $set_actions;
+    $sess->{_term_btn}    = $term_btn;
+    $sess->{_html_btn}    = $html_btn;
     $r++;
 }
 
@@ -1696,11 +1715,8 @@ $mw->repeat(750, sub {
         my $r = waitpid($pid, POSIX::WNOHANG());
         if ($r != 0) {
             $s->{pid} = undef;
-            $s->{_disc_count} = 0;
-            $s->{_attach_btn}->configure(-state => 'normal');
-            $s->{_disc_btn}  ->configure(-state => 'disabled',
-                                         -text  => 'Disconnect');
-            $s->{_term_btn}  ->configure(-state => 'disabled')
+            $s->{_set_actions}->(['Attach'], 'Attach');
+            $s->{_term_btn}->configure(-state => 'disabled')
                 if $s->{_term_btn};
         }
     }
