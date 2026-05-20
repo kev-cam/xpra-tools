@@ -1470,7 +1470,7 @@ my $mw = _tk_mw();
 _dbg("[debug] parent: MainWindow created");
 $mw->title('find-xpra: attach to X11 session');
 $mw->deiconify;
-my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '', '', '', '', '', '');
+my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '', '', '', '', '');
 
 # Rescan: re-exec self with the same args.  Discovery runs again and the
 # UI rebuilds.  In-flight xpra-attach children are setsid'd so they
@@ -1528,20 +1528,9 @@ for my $s (@sessions) {
     $mw->Button(-text => 'Apps',
                 -command => sub { _show_procs($sess) })
        ->grid(-row => $r, -column => 5, -padx => 6, -pady => 1, -sticky => 'ew');
-    # Terminal only makes sense once we've actually attached to the
-    # display — opening one against an unattached session pops a window
-    # the user can't see.  Enabled by Attach, disabled again by
-    # Disconnect / child reap (below).
-    my $term_btn = $mw->Button(-text => 'Terminal',
-                -state   => 'disabled',
-                -command => sub {
-                    _keys_ensure() unless $sess->{local};
-                    spawn_detached(_term_cmd($sess));
-                });
-    $term_btn->grid(-row => $r, -column => 6, -padx => 6, -pady => 1, -sticky => 'ew');
     $mw->Button(-text => 'Settings',
                 -command => sub { _show_settings($sess) })
-       ->grid(-row => $r, -column => 7, -padx => 6, -pady => 1, -sticky => 'ew');
+       ->grid(-row => $r, -column => 6, -padx => 6, -pady => 1, -sticky => 'ew');
     # HTML5 client button — points the default browser at xpra-web's
     # https endpoint for this session.  Starts disabled; enabled
     # asynchronously (below) once a TCP probe of host:14500+disp_n
@@ -1552,12 +1541,15 @@ for my $s (@sessions) {
                     my $url = $sess->{_html_url} or return;
                     spawn_detached('xdg-open', $url);
                 });
-    $html_btn->grid(-row => $r, -column => 8, -padx => 6, -pady => 1, -sticky => 'ew');
+    $html_btn->grid(-row => $r, -column => 7, -padx => 6, -pady => 1, -sticky => 'ew');
     # Action menu + Go button.  The dropdown reflects what's possible for
-    # the session's current state — Attach when detached, Disconnect /
-    # Force kill / KILL when an xpra-attach child is alive.  More items
-    # can be added later (e.g. HTML, terminal, edit) without growing the
-    # per-row button count.
+    # the session's current state — Attach when detached; Disconnect /
+    # Force kill / KILL / Terminal when an xpra-attach child is alive
+    # (Terminal would pop a window on a display nobody's viewing if we
+    # offered it before attaching).  More items can be added later
+    # without growing the per-row button count.
+    my @ACTIONS_DETACHED = ('Attach');
+    my @ACTIONS_ATTACHED = ('Disconnect', 'Force kill', 'KILL', 'Terminal');
     my $action = 'Attach';
     my ($action_mb, $action_menu);
     my $set_actions = sub {
@@ -1580,7 +1572,7 @@ for my $s (@sessions) {
     );
     $action_menu = $action_mb->Menu(-tearoff => 0);
     $action_mb->configure(-menu => $action_menu);
-    $set_actions->(['Attach'], 'Attach');
+    $set_actions->(\@ACTIONS_DETACHED, 'Attach');
     # Escalating disconnect: xpra viewers occasionally ignore a plain TERM
     # (mid-handshake, stuck modal, hung ssh transport, ...) so the user
     # can step up explicitly via the menu — TERM pid, then TERM the whole
@@ -1591,9 +1583,12 @@ for my $s (@sessions) {
                 _keys_ensure() unless $sess->{local};
                 my $pid = spawn_attach(_attach_cmd($sess));
                 $sess->{pid} = $pid;
-                $term_btn->configure(-state => 'normal');
-                $set_actions->(['Disconnect', 'Force kill', 'KILL'],
-                               'Disconnect');
+                $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
+                return;
+            }
+            if ($action eq 'Terminal') {
+                _keys_ensure() unless $sess->{local};
+                spawn_detached(_term_cmd($sess));
                 return;
             }
             my $pid = $sess->{pid} or return;
@@ -1607,11 +1602,11 @@ for my $s (@sessions) {
                 kill 'KILL',  $pid;
             }
         });
-    $action_mb->grid(-row => $r, -column => 9,  -padx => 6, -pady => 1, -sticky => 'ew');
-    $go_btn   ->grid(-row => $r, -column => 10, -padx => 6, -pady => 1, -sticky => 'ew');
-    $sess->{_set_actions} = $set_actions;
-    $sess->{_term_btn}    = $term_btn;
-    $sess->{_html_btn}    = $html_btn;
+    $action_mb->grid(-row => $r, -column => 8, -padx => 6, -pady => 1, -sticky => 'ew');
+    $go_btn   ->grid(-row => $r, -column => 9, -padx => 6, -pady => 1, -sticky => 'ew');
+    $sess->{_set_actions}     = $set_actions;
+    $sess->{_actions_detached} = \@ACTIONS_DETACHED;
+    $sess->{_html_btn}        = $html_btn;
     $r++;
 }
 
@@ -1715,9 +1710,7 @@ $mw->repeat(750, sub {
         my $r = waitpid($pid, POSIX::WNOHANG());
         if ($r != 0) {
             $s->{pid} = undef;
-            $s->{_set_actions}->(['Attach'], 'Attach');
-            $s->{_term_btn}->configure(-state => 'disabled')
-                if $s->{_term_btn};
+            $s->{_set_actions}->($s->{_actions_detached}, 'Attach');
         }
     }
 });
