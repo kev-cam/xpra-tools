@@ -1542,6 +1542,12 @@ for my $s (@sessions) {
                             'Restart app', 'Restart Xpra');
     my $action = 'Attach';
     my $current_opts = \@ACTIONS_DETACHED;
+    # Default-action helper: the menu reverts to this after any Go click
+    # so the dropdown always shows the most likely next action for the
+    # session's state, not the one the user just fired.
+    my $default_action = sub {
+        return $sess->{pid} ? 'Disconnect' : 'Attach';
+    };
     my ($action_mb, $action_menu);
     # Rebuild the menu items for the currently displayed list.  When
     # $default is defined, also reset $action (state flip).  Without
@@ -1579,38 +1585,43 @@ for my $s (@sessions) {
     # process group (ssh + xpra workers), then KILL the group.
     my $go_btn = $mw->Button(-text => 'Go',
         -command => sub {
-            if ($action eq 'Attach') {
+            my $picked = $action;
+            if ($picked eq 'Attach') {
                 _keys_ensure() unless $sess->{local};
                 my $pid = spawn_attach(_attach_cmd($sess));
                 $sess->{pid} = $pid;
+                # State flip; $set_actions already resets $action to
+                # 'Disconnect' (the new default) so no revert needed.
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
                 return;
             }
-            if ($action eq 'Attach Browser') {
-                my $url = $sess->{_html_url} or return;
-                spawn_detached('xdg-open', $url);
-                return;
+            if ($picked eq 'Attach Browser') {
+                my $url = $sess->{_html_url};
+                spawn_detached('xdg-open', $url) if $url;
             }
-            if ($action eq 'Terminal') {
+            elsif ($picked eq 'Terminal') {
                 _keys_ensure() unless $sess->{local};
                 spawn_detached(_term_cmd($sess));
-                return;
             }
-            if ($action eq 'Restart app' || $action eq 'Restart Xpra') {
+            elsif ($picked eq 'Restart app' || $picked eq 'Restart Xpra') {
                 _keys_ensure() unless $sess->{local};
-                spawn_detached(_launch_xpra_cmd($sess, $action));
-                return;
+                spawn_detached(_launch_xpra_cmd($sess, $picked));
             }
-            my $pid = $sess->{pid} or return;
-            if    ($action eq 'Disconnect') { kill 'TERM', $pid }
-            elsif ($action eq 'Force kill') {
-                kill 'TERM', -$pid;
-                kill 'TERM',  $pid;
+            elsif (my $pid = $sess->{pid}) {
+                if    ($picked eq 'Disconnect') { kill 'TERM', $pid }
+                elsif ($picked eq 'Force kill') {
+                    kill 'TERM', -$pid;
+                    kill 'TERM',  $pid;
+                }
+                elsif ($picked eq 'KILL') {
+                    kill 'KILL', -$pid;
+                    kill 'KILL',  $pid;
+                }
             }
-            elsif ($action eq 'KILL') {
-                kill 'KILL', -$pid;
-                kill 'KILL',  $pid;
-            }
+            # Revert dropdown to the most-likely next action.  The reap
+            # timer will later flip the whole list back to ACTIONS_DETACHED
+            # if a kill succeeded.
+            $action = $default_action->();
         });
     $action_mb->grid(-row => $r, -column => 7, -padx => 6, -pady => 1, -sticky => 'ew');
     $go_btn   ->grid(-row => $r, -column => 8, -padx => 6, -pady => 1, -sticky => 'ew');
@@ -1620,8 +1631,10 @@ for my $s (@sessions) {
     # the user's current selection.
     $sess->{_enable_browser} = sub {
         return if grep { $_ eq 'Attach Browser' } @ACTIONS_DETACHED;
-        push @ACTIONS_DETACHED, 'Attach Browser';
-        push @ACTIONS_ATTACHED, 'Attach Browser';
+        # Splice in right after the primary action so users don't have
+        # to scroll past kill/restart entries to find it.
+        splice(@ACTIONS_DETACHED, 1, 0, 'Attach Browser');
+        splice(@ACTIONS_ATTACHED, 1, 0, 'Attach Browser');
         $set_actions->();
     };
     $sess->{_set_actions}      = $set_actions;
