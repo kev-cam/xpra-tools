@@ -19,6 +19,10 @@
 # last 50 dispatched URLs, each with a Lock toggle (pins it past the
 # cap) and a Delete button; click a row to re-fill the URL entry.
 #
+# Ticking "Pin" keeps the chooser up after Open so subsequent URLs
+# launched from an application land in the same window instead of
+# spawning new chooser instances.
+#
 # ~/.xpra-start format: one target+app pair per line.  Prefix forms:
 #     20: thunderbird -P mail        # xpra display :20
 #     :20: thunderbird -P mail       #   (equivalent)
@@ -405,6 +409,7 @@ sub chooser {
                       ->pack(-side => 'left', -padx => [4, 0],
                              -fill => 'x', -expand => 1);
 
+    my $pin = 0;
     my $save_sticky = 0;
     $mw->Checkbutton(
         -text     => 'Remember as default for this URL kind',
@@ -573,7 +578,11 @@ sub chooser {
             save_cache($cache) if $dirty;
             record_history($cache, $url, $tid, $app);
             dispatch_pair($tid, $app, $url);
-            $mw->destroy;
+            if ($pin) {
+                $rebuild_history->();
+            } else {
+                $mw->destroy;
+            }
         },
     )->pack(-side => 'right', -padx => 4);
     $btns->Button(-text => 'Cancel',
@@ -589,6 +598,9 @@ sub chooser {
                       $save_filter = $initial_save_filter;
                   })
          ->pack(-side => 'left');
+    $btns->Checkbutton(-text     => 'Pin',
+                       -variable => \$pin)
+         ->pack(-side => 'left', -padx => [8, 0]);
 
     $uent->focus;
     Tk::MainLoop();
