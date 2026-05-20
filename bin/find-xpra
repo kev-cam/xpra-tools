@@ -1476,10 +1476,34 @@ my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '', '', '', '', '', '');
 # UI rebuilds.  In-flight xpra-attach children are setsid'd so they
 # survive the exec; their Disconnect tracking is lost (close the viewer
 # via xpra's own UI in that case).
-$mw->Button(-text => 'Rescan',
-            -command => sub { exec { $^X } $^X, $0, @ORIG_ARGV })
-   ->grid(-row => 0, -column => 0, -columnspan => scalar(@cols),
-          -sticky => 'ew', -padx => 6, -pady => 4);
+my $header_f = $mw->Frame->grid(-row => 0, -column => 0,
+                                -columnspan => scalar(@cols),
+                                -sticky => 'ew', -padx => 6, -pady => 4);
+$header_f->Button(-text => 'Rescan',
+                  -command => sub { exec { $^X } $^X, $0, @ORIG_ARGV })
+         ->pack(-side => 'left', -fill => 'x', -expand => 1);
+# Global default DPI — passed to `xpra attach --dpi=N` for every session
+# unless the host's Settings dialog overrides it.  Blank means "let xpra
+# auto-detect" (the historical behaviour).  Saved on FocusOut / Return.
+$header_f->Label(-text => 'Default DPI:')
+         ->pack(-side => 'left', -padx => [12, 4]);
+my $default_dpi = $SETTINGS->{'*'}{dpi} // '';
+my $dpi_entry = $header_f->Entry(-textvariable => \$default_dpi,
+                                 -width   => 5,
+                                 -justify => 'right')
+                         ->pack(-side => 'left');
+my $save_default_dpi = sub {
+    $default_dpi =~ s/^\s+|\s+$//g;
+    if (length $default_dpi && $default_dpi =~ /^\d+$/) {
+        $SETTINGS->{'*'}{dpi} = $default_dpi + 0;
+    } else {
+        delete $SETTINGS->{'*'}{dpi};
+        $default_dpi = '';
+    }
+    _save_settings($SETTINGS);
+};
+$dpi_entry->bind('<FocusOut>', $save_default_dpi);
+$dpi_entry->bind('<Return>',   $save_default_dpi);
 
 for my $i (0 .. $#cols) {
     $mw->Label(-text => $cols[$i], -font => 'sans-serif 11 bold',
@@ -1703,9 +1727,24 @@ sub _show_settings {
             ->pack(-fill => 'x', -padx => 30);
     }
 
+    # Per-host DPI override.  Blank = inherit the global default DPI
+    # (set beside the Rescan button).
+    $top->Label(-text => "DPI override for $host (blank = use default):",
+                -font => 'sans-serif 11 bold')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [10, 6]);
+    my $host_dpi = $SETTINGS->{$host}{dpi} // '';
+    $top->Entry(-textvariable => \$host_dpi, -width => 8, -justify => 'right')
+        ->pack(-anchor => 'w', -padx => 30);
+
     my $btns = $top->Frame->pack(-pady => 10);
     $btns->Button(-text => 'Save', -command => sub {
         $SETTINGS->{$host}{terminal} = $sel;
+        $host_dpi =~ s/^\s+|\s+$//g;
+        if (length $host_dpi && $host_dpi =~ /^\d+$/) {
+            $SETTINGS->{$host}{dpi} = $host_dpi + 0;
+        } else {
+            delete $SETTINGS->{$host}{dpi};
+        }
         _save_settings($SETTINGS);
         $top->destroy;
     })->pack(-side => 'left', -padx => 6);
@@ -1782,7 +1821,11 @@ sub _xpra_bin {
 sub _attach_cmd {
     my ($s) = @_;
     (my $disp_n = $s->{disp}) =~ s/^://;
-    return (_xpra_bin(), 'attach', ":$disp_n") if $s->{local};
+    my @dpi_opts;
+    if (defined(my $dpi = _dpi_for($s->{host}))) {
+        push @dpi_opts, "--dpi=$dpi";
+    }
+    return (_xpra_bin(), 'attach', @dpi_opts, ":$disp_n") if $s->{local};
     # Use the host name in the ssh URL so ~/.ssh/config Host blocks (User,
     # IdentityFile, ...) match.  If we know the IP, force the actual
     # connection to it via xpra's --ssh override (`-o HostName=$ip`) so
@@ -1798,7 +1841,7 @@ sub _attach_cmd {
     my $url = defined $ssh_user
         ? "ssh://$ssh_user\@$name/$disp_n"
         : "ssh://$name/$disp_n";
-    return (_xpra_bin(), 'attach', @opts, $url);
+    return (_xpra_bin(), 'attach', @opts, @dpi_opts, $url);
 }
 
 # Build the command to launch a terminal on the session's display.
@@ -1857,6 +1900,16 @@ sub _terminal_for {
     return $SETTINGS->{$host}{terminal}
         // $SETTINGS->{'*'}{terminal}
         // 'xterm';
+}
+
+# Resolve the DPI to pass to `xpra attach --dpi=N` for $host.  Per-host
+# override wins over the global default (entry beside Rescan).  Returns
+# undef when neither is set (xpra falls back to auto-detect).
+sub _dpi_for {
+    my ($host) = @_;
+    my $dpi = $SETTINGS->{$host}{dpi} // $SETTINGS->{'*'}{dpi};
+    return undef unless defined $dpi && $dpi =~ /^\d+$/ && $dpi > 0;
+    return $dpi + 0;
 }
 
 sub _term_cmd {
