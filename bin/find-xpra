@@ -1584,7 +1584,7 @@ for my $s (@sessions) {
     # (mid-handshake, stuck modal, hung ssh transport, ...) so the user
     # can step up explicitly via the menu — TERM pid, then TERM the whole
     # process group (ssh + xpra workers), then KILL the group.
-    my $go_btn = $mw->Button(-text => 'Go',
+    my $go_btn = $mw->Button(-text => "\x{25B6}",
         -command => sub {
             my $picked = $action;
             if ($picked eq 'Attach') {
