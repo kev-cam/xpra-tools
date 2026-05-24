@@ -1076,20 +1076,28 @@ for my $c (@candidates) {
                     next;
                 }
                 if ($in_psvnc) {
-                    # ps -eo user,pid,args: match VNC server processes
-                    if ($line =~ /^\s*(\S+)\s+(\d+)\s+(.*\b(?:Xvnc|x11vnc|Xtigervnc|Xtightvnc|tigervncserver|vino-server|krfb)\b.*)$/) {
-                        my ($ps_user, $ps_pid, $ps_cmd) = ($1, $2, $3);
-                        # Extract display: Xvnc :N or -display :N
+                    next unless $line =~ /^\s*(\S+)\s+(\d+)\s+(.*)/;
+                    my ($ps_user, $ps_pid, $ps_cmd) = ($1, $2, $3);
+                    # VNC server processes
+                    if ($ps_cmd =~ /\b(?:Xvnc|x11vnc|Xtigervnc|Xtightvnc|tigervncserver|vino-server|krfb)\b/) {
                         my $disp_n;
                         if ($ps_cmd =~ /(?:^|\s):(\d+)\b/) { $disp_n = $1 }
                         elsif ($ps_cmd =~ /-display\s+:(\d+)/) { $disp_n = $1 }
-                        # Extract port: -rfbport N
                         my $port;
                         if ($ps_cmd =~ /-rfbport\s+(\d+)/) { $port = $1 }
                         $port //= 5900 + ($disp_n // 0) if defined $disp_n;
                         $disp_n //= ($port - 5900) if defined $port && $port >= 5900;
                         print { $pipe } join("\t", '__psvnc__', $c->{name},
                                              $disp_n // '', $port // '', $ps_user), "\n";
+                    }
+                    # Xpra server processes (Xdummy/Xvfb started by xpra)
+                    if ($ps_cmd =~ /\b(?:xpra_Xdummy|Xdummy|Xvfb)\b.*(?:^|\s):(\d+)\b/) {
+                        print { $pipe } join("\t", '__psxpra__', $c->{name},
+                                             $1, $ps_user), "\n";
+                    }
+                    elsif ($ps_cmd =~ /\bxpra\s+(?:start|start-desktop)\b.*(?:^|\s):(\d+)\b/) {
+                        print { $pipe } join("\t", '__psxpra__', $c->{name},
+                                             $1, $ps_user), "\n";
                     }
                     next;
                 }
@@ -1151,6 +1159,7 @@ my %xpra_listed;     # "$host\t$disp" -> 1 (display reported by `xpra list`)
 my %vnc_ports;       # "$host\t$disp_n" -> port (VNC port from ss/netstat)
 my %any_displays;    # "$host\t$disp_n" -> user (from /tmp/.X11-unix stat)
 my @psvnc;           # [{host, disp_n, port, user}, ...] (from ps VNC scan)
+my @psxpra;          # [{host, disp_n, user}, ...] (from ps xpra scan)
 my %vnc_users;       # "$host\t$user" -> 1 (users running a VNC server)
 my %remote_id;       # candidate-name -> machine-id (from `show-x11 -id`)
 my %remote_host;     # candidate-name -> remote `hostname`
@@ -1188,6 +1197,8 @@ while ($sel->count) {
                                    user => $f[4] };
                 }
                 $vnc_users{"$f[1]\t$f[4]"} = 1 if defined $f[4];
+            } elsif ($line =~ /^__psxpra__\t([^\t]*)\t([^\t]*)\t([^\t]*)$/) {
+                push @psxpra, { host => $1, disp_n => $2+0, user => $3 };
             } else {
                 my @f = split /\t/, $line, 5;
                 push @rows, \@f if @f == 5;
@@ -1268,6 +1279,9 @@ for my $pid (keys %pid_for) {
         }
         %vnc_ports = %vnc_relabelled;
         for my $v (@psvnc) {
+            $v->{host} = $canonical{$v->{host}} // $v->{host};
+        }
+        for my $v (@psxpra) {
             $v->{host} = $canonical{$v->{host}} // $v->{host};
         }
         my %vu_relabelled;
@@ -1357,6 +1371,17 @@ for my $v (@psvnc) {
     $by_session{$sess_key} = { host=>$v->{host}, disp=>$disp, user=>$v->{user},
                                cmds=>[], procs=>[], n=>0, kind=>'vnc',
                                vnc_port=>$v->{port} };
+}
+for my $v (@psxpra) {
+    my $disp = ":$v->{disp_n}";
+    my $sess_key = "$v->{host}\t$disp";
+    if (my $existing = $by_session{$sess_key}) {
+        $existing->{kind} //= 'xpra';
+        $existing->{user} = $v->{user} if defined $v->{user} && length $v->{user};
+        next;
+    }
+    $by_session{$sess_key} = { host=>$v->{host}, disp=>$disp, user=>$v->{user},
+                               cmds=>[], procs=>[], n=>0, kind=>'xpra' };
 }
 for my $r (@rows) {
     my ($host, $disp, $pid, $user, $cmd) = @$r;
