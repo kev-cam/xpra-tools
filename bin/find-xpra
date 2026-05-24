@@ -1260,6 +1260,30 @@ for my $pid (keys %pid_for) {
             push @{ $xs_relabelled{$h2} }, @{ $xs_for_host{$h} };
         }
         %xs_for_host = %xs_relabelled;
+        my %vnc_relabelled;
+        for my $key (keys %vnc_ports) {
+            my ($h, $d) = split /\t/, $key, 2;
+            my $h2 = $canonical{$h} // $h;
+            $vnc_relabelled{"$h2\t$d"} = $vnc_ports{$key};
+        }
+        %vnc_ports = %vnc_relabelled;
+        for my $v (@psvnc) {
+            $v->{host} = $canonical{$v->{host}} // $v->{host};
+        }
+        my %vu_relabelled;
+        for my $key (keys %vnc_users) {
+            my ($h, $u) = split /\t/, $key, 2;
+            my $h2 = $canonical{$h} // $h;
+            $vu_relabelled{"$h2\t$u"} = 1;
+        }
+        %vnc_users = %vu_relabelled;
+        my %ad_relabelled;
+        for my $key (keys %any_displays) {
+            my ($h, $d) = split /\t/, $key, 2;
+            my $h2 = $canonical{$h} // $h;
+            $ad_relabelled{"$h2\t$d"} = $any_displays{$key};
+        }
+        %any_displays = %ad_relabelled;
     }
 }
 
