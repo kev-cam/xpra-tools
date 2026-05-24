@@ -1343,7 +1343,8 @@ for my $key (keys %any_displays) {
     my $disp = ":$disp_n";
     my $sess_key = "$host\t$disp";
     my $owner  = $any_displays{$key};
-    my $is_vnc = $vnc_ports{"$host\t$disp_n"};
+    my $is_vnc = $vnc_ports{"$host\t$disp_n"}
+              || $vnc_users{"$host\t$owner"};
     if (my $existing = $by_session{$sess_key}) {
         $existing->{user} = $owner;
         if ($is_vnc) {
@@ -1352,7 +1353,9 @@ for my $key (keys %any_displays) {
         }
         next;
     }
-    my $kind_default = $is_vnc ? 'vnc' : 'xpra';
+    my $kind_default = $is_vnc       ? 'vnc'
+                     : $disp_n >= 20 ? 'xpra'
+                     :                 'X';
     $by_session{$sess_key} = { host=>$host, disp=>$disp, user=>$owner,
                                cmds=>[], procs=>[], n=>0, kind=>$kind_default,
                                ($is_vnc ? (vnc_port => 5900 + $disp_n) : ()) };
@@ -1494,7 +1497,7 @@ for my $s (@sessions) {
     $s->{ip}       = $ip_for_name{$s->{host}};
     $s->{local}    = $local_for_name{$s->{host}} ? 1 : 0;
 }
-unless ($all || $any) {
+unless ($all) {
     @sessions = grep {
         $_->{kind} eq 'vnc'
         || (defined $_->{disp_n} && $_->{disp_n} >= 20 && $_->{disp_n} <= 1000)
