@@ -168,7 +168,7 @@ sub _keys_helper {
 # keys-<method> symlink is configured, the helper failed to mount, or
 # the mount didn't appear within the timeout.
 sub _keys_ensure {
-    return 0 if $no_mount;
+    return 0 if $no_mount || $no_prompt;
     my ($method, $link) = _keys_link() or return 0;
 
     # Mount script already running?  Bump its idle timeout and wait.
