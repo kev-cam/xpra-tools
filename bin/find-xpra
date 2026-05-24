@@ -1659,7 +1659,22 @@ for my $s (@sessions) {
                 spawn_detached(_launch_xpra_cmd($sess, $picked));
             }
             elsif (my $pid = $sess->{pid}) {
-                if    ($picked eq 'Disconnect') { kill 'TERM', $pid }
+                if ($picked eq 'Disconnect') {
+                    kill 'TERM', $pid;
+                    $action = 'Force kill';
+                    $mw->after(500, sub {
+                        return unless $sess->{pid} && $sess->{pid} == $pid;
+                        kill 'TERM', -$pid;
+                        kill 'TERM',  $pid;
+                        $action = 'KILL';
+                        $mw->after(500, sub {
+                            return unless $sess->{pid} && $sess->{pid} == $pid;
+                            kill 'KILL', -$pid;
+                            kill 'KILL',  $pid;
+                        });
+                    });
+                    return;
+                }
                 elsif ($picked eq 'Force kill') {
                     kill 'TERM', -$pid;
                     kill 'TERM',  $pid;
