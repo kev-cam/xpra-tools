@@ -1256,7 +1256,11 @@ for my $key (keys %vnc_ports) {
     my ($host, $disp_n) = split /\t/, $key, 2;
     my $disp = ":$disp_n";
     my $sess_key = "$host\t$disp";
-    next if $by_session{$sess_key};
+    if (my $existing = $by_session{$sess_key}) {
+        $existing->{kind} = 'vnc' unless $existing->{kind} eq 'xpra';
+        $existing->{vnc_port} //= $vnc_ports{$key};
+        next;
+    }
     my $is_local = $local_for_name{$host};
     my $user_seed = $is_local
         ? ($ENV{USER} // '')
@@ -1269,8 +1273,11 @@ for my $key (keys %any_displays) {
     my ($host, $disp_n) = split /\t/, $key, 2;
     my $disp = ":$disp_n";
     my $sess_key = "$host\t$disp";
-    next if $by_session{$sess_key};
     my $owner = $any_displays{$key};
+    if (my $existing = $by_session{$sess_key}) {
+        $existing->{user} = $owner;
+        next;
+    }
     my $kind_default = ($disp_n >= 20) ? 'xpra' : 'X';
     $by_session{$sess_key} = { host=>$host, disp=>$disp, user=>$owner,
                                cmds=>[], procs=>[], n=>0, kind=>$kind_default };
