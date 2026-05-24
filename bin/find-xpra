@@ -1534,7 +1534,8 @@ for my $host (keys %xs_for_host) {
     my %new_disp = map { $_->{disp_n} => 1 } @new;
     @sessions = grep {
         $_->{host} ne $host
-        || $_->{kind} eq 'vnc' && !$new_disp{$_->{disp_n}}
+        || (($_->{user} // '') ne $h_user)
+        || ($_->{kind} eq 'vnc' && !$new_disp{$_->{disp_n}})
     } @sessions;
     push @sessions, @new;
 }
