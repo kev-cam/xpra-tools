@@ -1872,19 +1872,18 @@ for my $s (@sessions) {
     }
 }
 
-# Reap exited xpra-attach children so the UI flips back when the viewer
-# closes on its own (remote disconnects, user closed the xpra window, ...).
-# Adopted processes (from a prior find-xpra) aren't our children, so we
-# check liveness with kill(0) instead of waitpid.
+# Reap exited viewer processes so the UI flips back when the viewer closes
+# on its own.  Try waitpid first — it handles both freshly spawned children
+# AND children inherited through exec (Rescan).  For truly external
+# processes (adopted from a different find-xpra PID), waitpid returns -1
+# (ECHILD); fall back to kill(0) for those.
 $mw->repeat(750, sub {
     for my $s (@sessions) {
         my $pid = $s->{pid} // next;
-        my $gone;
-        if ($s->{_adopted}) {
-            $gone = !kill(0, $pid);
-        } else {
-            $gone = (waitpid($pid, POSIX::WNOHANG()) != 0);
-        }
+        my $r = waitpid($pid, POSIX::WNOHANG());
+        my $gone = $r > 0              ? 1
+                 : $r == 0             ? 0
+                 : !kill(0, $pid);      # -1 (ECHILD): not our child
         if ($gone) {
             $s->{pid} = undef;
             $s->{_adopted} = 0;
