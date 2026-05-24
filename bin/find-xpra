@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-# find-xpra — discover X11/xpra sessions across the network and pop up
+# find-xpra — discover X11/xpra/VNC sessions across the network and pop up
 # a chooser to attach.
 #
 # Discovery: query net-mgr for online machines with tcp/22 open (skip APs),
@@ -1035,7 +1035,8 @@ for my $c (@candidates) {
         # doesn't tank the pipeline; the surrounding parens make it work
         # in both bourne-style and csh-style shells.
         my $remote = 'show-x11 -ns -id; echo __XPRA__; xpra list; '
-                   . 'echo __XSTART__; cat ~/.xpra-start';
+                   . 'echo __XSTART__; cat ~/.xpra-start; '
+                   . 'echo __VNC__; (ss -tln 2>/dev/null || netstat -tln 2>/dev/null)';
         my @cmd = $c->{local}
             ? ('sh', '-c', $remote)
             : ('ssh', ssh_opts(), ssh_target($c), $remote);
@@ -1045,11 +1046,23 @@ for my $c (@candidates) {
             my $disp;
             my $in_xpra   = 0;
             my $in_xstart = 0;
+            my $in_vnc    = 0;
+            my %vnc_seen;
             while (defined(my $line = <$oh>)) {
                 chomp $line;
                 _dbg("[debug] $c->{name}> $line");
-                if ($line eq '__XPRA__')   { $in_xpra = 1; $in_xstart = 0; next }
-                if ($line eq '__XSTART__') { $in_xpra = 0; $in_xstart = 1; next }
+                if ($line eq '__XPRA__')   { $in_xpra = 1; $in_xstart = 0; $in_vnc = 0; next }
+                if ($line eq '__XSTART__') { $in_xpra = 0; $in_xstart = 1; $in_vnc = 0; next }
+                if ($line eq '__VNC__')    { $in_xpra = 0; $in_xstart = 0; $in_vnc = 1; next }
+                if ($in_vnc) {
+                    if ($line =~ /:(\d+)\b/ && $1 >= 5900 && $1 <= 5999) {
+                        my $port = $1 + 0;
+                        next if $vnc_seen{$port}++;
+                        my $disp_n = $port - 5900;
+                        print { $pipe } join("\t", '__vnc__', $c->{name}, $disp_n, $port), "\n";
+                    }
+                    next;
+                }
                 if ($in_xstart) {
                     # ~/.xpra-start lines: "<n>: <cmd>" or ":<n>: <cmd>".
                     # Skip blanks and comments.  Strip inline `#` comments.
@@ -1098,6 +1111,7 @@ for my $c (@candidates) {
 
 my @rows;
 my %xpra_listed;     # "$host\t$disp" -> 1 (display reported by `xpra list`)
+my %vnc_ports;       # "$host\t$disp_n" -> port (VNC port from ss/netstat)
 my %remote_id;       # candidate-name -> machine-id (from `show-x11 -id`)
 my %remote_host;     # candidate-name -> remote `hostname`
 my %xs_for_host;     # candidate-name -> [ {disp_n, cmd}, ... ]
@@ -1122,6 +1136,8 @@ while ($sel->count) {
             } elsif ($line =~ /^__xs__\t([^\t]*)\t([^\t]*)\t([^\t]*)$/) {
                 push @{ $xs_for_host{$1} },
                     { disp_n => $2 + 0, cmd => $3 };
+            } elsif ($line =~ /^__vnc__\t([^\t]*)\t([^\t]*)\t([^\t]*)$/) {
+                $vnc_ports{"$1\t$2"} = $3 + 0;
             } else {
                 my @f = split /\t/, $line, 5;
                 push @rows, \@f if @f == 5;
@@ -1131,7 +1147,8 @@ while ($sel->count) {
 }
 _dbg("[debug] parent: select-loop done, "
      . scalar(@rows) . " rows, "
-     . scalar(keys %xpra_listed) . " xpra-listed");
+     . scalar(keys %xpra_listed) . " xpra-listed, "
+     . scalar(keys %vnc_ports) . " vnc-ports");
 # Kill stragglers — TERM first, brief grace, then KILL so a stuck ssh
 # can't leave the parent waiting indefinitely for the kernel to reap.
 for my $pid (keys %pid_for) {
@@ -1216,6 +1233,19 @@ for my $key (keys %xpra_listed) {
                           cmds=>[], procs=>[], n=>0, kind=>'xpra',
                           xpra_listed=>1 };
 }
+for my $key (keys %vnc_ports) {
+    my ($host, $disp_n) = split /\t/, $key, 2;
+    my $disp = ":$disp_n";
+    my $sess_key = "$host\t$disp";
+    next if $by_session{$sess_key};
+    my $is_local = $local_for_name{$host};
+    my $user_seed = $is_local
+        ? ($ENV{USER} // '')
+        : ($ssh_user // $user_for_name{$host} // $ENV{USER} // '');
+    $by_session{$sess_key} = { host=>$host, disp=>$disp, user=>$user_seed,
+                               cmds=>[], procs=>[], n=>0, kind=>'vnc',
+                               vnc_port=>$vnc_ports{$key} };
+}
 for my $r (@rows) {
     my ($host, $disp, $pid, $user, $cmd) = @$r;
     my $key = "$host\t$disp";
@@ -1242,6 +1272,12 @@ for my $r (@rows) {
     next if $cmd =~ m{(?:crashhelper|-helper\b|RemoteSandbox|GMPProcess|NetworkBroker|content-process)};
     next if $cmd =~ m{\s-contentproc\b|\s--type=\S};
     # X / VNC servers are session infrastructure, not user-launched apps.
+    # Tag the session as VNC when we spot a VNC server process.
+    if ($cmd =~ m{^(?:\S*/)?(?:Xvnc|Xtightvnc|x11vnc|Xtigervnc|krfb|vino-server|tigervncserver)\b}) {
+        $s->{kind} = 'vnc' unless $s->{kind} eq 'xpra';
+        $s->{vnc_port} //= 5900 + $n if defined $n;
+    }
+    $s->{vnc_port} //= $vnc_ports{"$host\t$n"} if defined $n;
     next if $cmd =~ m{^(?:\S*/)?(?:Xvnc|Xtightvnc|x11vnc|Xvfb|Xorg|Xtigervnc|krfb|vino-server|tigervncserver)\b};
     push @{ $s->{cmds} }, $cmd;
 }
@@ -1325,7 +1361,8 @@ for my $s (@sessions) {
 }
 unless ($all) {
     @sessions = grep {
-        defined $_->{disp_n} && $_->{disp_n} >= 20 && $_->{disp_n} <= 1000
+        $_->{kind} eq 'vnc'
+        || (defined $_->{disp_n} && $_->{disp_n} >= 20 && $_->{disp_n} <= 1000)
     } @sessions;
 }
 if (defined $user) {
@@ -1402,15 +1439,17 @@ for my $s (@sessions) {
     my $main = _main_cmd(@{ $s->{cmds} });
     $s->{apps} = length $main           ? _fmt_cmd($main, 60)
                : $s->{xpra_listed}      ? '(empty xpra)'
+               : $s->{kind} eq 'vnc'    ? '(vnc)'
                :                          '(daemons only)';
 }
 
 # Drop sessions whose only contents are session plumbing (no real app to
-# attach to).  Keep xpra-listed sessions even if empty — the user might
-# specifically want to attach to a freshly-started, app-less display.
-# --all keeps everything.
+# attach to).  Keep xpra-listed and vnc sessions even if empty — the user
+# might specifically want to attach.  --all keeps everything.
 unless ($all) {
-    @sessions = grep { $_->{apps} ne '(daemons only)' } @sessions;
+    @sessions = grep {
+        $_->{apps} ne '(daemons only)' || $_->{kind} eq 'vnc'
+    } @sessions;
 }
 
 # Cache successful probe results per host so the next picker run shows
@@ -1432,11 +1471,11 @@ _dbg("[debug] parent: " . scalar(@sessions) . " sessions ready, "
      . ($list_only ? '--list mode' : 'about to open Tk chooser'));
 
 unless (@sessions) {
-    if ($list_only) { print STDERR "no X11/xpra sessions found\n"; exit 1 }
+    if ($list_only) { print STDERR "no X11/xpra/VNC sessions found\n"; exit 1 }
     my $mw = _tk_mw();
     $mw->title('find-xpra');
     $mw->deiconify;
-    $mw->Label(-text => 'No X11/xpra sessions found.', -padx => 30, -pady => 30)
+    $mw->Label(-text => 'No X11/xpra/VNC sessions found.', -padx => 30, -pady => 30)
        ->pack;
     # Destroy the window so MainLoop returns cleanly, then exit at
     # the script level — calling `exit` directly from inside a Tk
@@ -1537,10 +1576,13 @@ for my $s (@sessions) {
     # (Terminal would pop a window on a display nobody's viewing if we
     # offered it before attaching).  "Attach Browser" is appended to both
     # lists when the async HTML5-port probe (below) finds xpra-web open.
-    my @ACTIONS_DETACHED = ('Attach', 'Restart app',
-                            'Restart Xpra', 'Restart Xpra with web');
-    my @ACTIONS_ATTACHED = ('Disconnect', 'Force kill', 'KILL', 'Terminal',
-                            'Restart app', 'Restart Xpra', 'Restart Xpra with web');
+    my @ACTIONS_DETACHED = $sess->{kind} eq 'vnc'
+        ? ('Attach')
+        : ('Attach', 'Restart app', 'Restart Xpra', 'Restart Xpra with web');
+    my @ACTIONS_ATTACHED = $sess->{kind} eq 'vnc'
+        ? ('Disconnect', 'Force kill', 'KILL')
+        : ('Disconnect', 'Force kill', 'KILL', 'Terminal',
+           'Restart app', 'Restart Xpra', 'Restart Xpra with web');
     my $action = 'Attach';
     my $current_opts = \@ACTIONS_DETACHED;
     # Default-action helper: the menu reverts to this after any Go click
@@ -1589,7 +1631,10 @@ for my $s (@sessions) {
             my $picked = $action;
             if ($picked eq 'Attach') {
                 _keys_ensure() unless $sess->{local};
-                my $pid = spawn_attach(_attach_cmd($sess));
+                my $pid = spawn_attach(
+                    $sess->{kind} eq 'vnc'
+                        ? _vnc_attach_cmd($sess)
+                        : _attach_cmd($sess));
                 $sess->{pid} = $pid;
                 # State flip; $set_actions already resets $action to
                 # 'Disconnect' (the new default) so no revert needed.
@@ -1888,6 +1933,27 @@ sub _attach_cmd {
         ? "ssh://$ssh_user\@$name/$disp_n"
         : "ssh://$name/$disp_n";
     return (_xpra_bin(), 'attach', @opts, @dpi_opts, $url);
+}
+
+sub _vnc_attach_cmd {
+    my ($s) = @_;
+    (my $disp_n = $s->{disp}) =~ s/^://;
+    my $port = $s->{vnc_port} // (5900 + $disp_n);
+    if ($s->{local}) {
+        return ('vncviewer', "localhost:$disp_n");
+    }
+    my $name = $s->{host};
+    my $ip   = $s->{ip};
+    my @tgt  = ssh_target({ name => $name, ip => $ip });
+    my @sopts = ssh_opts();
+    my $local_port = 15900 + $disp_n;
+    my $ssh_str = join(' ', map { /[\s'"]/ ? "'$_'" : $_ }
+                       ('ssh', @sopts, @tgt,
+                        '-L', "$local_port:localhost:$port", '-N'));
+    my $script = "$ssh_str & VNC_SSH=\$!; sleep 1; "
+               . "vncviewer localhost::$local_port; "
+               . "kill \$VNC_SSH 2>/dev/null";
+    return ('bash', '-c', $script);
 }
 
 # Build a launch-xpra invocation for the given session and action
