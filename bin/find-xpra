@@ -1532,7 +1532,11 @@ for my $host (keys %xs_for_host) {
         $s->{_xs_running} = $running;
         push @new, $s;
     }
-    @sessions = grep { $_->{host} ne $host } @sessions;
+    my %new_disp = map { $_->{disp_n} => 1 } @new;
+    @sessions = grep {
+        $_->{host} ne $host
+        || $_->{kind} eq 'vnc' && !$new_disp{$_->{disp_n}}
+    } @sessions;
     push @sessions, @new;
 }
 
