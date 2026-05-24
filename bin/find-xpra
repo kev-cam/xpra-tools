@@ -1343,7 +1343,8 @@ for my $key (keys %any_displays) {
     my $disp = ":$disp_n";
     my $sess_key = "$host\t$disp";
     my $owner  = $any_displays{$key};
-    my $is_vnc = $vnc_ports{"$host\t$disp_n"};
+    my $is_vnc = $vnc_ports{"$host\t$disp_n"}
+              || $vnc_users{"$host\t$owner"};
     if (my $existing = $by_session{$sess_key}) {
         $existing->{user} = $owner;
         if ($is_vnc) {
