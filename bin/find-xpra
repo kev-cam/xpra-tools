@@ -1497,6 +1497,65 @@ if ($list_only) {
     exit 0;
 }
 
+# --- adopt pre-existing viewer processes -----------------------------------
+# Scan for running xpra-attach / vncviewer processes so the UI shows them
+# as already connected.  These are not our children (spawned by a prior
+# find-xpra instance or manually), so we track them with kill(0) instead
+# of waitpid.
+
+sub _scan_attached {
+    my @found;
+    open my $h, '-|', 'ps', '-eo', 'pid,args' or return [];
+    while (<$h>) {
+        s/^\s+//;
+        my ($pid, $cmd) = /^(\d+)\s+(.+)/ or next;
+        $pid += 0;
+        next if $pid == $$;
+        if ($cmd =~ /\bxpra\b.*\battach\b.*\bssh:\/\/(?:\S+@)?([^\s\/]+)\/(\d+)\b/) {
+            push @found, { pid => $pid, type => 'xpra', host => $1, disp_n => $2 + 0 };
+        }
+        elsif ($cmd =~ /\bxpra\b.*\battach\b.*\s:(\d+)\s*$/) {
+            push @found, { pid => $pid, type => 'xpra', local => 1, disp_n => $1 + 0 };
+        }
+        elsif ($cmd =~ /\bvncviewer\s+localhost:(\d+)\s*$/ && $1 < 100) {
+            push @found, { pid => $pid, type => 'vnc', local => 1, disp_n => $1 + 0 };
+        }
+        elsif ($cmd =~ /\bvncviewer\s+localhost::(\d+)\b/ && $1 >= 15900) {
+            push @found, { pid => $pid, type => 'vnc', disp_n => $1 - 15900, cmd => $cmd };
+        }
+    }
+    close $h;
+    return \@found;
+}
+
+{
+    my $found = _scan_attached();
+    _dbg("[debug] adopt: " . scalar(@$found) . " viewer processes found");
+    for my $s (@sessions) {
+        my $dn = $s->{disp_n} // next;
+        for my $f (@$found) {
+            next unless $f->{disp_n} == $dn;
+            my $match = 0;
+            if ($f->{type} eq 'xpra' && $s->{kind} ne 'vnc') {
+                $match = 1 if  $s->{local} &&  $f->{local};
+                $match = 1 if !$s->{local} && !$f->{local}
+                           && defined $f->{host} && $f->{host} eq $s->{host};
+            }
+            elsif ($f->{type} eq 'vnc' && $s->{kind} eq 'vnc') {
+                $match = 1 if  $s->{local} &&  $f->{local};
+                $match = 1 if !$s->{local} && !$f->{local}
+                           && defined $f->{cmd} && $f->{cmd} =~ /\Q$s->{host}\E/;
+            }
+            if ($match) {
+                $s->{pid} = $f->{pid};
+                $s->{_adopted} = 1;
+                _dbg("[debug] adopt: $s->{host} $s->{disp} -> pid $f->{pid}");
+                last;
+            }
+        }
+    }
+}
+
 # --- pop up Tk chooser ----------------------------------------------------
 #
 # A row per session, with an [Attach] button at the end of each row.
@@ -1622,7 +1681,11 @@ for my $s (@sessions) {
     );
     $action_menu = $action_mb->Menu(-tearoff => 0);
     $action_mb->configure(-menu => $action_menu);
-    $set_actions->(\@ACTIONS_DETACHED, 'Attach');
+    if ($sess->{pid}) {
+        $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
+    } else {
+        $set_actions->(\@ACTIONS_DETACHED, 'Attach');
+    }
     # Escalating disconnect: xpra viewers occasionally ignore a plain TERM
     # (mid-handshake, stuck modal, hung ssh transport, ...) so the user
     # can step up explicitly via the menu — TERM pid, then TERM the whole
@@ -1811,12 +1874,20 @@ for my $s (@sessions) {
 
 # Reap exited xpra-attach children so the UI flips back when the viewer
 # closes on its own (remote disconnects, user closed the xpra window, ...).
+# Adopted processes (from a prior find-xpra) aren't our children, so we
+# check liveness with kill(0) instead of waitpid.
 $mw->repeat(750, sub {
     for my $s (@sessions) {
         my $pid = $s->{pid} // next;
-        my $r = waitpid($pid, POSIX::WNOHANG());
-        if ($r != 0) {
+        my $gone;
+        if ($s->{_adopted}) {
+            $gone = !kill(0, $pid);
+        } else {
+            $gone = (waitpid($pid, POSIX::WNOHANG()) != 0);
+        }
+        if ($gone) {
             $s->{pid} = undef;
+            $s->{_adopted} = 0;
             $s->{_set_actions}->($s->{_actions_detached}, 'Attach');
         }
     }
