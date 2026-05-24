@@ -1494,7 +1494,7 @@ for my $s (@sessions) {
     $s->{ip}       = $ip_for_name{$s->{host}};
     $s->{local}    = $local_for_name{$s->{host}} ? 1 : 0;
 }
-unless ($all) {
+unless ($all || $any) {
     @sessions = grep {
         $_->{kind} eq 'vnc'
         || (defined $_->{disp_n} && $_->{disp_n} >= 20 && $_->{disp_n} <= 1000)
