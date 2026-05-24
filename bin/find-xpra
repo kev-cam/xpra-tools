@@ -1573,13 +1573,13 @@ for my $s (@sessions) {
     my @ACTIONS_DETACHED = $sess->{kind} eq 'vnc'
         ? ('Attach', '---', 'Apps', 'Settings')
         : ('Attach', 'Restart app', 'Restart Xpra', 'Restart Xpra with web',
-           '---', 'Apps', 'Settings');
+           '---', 'Helper', 'Apps', 'Settings');
     my @ACTIONS_ATTACHED = $sess->{kind} eq 'vnc'
         ? ('Disconnect', 'Force kill', 'KILL',
            '---', 'Apps', 'Settings')
         : ('Disconnect', 'Force kill', 'KILL', 'Terminal',
            'Restart app', 'Restart Xpra', 'Restart Xpra with web',
-           '---', 'Apps', 'Settings');
+           '---', 'Helper', 'Apps', 'Settings');
     my $action = 'Attach';
     my $current_opts = \@ACTIONS_DETACHED;
     # Default-action helper: the menu reverts to this after any Go click
@@ -1652,6 +1652,9 @@ for my $s (@sessions) {
             elsif ($picked eq 'Terminal') {
                 _keys_ensure() unless $sess->{local};
                 spawn_detached(_term_cmd($sess));
+            }
+            elsif ($picked eq 'Helper') {
+                spawn_detached('xpra-helper', '--pin');
             }
             elsif ($picked eq 'Apps') {
                 _show_procs($sess);

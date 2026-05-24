@@ -63,6 +63,10 @@ use warnings;
 use POSIX ();
 use JSON::PP;
 use File::Path qw(make_path);
+use Getopt::Long qw(:config no_ignore_case no_bundling pass_through);
+
+my $opt_pin;
+GetOptions('pin' => \$opt_pin);
 
 my $START_FILE = "$ENV{HOME}/.xpra-start";
 my $CONFIG_DIR = "$ENV{HOME}/.config/xpra-helper";
@@ -409,7 +413,7 @@ sub chooser {
                       ->pack(-side => 'left', -padx => [4, 0],
                              -fill => 'x', -expand => 1);
 
-    my $pin = 0;
+    my $pin = $opt_pin ? 1 : 0;
     my $save_sticky = 0;
     $mw->Checkbutton(
         -text     => 'Remember as default for this URL kind',
