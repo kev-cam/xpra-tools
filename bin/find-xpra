@@ -1922,12 +1922,14 @@ for my $s (@sessions) {
     # lists when the async HTML5-port probe (below) finds xpra-web open.
     my @ACTIONS_DETACHED = $sess->{kind} eq 'vnc'
         ? ('Attach', '---', 'Apps', 'Settings')
-        : ('Attach', 'Restart app', 'Restart Xpra', 'Restart Xpra with web',
+        : ('Attach', 'Connect as VNC',
+           'Restart app', 'Restart Xpra', 'Restart Xpra with web',
            '---', 'Helper', 'Apps', 'Settings');
     my @ACTIONS_ATTACHED = $sess->{kind} eq 'vnc'
         ? ('Disconnect', 'Force kill', 'KILL',
            '---', 'Apps', 'Settings')
         : ('Disconnect', 'Force kill', 'KILL', 'Terminal',
+           'Connect as VNC',
            'Restart app', 'Restart Xpra', 'Restart Xpra with web',
            '---', 'Helper', 'Apps', 'Settings');
     my $action = 'Attach';
@@ -1984,6 +1986,13 @@ for my $s (@sessions) {
     my $go_btn = $mw->Button(-text => "\x{25B6}",
         -command => sub {
             my $picked = $action;
+            if ($picked eq 'Connect as VNC') {
+                _keys_ensure() unless $sess->{local};
+                my $pid = spawn_attach(_vnc_attach_cmd($sess));
+                $sess->{pid} = $pid;
+                $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
+                return;
+            }
             if ($picked eq 'Attach') {
                 _keys_ensure() unless $sess->{local};
                 my $pid = spawn_attach(
