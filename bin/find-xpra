@@ -1088,9 +1088,8 @@ for my $c (@candidates) {
                         if ($ps_cmd =~ /-rfbport\s+(\d+)/) { $port = $1 }
                         $port //= 5900 + ($disp_n // 0) if defined $disp_n;
                         $disp_n //= ($port - 5900) if defined $port && $port >= 5900;
-                        next unless defined $disp_n;
                         print { $pipe } join("\t", '__psvnc__', $c->{name},
-                                             $disp_n, $port // '', $ps_user), "\n";
+                                             $disp_n // '', $port // '', $ps_user), "\n";
                     }
                     next;
                 }
@@ -1152,6 +1151,7 @@ my %xpra_listed;     # "$host\t$disp" -> 1 (display reported by `xpra list`)
 my %vnc_ports;       # "$host\t$disp_n" -> port (VNC port from ss/netstat)
 my %any_displays;    # "$host\t$disp_n" -> user (from /tmp/.X11-unix stat)
 my @psvnc;           # [{host, disp_n, port, user}, ...] (from ps VNC scan)
+my %vnc_users;       # "$host\t$user" -> 1 (users running a VNC server)
 my %remote_id;       # candidate-name -> machine-id (from `show-x11 -id`)
 my %remote_host;     # candidate-name -> remote `hostname`
 my %xs_for_host;     # candidate-name -> [ {disp_n, cmd}, ... ]
@@ -1182,9 +1182,12 @@ while ($sel->count) {
                 $any_displays{"$1\t$2"} = $3;
             } elsif ($line =~ /^__psvnc__\t/) {
                 my @f = split /\t/, $line;
-                push @psvnc, { host => $f[1], disp_n => $f[2]+0,
-                               port => (length $f[3] ? $f[3]+0 : undef),
-                               user => $f[4] };
+                if (length $f[2]) {
+                    push @psvnc, { host => $f[1], disp_n => $f[2]+0,
+                                   port => (length $f[3] ? $f[3]+0 : undef),
+                                   user => $f[4] };
+                }
+                $vnc_users{"$f[1]\t$f[4]"} = 1 if defined $f[4];
             } else {
                 my @f = split /\t/, $line, 5;
                 push @rows, \@f if @f == 5;
@@ -1302,13 +1305,21 @@ for my $key (keys %any_displays) {
     my $disp = ":$disp_n";
     my $sess_key = "$host\t$disp";
     my $owner = $any_displays{$key};
+    my $is_vnc = $vnc_users{"$host\t$owner"} ? 1 : 0;
     if (my $existing = $by_session{$sess_key}) {
         $existing->{user} = $owner;
+        if ($is_vnc) {
+            $existing->{kind} = 'vnc' unless $existing->{kind} eq 'xpra';
+            $existing->{vnc_port} //= 5900 + $disp_n;
+        }
         next;
     }
-    my $kind_default = ($disp_n >= 20) ? 'xpra' : 'X';
+    my $kind_default = $is_vnc       ? 'vnc'
+                     : $disp_n >= 20 ? 'xpra'
+                     :                 'X';
     $by_session{$sess_key} = { host=>$host, disp=>$disp, user=>$owner,
-                               cmds=>[], procs=>[], n=>0, kind=>$kind_default };
+                               cmds=>[], procs=>[], n=>0, kind=>$kind_default,
+                               ($is_vnc ? (vnc_port => 5900 + $disp_n) : ()) };
 }
 for my $v (@psvnc) {
     my $disp = ":$v->{disp_n}";
