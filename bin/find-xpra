@@ -2352,7 +2352,7 @@ sub _vnc_attach_cmd {
                 . " QT_SCALE_FACTOR=$scale ";
     }
     if ($s->{local}) {
-        return (@env, 'vncviewer', "localhost:$disp_n");
+        return (@env, 'net-vnc', "localhost:$disp_n");
     }
     my $name = $s->{host};
     my $ip   = $s->{ip};
@@ -2364,7 +2364,7 @@ sub _vnc_attach_cmd {
                         '-L', "$local_port:localhost:$port", '-N'));
     $env_sh //= '';
     my $script = "$ssh_str & VNC_SSH=\$!; sleep 1; "
-               . "${env_sh}vncviewer localhost::$local_port; "
+               . "${env_sh}net-vnc localhost::$local_port; "
                . "kill \$VNC_SSH 2>/dev/null";
     return ('bash', '-c', $script);
 }
