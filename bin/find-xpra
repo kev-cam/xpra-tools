@@ -1509,7 +1509,7 @@ my $mw = _tk_mw();
 _dbg("[debug] parent: MainWindow created");
 $mw->title('find-xpra: attach to X11 session');
 $mw->deiconify;
-my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '', '', '', '');
+my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '', '');
 
 # Rescan: re-exec self with the same args.  Discovery runs again and the
 # UI rebuilds.  In-flight xpra-attach children are setsid'd so they
@@ -1564,12 +1564,6 @@ for my $s (@sessions) {
            ->grid(-row => $r, -column => $c, -sticky => 'ew');
     }
     my $sess = $s;     # closure capture
-    $mw->Button(-text => 'Apps',
-                -command => sub { _show_procs($sess) })
-       ->grid(-row => $r, -column => 5, -padx => 6, -pady => 1, -sticky => 'ew');
-    $mw->Button(-text => 'Settings',
-                -command => sub { _show_settings($sess) })
-       ->grid(-row => $r, -column => 6, -padx => 6, -pady => 1, -sticky => 'ew');
     # Action menu + Go button.  The dropdown reflects what's possible for
     # the session's current state — Attach when detached; Disconnect /
     # Force kill / KILL / Terminal when an xpra-attach child is alive
@@ -1577,12 +1571,15 @@ for my $s (@sessions) {
     # offered it before attaching).  "Attach Browser" is appended to both
     # lists when the async HTML5-port probe (below) finds xpra-web open.
     my @ACTIONS_DETACHED = $sess->{kind} eq 'vnc'
-        ? ('Attach')
-        : ('Attach', 'Restart app', 'Restart Xpra', 'Restart Xpra with web');
+        ? ('Attach', '---', 'Apps', 'Settings')
+        : ('Attach', 'Restart app', 'Restart Xpra', 'Restart Xpra with web',
+           '---', 'Apps', 'Settings');
     my @ACTIONS_ATTACHED = $sess->{kind} eq 'vnc'
-        ? ('Disconnect', 'Force kill', 'KILL')
+        ? ('Disconnect', 'Force kill', 'KILL',
+           '---', 'Apps', 'Settings')
         : ('Disconnect', 'Force kill', 'KILL', 'Terminal',
-           'Restart app', 'Restart Xpra', 'Restart Xpra with web');
+           'Restart app', 'Restart Xpra', 'Restart Xpra with web',
+           '---', 'Apps', 'Settings');
     my $action = 'Attach';
     my $current_opts = \@ACTIONS_DETACHED;
     # Default-action helper: the menu reverts to this after any Go click
@@ -1601,6 +1598,10 @@ for my $s (@sessions) {
         $current_opts = $opts if defined $opts;
         $action_menu->delete(0, 'end');
         for my $o (@$current_opts) {
+            if ($o eq '---') {
+                $action_menu->add('separator');
+                next;
+            }
             my $val = $o;
             $action_menu->add('command', -label => $o,
                               -command => sub { $action = $val });
@@ -1652,6 +1653,12 @@ for my $s (@sessions) {
                 _keys_ensure() unless $sess->{local};
                 spawn_detached(_term_cmd($sess));
             }
+            elsif ($picked eq 'Apps') {
+                _show_procs($sess);
+            }
+            elsif ($picked eq 'Settings') {
+                _show_settings($sess);
+            }
             elsif ($picked eq 'Restart app'
                 || $picked eq 'Restart Xpra'
                 || $picked eq 'Restart Xpra with web') {
@@ -1689,8 +1696,8 @@ for my $s (@sessions) {
             # if a kill succeeded.
             $action = $default_action->();
         });
-    $action_mb->grid(-row => $r, -column => 7, -padx => 6, -pady => 1, -sticky => 'ew');
-    $go_btn   ->grid(-row => $r, -column => 8, -padx => 6, -pady => 1, -sticky => 'ew');
+    $action_mb->grid(-row => $r, -column => 5, -padx => 6, -pady => 1, -sticky => 'ew');
+    $go_btn   ->grid(-row => $r, -column => 6, -padx => 6, -pady => 1, -sticky => 'ew');
     # Called by the html port-probe fileevent when xpra-web is reachable.
     # Mutates the action lists in place so future state flips also offer
     # the browser action; refreshes the visible menu without disturbing
@@ -1842,6 +1849,15 @@ sub _show_settings {
     $top->Entry(-textvariable => \$host_dpi, -width => 8, -justify => 'right')
         ->pack(-anchor => 'w', -padx => 30);
 
+    # VNC zoom factor — percentage applied via FLTK_SCALING_FACTOR /
+    # GDK_DPI_SCALE / QT_SCALE_FACTOR when launching vncviewer.
+    $top->Label(-text => "VNC zoom % for $host (blank = 100%):",
+                -font => 'sans-serif 11 bold')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [10, 6]);
+    my $host_zoom = $SETTINGS->{$host}{vnc_zoom} // '';
+    $top->Entry(-textvariable => \$host_zoom, -width => 8, -justify => 'right')
+        ->pack(-anchor => 'w', -padx => 30);
+
     my $btns = $top->Frame->pack(-pady => 10);
     $btns->Button(-text => 'Save', -command => sub {
         $SETTINGS->{$host}{terminal} = $sel;
@@ -1850,6 +1866,12 @@ sub _show_settings {
             $SETTINGS->{$host}{dpi} = $host_dpi + 0;
         } else {
             delete $SETTINGS->{$host}{dpi};
+        }
+        $host_zoom =~ s/^\s+|\s+$//g;
+        if (length $host_zoom && $host_zoom =~ /^\d+$/ && $host_zoom != 100) {
+            $SETTINGS->{$host}{vnc_zoom} = $host_zoom + 0;
+        } else {
+            delete $SETTINGS->{$host}{vnc_zoom};
         }
         _save_settings($SETTINGS);
         $top->destroy;
@@ -1954,8 +1976,16 @@ sub _vnc_attach_cmd {
     my ($s) = @_;
     (my $disp_n = $s->{disp}) =~ s/^://;
     my $port = $s->{vnc_port} // (5900 + $disp_n);
+    my (@env, $env_sh);
+    if (defined(my $zoom = _zoom_for($s->{host}))) {
+        my $scale = sprintf("%.2f", $zoom / 100);
+        @env = ('env', "FLTK_SCALING_FACTOR=$scale",
+                "GDK_DPI_SCALE=$scale", "QT_SCALE_FACTOR=$scale");
+        $env_sh = "FLTK_SCALING_FACTOR=$scale GDK_DPI_SCALE=$scale"
+                . " QT_SCALE_FACTOR=$scale ";
+    }
     if ($s->{local}) {
-        return ('vncviewer', "localhost:$disp_n");
+        return (@env, 'vncviewer', "localhost:$disp_n");
     }
     my $name = $s->{host};
     my $ip   = $s->{ip};
@@ -1965,8 +1995,9 @@ sub _vnc_attach_cmd {
     my $ssh_str = join(' ', map { /[\s'"]/ ? "'$_'" : $_ }
                        ('ssh', @sopts, @tgt,
                         '-L', "$local_port:localhost:$port", '-N'));
+    $env_sh //= '';
     my $script = "$ssh_str & VNC_SSH=\$!; sleep 1; "
-               . "vncviewer localhost::$local_port; "
+               . "${env_sh}vncviewer localhost::$local_port; "
                . "kill \$VNC_SSH 2>/dev/null";
     return ('bash', '-c', $script);
 }
@@ -2058,6 +2089,13 @@ sub _dpi_for {
     my $dpi = $SETTINGS->{$host}{dpi} // $SETTINGS->{'*'}{dpi};
     return undef unless defined $dpi && $dpi =~ /^\d+$/ && $dpi > 0;
     return $dpi + 0;
+}
+
+sub _zoom_for {
+    my ($host) = @_;
+    my $zoom = $SETTINGS->{$host}{vnc_zoom} // $SETTINGS->{'*'}{vnc_zoom};
+    return undef unless defined $zoom && $zoom =~ /^\d+$/ && $zoom > 0 && $zoom != 100;
+    return $zoom + 0;
 }
 
 sub _term_cmd {
