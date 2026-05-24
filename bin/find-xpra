@@ -1565,6 +1565,144 @@ for my $host (keys %xs_for_host) {
     push @sessions, @new;
 }
 
+# --- probe other users' ~/.xpra-start (--any) --------------------------------
+# SSH as each other user to grab their intended-sessions file, then merge
+# into @sessions.  Blue = running, grey = not running.
+if ($any) {
+    my $own_user = $ssh_user // $ENV{USER} // '';
+    my %to_probe;
+    for my $s (@sessions) {
+        next unless defined $s->{user} && length $s->{user};
+        next if $s->{user} eq $own_user;
+        next if $s->{kind} eq 'vnc';
+        $to_probe{"$s->{host}\t$s->{user}"} //= {
+            host => $s->{host}, user => $s->{user},
+            ip => $s->{ip}, local => $s->{local},
+        };
+    }
+    if (%to_probe) {
+        _keys_ensure();
+        my $sel2 = IO::Select->new;
+        my %pid2;
+        for my $key (keys %to_probe) {
+            my $info = $to_probe{$key};
+            my $pipe = IO::Pipe->new;
+            my $pid  = fork;
+            die "fork: $!" unless defined $pid;
+            if (!$pid) {
+                $pipe->writer;
+                $pipe->autoflush(1);
+                open STDERR, '>', '/dev/null' unless $debug;
+                POSIX::setsid();
+                open STDIN, '<', '/dev/null';
+                $SIG{ALRM} = sub { POSIX::_exit(1) };
+                alarm(10);
+                my @sopts = (
+                    '-o', "ConnectTimeout=$ssh_to",
+                    '-o', 'StrictHostKeyChecking=accept-new',
+                    '-o', 'ServerAliveInterval=3',
+                    '-o', 'ServerAliveCountMax=2',
+                );
+                my $ukey = $SETTINGS->{_user_keys}{$info->{user}};
+                push @sopts, '-i', $ukey if defined $ukey && length $ukey;
+                if ($no_prompt) {
+                    push @sopts, '-o', 'BatchMode=yes',
+                        '-o', 'NumberOfPasswordPrompts=0',
+                        '-o', 'PreferredAuthentications=publickey';
+                }
+                my $login = "$info->{user}\@$info->{host}";
+                if (defined $info->{ip} && $info->{ip} ne $info->{host}) {
+                    push @sopts, '-o', "HostName=$info->{ip}";
+                }
+                my @cmd = ('ssh', @sopts, $login, 'cat ~/.xpra-start');
+                _dbg("[debug] xs-other: ", join(' ', @cmd));
+                if (open my $oh, '-|', @cmd) {
+                    while (<$oh>) {
+                        chomp;
+                        (my $l = $_) =~ s/#.*//;
+                        next if $l =~ /^\s*$/;
+                        if ($l =~ /^\s*:?(\d+)\s*:\s*(\S.*?)\s*$/) {
+                            print {$pipe} join("\t",
+                                $info->{host}, $info->{user}, $1, $2), "\n";
+                        }
+                    }
+                    close $oh;
+                }
+                POSIX::_exit(0);
+            }
+            $pipe->reader;
+            $sel2->add($pipe);
+            $pid2{$pid} = $pipe;
+        }
+        my %xs_other;
+        my %buf2;
+        my $deadline2 = time + 10;
+        while ($sel2->count) {
+            my $remain = $deadline2 - time;
+            last if $remain <= 0;
+            my @ready = $sel2->can_read($remain);
+            last unless @ready;
+            for my $h (@ready) {
+                my $n = sysread($h, my $chunk, 4096);
+                if (!$n) { $sel2->remove($h); close $h; next }
+                $buf2{0+$h} .= $chunk;
+                while ($buf2{0+$h} =~ s/^([^\n]*)\n//) {
+                    my ($host, $xu, $dn, $cmd) = split /\t/, $1, 4;
+                    push @{ $xs_other{"$host\t$xu"} },
+                        { disp_n => $dn + 0, cmd => $cmd };
+                }
+            }
+        }
+        for my $pid (keys %pid2) {
+            kill 'TERM', $pid if waitpid($pid, POSIX::WNOHANG()) == 0;
+        }
+        my $kd = time + 1;
+        for my $pid (keys %pid2) {
+            while (waitpid($pid, POSIX::WNOHANG()) == 0 && time < $kd) {
+                select undef, undef, undef, 0.05;
+            }
+            kill('KILL', $pid), waitpid($pid, 0)
+                if waitpid($pid, POSIX::WNOHANG()) == 0;
+        }
+        _dbg("[debug] xs-other: " . scalar(keys %xs_other) . " users responded");
+
+        my %existing_disp;
+        for my $s (@sessions) {
+            $existing_disp{"$s->{host}\t$s->{disp_n}"} = $s;
+        }
+        for my $key (keys %xs_other) {
+            my ($host, $xu) = split /\t/, $key, 2;
+            for my $e (@{ $xs_other{$key} }) {
+                my $dk = "$host\t$e->{disp_n}";
+                my $existing = $existing_disp{$dk};
+                my $running = $existing ? 1 : 0;
+                my $s = $existing // {
+                    host    => $host,
+                    disp    => ":$e->{disp_n}",
+                    disp_n  => $e->{disp_n},
+                    kind    => 'xpra',
+                    user    => $xu,
+                    n       => 0,
+                    cmds    => [],
+                    procs   => [],
+                    local   => $local_for_name{$host} ? 1 : 0,
+                    ip      => $ip_for_name{$host},
+                };
+                $s->{apps}            = $e->{cmd};
+                $s->{_xs_cmd}         = $e->{cmd};
+                $s->{_xs_running}     = $running;
+                $s->{_xs_other_user}  = 1;
+                $s->{_attach_as}      = $xu;
+                $s->{user}            = $xu;
+                unless ($existing) {
+                    push @sessions, $s;
+                    $existing_disp{$dk} = $s;
+                }
+            }
+        }
+    }
+}
+
 @sessions = sort {
        ($b->{local}//0) <=> ($a->{local}//0)
     || $a->{host} cmp $b->{host}
@@ -1765,7 +1903,11 @@ for my $s (@sessions) {
     # otherwise.  Plain detected sessions stay the default colour.
     my %fg;
     if (defined $s->{_xs_cmd}) {
-        %fg = (-foreground => $s->{_xs_running} ? '#0a7d10' : '#c00000');
+        if ($s->{_xs_other_user}) {
+            %fg = (-foreground => $s->{_xs_running} ? '#0055cc' : '#808080');
+        } else {
+            %fg = (-foreground => $s->{_xs_running} ? '#0a7d10' : '#c00000');
+        }
     }
     for my $c (0 .. $#vals) {
         $mw->Label(-text => $vals[$c], -anchor => 'w', -padx => 6, %fg)
