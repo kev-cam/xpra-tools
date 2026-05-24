@@ -1043,12 +1043,7 @@ for my $c (@candidates) {
                    . 'echo __XSTART__; cat ~/.xpra-start; '
                    . 'echo __VNC__; (ss -tln 2>/dev/null || netstat -tln 2>/dev/null); '
                    . 'echo __PSVNC__; ps -eo user,pid,args';
-        $remote .= q{; echo __DISPLAYS__; }
-                 . q{for f in /tmp/.X11-unix/X*; do }
-                 . q{n=${f##*X}; u=$(stat -c %U "$f" 2>/dev/null); }
-                 . q{p=$(cat "/tmp/.X${n}-lock" 2>/dev/null | tr -dc 0-9); }
-                 . q{c=$(cat "/proc/$p/comm" 2>/dev/null); }
-                 . q{echo "$n $u $c"; done}
+        $remote .= q{; echo __DISPLAYS__; stat -c '%n %U' /tmp/.X11-unix/X*}
             if $any;
         my @cmd = $c->{local}
             ? ('sh', '-c', $remote)
@@ -1099,13 +1094,9 @@ for my $c (@candidates) {
                     next;
                 }
                 if ($in_disps) {
-                    # "N USER COMM" from the for-loop: display number,
-                    # socket owner, and X server process name (if readable).
-                    if ($line =~ /^(\d+)\s+(\S+)(?:\s+(\S*))?/) {
-                        my ($dn, $owner, $comm) = ($1, $2, $3 // '');
-                        my $is_vnc = ($comm =~ /vnc/i) ? 1 : 0;
-                        print { $pipe } join("\t", '__disp__', $c->{name},
-                                             $dn, $owner, $is_vnc), "\n";
+                    # stat -c '%n %U' output: /tmp/.X11-unix/X20 claude
+                    if ($line =~ /X(\d+)\s+(\S+)/) {
+                        print { $pipe } join("\t", '__disp__', $c->{name}, $1, $2), "\n";
                     }
                     next;
                 }
@@ -1158,7 +1149,7 @@ for my $c (@candidates) {
 my @rows;
 my %xpra_listed;     # "$host\t$disp" -> 1 (display reported by `xpra list`)
 my %vnc_ports;       # "$host\t$disp_n" -> port (VNC port from ss/netstat)
-my %any_displays;    # "$host\t$disp_n" -> {user, is_vnc} (from display scan)
+my %any_displays;    # "$host\t$disp_n" -> user (from /tmp/.X11-unix stat)
 my @psvnc;           # [{host, disp_n, port, user}, ...] (from ps VNC scan)
 my %vnc_users;       # "$host\t$user" -> 1 (users running a VNC server)
 my %remote_id;       # candidate-name -> machine-id (from `show-x11 -id`)
@@ -1187,12 +1178,8 @@ while ($sel->count) {
                     { disp_n => $2 + 0, cmd => $3 };
             } elsif ($line =~ /^__vnc__\t([^\t]*)\t([^\t]*)\t([^\t]*)$/) {
                 $vnc_ports{"$1\t$2"} = $3 + 0;
-            } elsif ($line =~ /^__disp__\t/) {
-                my @f = split /\t/, $line;
-                $any_displays{"$f[1]\t$f[2]"} = {
-                    user   => $f[3],
-                    is_vnc => ($f[4] // 0) + 0,
-                };
+            } elsif ($line =~ /^__disp__\t([^\t]*)\t([^\t]*)\t([^\t]*)$/) {
+                $any_displays{"$1\t$2"} = $3;
             } elsif ($line =~ /^__psvnc__\t/) {
                 my @f = split /\t/, $line;
                 if (length $f[2]) {
@@ -1317,9 +1304,9 @@ for my $key (keys %any_displays) {
     my ($host, $disp_n) = split /\t/, $key, 2;
     my $disp = ":$disp_n";
     my $sess_key = "$host\t$disp";
-    my $info   = $any_displays{$key};
-    my $owner  = $info->{user};
-    my $is_vnc = $info->{is_vnc} || $vnc_users{"$host\t$owner"};
+    my $owner  = $any_displays{$key};
+    my $is_vnc = $vnc_ports{"$host\t$disp_n"}
+              || $vnc_users{"$host\t$owner"};
     if (my $existing = $by_session{$sess_key}) {
         $existing->{user} = $owner;
         if ($is_vnc) {
