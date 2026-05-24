@@ -1662,12 +1662,12 @@ for my $s (@sessions) {
                 if ($picked eq 'Disconnect') {
                     kill 'TERM', $pid;
                     $action = 'Force kill';
-                    $mw->after(500, sub {
+                    $mw->after(2000, sub {
                         return unless $sess->{pid} && $sess->{pid} == $pid;
                         kill 'TERM', -$pid;
                         kill 'TERM',  $pid;
                         $action = 'KILL';
-                        $mw->after(500, sub {
+                        $mw->after(2000, sub {
                             return unless $sess->{pid} && $sess->{pid} == $pid;
                             kill 'KILL', -$pid;
                             kill 'KILL',  $pid;
