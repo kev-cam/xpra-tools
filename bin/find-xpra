@@ -1352,7 +1352,9 @@ for my $key (keys %any_displays) {
         }
         next;
     }
-    my $kind_default = $is_vnc ? 'vnc' : 'xpra';
+    my $kind_default = $is_vnc      ? 'vnc'
+                     : $disp_n == 0 ? 'X'
+                     :                'xpra';
     $by_session{$sess_key} = { host=>$host, disp=>$disp, user=>$owner,
                                cmds=>[], procs=>[], n=>0, kind=>$kind_default,
                                ($is_vnc ? (vnc_port => 5900 + $disp_n) : ()) };
