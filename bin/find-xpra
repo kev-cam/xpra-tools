@@ -1041,7 +1041,8 @@ for my $c (@candidates) {
         # in both bourne-style and csh-style shells.
         my $remote = 'show-x11 -ns -id; echo __XPRA__; xpra list; '
                    . 'echo __XSTART__; cat ~/.xpra-start; '
-                   . 'echo __VNC__; (ss -tln 2>/dev/null || netstat -tln 2>/dev/null)';
+                   . 'echo __VNC__; (ss -tln 2>/dev/null || netstat -tln 2>/dev/null); '
+                   . 'echo __PSVNC__; ps -eo user,pid,args';
         $remote .= q{; echo __DISPLAYS__; stat -c '%n %U' /tmp/.X11-unix/X*}
             if $any;
         my @cmd = $c->{local}
@@ -1055,20 +1056,41 @@ for my $c (@candidates) {
             my $in_xstart = 0;
             my $in_vnc    = 0;
             my $in_disps  = 0;
+            my $in_psvnc  = 0;
             my %vnc_seen;
             while (defined(my $line = <$oh>)) {
                 chomp $line;
                 _dbg("[debug] $c->{name}> $line");
-                if ($line eq '__XPRA__')     { $in_xpra = 1; $in_xstart = 0; $in_vnc = 0; $in_disps = 0; next }
-                if ($line eq '__XSTART__')  { $in_xpra = 0; $in_xstart = 1; $in_vnc = 0; $in_disps = 0; next }
-                if ($line eq '__VNC__')     { $in_xpra = 0; $in_xstart = 0; $in_vnc = 1; $in_disps = 0; next }
-                if ($line eq '__DISPLAYS__'){ $in_xpra = 0; $in_xstart = 0; $in_vnc = 0; $in_disps = 1; next }
+                if ($line eq '__XPRA__')     { $in_xpra = 1; $in_xstart = 0; $in_vnc = 0; $in_disps = 0; $in_psvnc = 0; next }
+                if ($line eq '__XSTART__')  { $in_xpra = 0; $in_xstart = 1; $in_vnc = 0; $in_disps = 0; $in_psvnc = 0; next }
+                if ($line eq '__VNC__')     { $in_xpra = 0; $in_xstart = 0; $in_vnc = 1; $in_disps = 0; $in_psvnc = 0; next }
+                if ($line eq '__PSVNC__')   { $in_xpra = 0; $in_xstart = 0; $in_vnc = 0; $in_disps = 0; $in_psvnc = 1; next }
+                if ($line eq '__DISPLAYS__'){ $in_xpra = 0; $in_xstart = 0; $in_vnc = 0; $in_disps = 1; $in_psvnc = 0; next }
                 if ($in_vnc) {
                     if ($line =~ /:(\d+)\b/ && $1 >= 5900 && $1 <= 5999) {
                         my $port = $1 + 0;
                         next if $vnc_seen{$port}++;
                         my $disp_n = $port - 5900;
                         print { $pipe } join("\t", '__vnc__', $c->{name}, $disp_n, $port), "\n";
+                    }
+                    next;
+                }
+                if ($in_psvnc) {
+                    # ps -eo user,pid,args: match VNC server processes
+                    if ($line =~ /^\s*(\S+)\s+(\d+)\s+(.*\b(?:Xvnc|x11vnc|Xtigervnc|Xtightvnc|tigervncserver|vino-server|krfb)\b.*)$/) {
+                        my ($ps_user, $ps_pid, $ps_cmd) = ($1, $2, $3);
+                        # Extract display: Xvnc :N or -display :N
+                        my $disp_n;
+                        if ($ps_cmd =~ /(?:^|\s):(\d+)\b/) { $disp_n = $1 }
+                        elsif ($ps_cmd =~ /-display\s+:(\d+)/) { $disp_n = $1 }
+                        # Extract port: -rfbport N
+                        my $port;
+                        if ($ps_cmd =~ /-rfbport\s+(\d+)/) { $port = $1 }
+                        $port //= 5900 + ($disp_n // 0) if defined $disp_n;
+                        $disp_n //= ($port - 5900) if defined $port && $port >= 5900;
+                        next unless defined $disp_n;
+                        print { $pipe } join("\t", '__psvnc__', $c->{name},
+                                             $disp_n, $port // '', $ps_user), "\n";
                     }
                     next;
                 }
@@ -1129,6 +1151,7 @@ my @rows;
 my %xpra_listed;     # "$host\t$disp" -> 1 (display reported by `xpra list`)
 my %vnc_ports;       # "$host\t$disp_n" -> port (VNC port from ss/netstat)
 my %any_displays;    # "$host\t$disp_n" -> user (from /tmp/.X11-unix stat)
+my @psvnc;           # [{host, disp_n, port, user}, ...] (from ps VNC scan)
 my %remote_id;       # candidate-name -> machine-id (from `show-x11 -id`)
 my %remote_host;     # candidate-name -> remote `hostname`
 my %xs_for_host;     # candidate-name -> [ {disp_n, cmd}, ... ]
@@ -1157,6 +1180,11 @@ while ($sel->count) {
                 $vnc_ports{"$1\t$2"} = $3 + 0;
             } elsif ($line =~ /^__disp__\t([^\t]*)\t([^\t]*)\t([^\t]*)$/) {
                 $any_displays{"$1\t$2"} = $3;
+            } elsif ($line =~ /^__psvnc__\t/) {
+                my @f = split /\t/, $line;
+                push @psvnc, { host => $f[1], disp_n => $f[2]+0,
+                               port => (length $f[3] ? $f[3]+0 : undef),
+                               user => $f[4] };
             } else {
                 my @f = split /\t/, $line, 5;
                 push @rows, \@f if @f == 5;
@@ -1281,6 +1309,19 @@ for my $key (keys %any_displays) {
     my $kind_default = ($disp_n >= 20) ? 'xpra' : 'X';
     $by_session{$sess_key} = { host=>$host, disp=>$disp, user=>$owner,
                                cmds=>[], procs=>[], n=>0, kind=>$kind_default };
+}
+for my $v (@psvnc) {
+    my $disp = ":$v->{disp_n}";
+    my $sess_key = "$v->{host}\t$disp";
+    if (my $existing = $by_session{$sess_key}) {
+        $existing->{kind} = 'vnc' unless $existing->{kind} eq 'xpra';
+        $existing->{vnc_port} //= $v->{port} if defined $v->{port};
+        $existing->{user} = $v->{user} if defined $v->{user} && length $v->{user};
+        next;
+    }
+    $by_session{$sess_key} = { host=>$v->{host}, disp=>$disp, user=>$v->{user},
+                               cmds=>[], procs=>[], n=>0, kind=>'vnc',
+                               vnc_port=>$v->{port} };
 }
 for my $r (@rows) {
     my ($host, $disp, $pid, $user, $cmd) = @$r;
