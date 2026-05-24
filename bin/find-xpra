@@ -1579,9 +1579,16 @@ for my $host (keys %xs_for_host) {
 for my $s (@sessions) {
     next if defined $s->{_xs_cmd};
     my $main = _main_cmd(@{ $s->{cmds} });
+    my $own_user = $ssh_user // $ENV{USER} // '';
+    my $other_user = $any && defined $s->{user} && length $s->{user}
+                   && $s->{user} ne $own_user;
+    if ($other_user) {
+        $s->{_attach_as} = $s->{user};
+    }
     $s->{apps} = length $main           ? _fmt_cmd($main, 60)
                : $s->{xpra_listed}      ? '(empty xpra)'
                : $s->{kind} eq 'vnc'    ? '(vnc)'
+               : $other_user            ? '(login required)'
                :                          '(daemons only)';
 }
 
@@ -2168,7 +2175,9 @@ sub _attach_cmd {
     if (defined(my $dpi = _dpi_for($s->{host}))) {
         push @dpi_opts, "--dpi=$dpi";
     }
-    return (_xpra_bin(), 'attach', @dpi_opts, ":$disp_n") if $s->{local};
+    if ($s->{local} && !$s->{_attach_as}) {
+        return (_xpra_bin(), 'attach', @dpi_opts, ":$disp_n");
+    }
     # Use the host name in the ssh URL so ~/.ssh/config Host blocks (User,
     # IdentityFile, ...) match.  If we know the IP, force the actual
     # connection to it via xpra's --ssh override (`-o HostName=$ip`) so
@@ -2181,8 +2190,9 @@ sub _attach_cmd {
     } else {
         $name = $ip if defined $ip;
     }
-    my $url = defined $ssh_user
-        ? "ssh://$ssh_user\@$name/$disp_n"
+    my $login_user = $s->{_attach_as} // $ssh_user;
+    my $url = defined $login_user
+        ? "ssh://$login_user\@$name/$disp_n"
         : "ssh://$name/$disp_n";
     return (_xpra_bin(), 'attach', @opts, @dpi_opts, $url);
 }
