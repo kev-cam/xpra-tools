@@ -45,6 +45,7 @@ my $no_prompt;
 my $no_mount;
 my $ssh_key;
 my $debug;
+my $any;
 my $all;
 my $help;
 
@@ -62,6 +63,7 @@ GetOptions(
     'scan'       => \$scan,
     'pick'       => \$pick,
     'debug'      => \$debug,
+    'any'        => \$any,
     'a|all'      => \$all,
     'h|help'     => \$help,
 ) or die usage();
@@ -400,6 +402,9 @@ usage: find-xpra [options]
   --list                print rows to stdout instead of popping a chooser
   --no-local            skip local show-x11 probe; also skip our own IP
                         when scanning for net-mgr
+  --any                 show sessions belonging to all users, not just
+                        the ssh login user (discovers displays from
+                        /tmp/.X11-unix/ on each host)
   -a, --all             show everything otherwise hidden: displays under
                         :20 (presumed plain X), displays over :1000, and
                         sessions whose only contents are session plumbing
@@ -1037,6 +1042,8 @@ for my $c (@candidates) {
         my $remote = 'show-x11 -ns -id; echo __XPRA__; xpra list; '
                    . 'echo __XSTART__; cat ~/.xpra-start; '
                    . 'echo __VNC__; (ss -tln 2>/dev/null || netstat -tln 2>/dev/null)';
+        $remote .= q{; echo __DISPLAYS__; stat -c '%n %U' /tmp/.X11-unix/X*}
+            if $any;
         my @cmd = $c->{local}
             ? ('sh', '-c', $remote)
             : ('ssh', ssh_opts(), ssh_target($c), $remote);
@@ -1047,19 +1054,28 @@ for my $c (@candidates) {
             my $in_xpra   = 0;
             my $in_xstart = 0;
             my $in_vnc    = 0;
+            my $in_disps  = 0;
             my %vnc_seen;
             while (defined(my $line = <$oh>)) {
                 chomp $line;
                 _dbg("[debug] $c->{name}> $line");
-                if ($line eq '__XPRA__')   { $in_xpra = 1; $in_xstart = 0; $in_vnc = 0; next }
-                if ($line eq '__XSTART__') { $in_xpra = 0; $in_xstart = 1; $in_vnc = 0; next }
-                if ($line eq '__VNC__')    { $in_xpra = 0; $in_xstart = 0; $in_vnc = 1; next }
+                if ($line eq '__XPRA__')     { $in_xpra = 1; $in_xstart = 0; $in_vnc = 0; $in_disps = 0; next }
+                if ($line eq '__XSTART__')  { $in_xpra = 0; $in_xstart = 1; $in_vnc = 0; $in_disps = 0; next }
+                if ($line eq '__VNC__')     { $in_xpra = 0; $in_xstart = 0; $in_vnc = 1; $in_disps = 0; next }
+                if ($line eq '__DISPLAYS__'){ $in_xpra = 0; $in_xstart = 0; $in_vnc = 0; $in_disps = 1; next }
                 if ($in_vnc) {
                     if ($line =~ /:(\d+)\b/ && $1 >= 5900 && $1 <= 5999) {
                         my $port = $1 + 0;
                         next if $vnc_seen{$port}++;
                         my $disp_n = $port - 5900;
                         print { $pipe } join("\t", '__vnc__', $c->{name}, $disp_n, $port), "\n";
+                    }
+                    next;
+                }
+                if ($in_disps) {
+                    # stat -c '%n %U' output: /tmp/.X11-unix/X20 claude
+                    if ($line =~ /X(\d+)\s+(\S+)/) {
+                        print { $pipe } join("\t", '__disp__', $c->{name}, $1, $2), "\n";
                     }
                     next;
                 }
@@ -1112,6 +1128,7 @@ for my $c (@candidates) {
 my @rows;
 my %xpra_listed;     # "$host\t$disp" -> 1 (display reported by `xpra list`)
 my %vnc_ports;       # "$host\t$disp_n" -> port (VNC port from ss/netstat)
+my %any_displays;    # "$host\t$disp_n" -> user (from /tmp/.X11-unix stat)
 my %remote_id;       # candidate-name -> machine-id (from `show-x11 -id`)
 my %remote_host;     # candidate-name -> remote `hostname`
 my %xs_for_host;     # candidate-name -> [ {disp_n, cmd}, ... ]
@@ -1138,6 +1155,8 @@ while ($sel->count) {
                     { disp_n => $2 + 0, cmd => $3 };
             } elsif ($line =~ /^__vnc__\t([^\t]*)\t([^\t]*)\t([^\t]*)$/) {
                 $vnc_ports{"$1\t$2"} = $3 + 0;
+            } elsif ($line =~ /^__disp__\t([^\t]*)\t([^\t]*)\t([^\t]*)$/) {
+                $any_displays{"$1\t$2"} = $3;
             } else {
                 my @f = split /\t/, $line, 5;
                 push @rows, \@f if @f == 5;
@@ -1245,6 +1264,16 @@ for my $key (keys %vnc_ports) {
     $by_session{$sess_key} = { host=>$host, disp=>$disp, user=>$user_seed,
                                cmds=>[], procs=>[], n=>0, kind=>'vnc',
                                vnc_port=>$vnc_ports{$key} };
+}
+for my $key (keys %any_displays) {
+    my ($host, $disp_n) = split /\t/, $key, 2;
+    my $disp = ":$disp_n";
+    my $sess_key = "$host\t$disp";
+    next if $by_session{$sess_key};
+    my $owner = $any_displays{$key};
+    my $kind_default = ($disp_n >= 20) ? 'xpra' : 'X';
+    $by_session{$sess_key} = { host=>$host, disp=>$disp, user=>$owner,
+                               cmds=>[], procs=>[], n=>0, kind=>$kind_default };
 }
 for my $r (@rows) {
     my ($host, $disp, $pid, $user, $cmd) = @$r;
@@ -1365,7 +1394,7 @@ unless ($all) {
         || (defined $_->{disp_n} && $_->{disp_n} >= 20 && $_->{disp_n} <= 1000)
     } @sessions;
 }
-if (defined $user) {
+if (defined $user && !$any) {
     @sessions = grep { defined $_->{user} && $_->{user} eq $user } @sessions;
 }
 
