@@ -2783,7 +2783,14 @@ sub _vnc_direct_cmd {
         @env = ('env', "FLTK_SCALING_FACTOR=$scale",
                 "GDK_DPI_SCALE=$scale", "QT_SCALE_FACTOR=$scale");
     }
-    my $target = $s->{ip} // $s->{host};
+    # Prefer a numeric IP so we don't depend on DNS or net-lookup.
+    my $target;
+    for my $t ($s->{ip}, $s->{host}) {
+        if (defined $t && $t =~ /^\d+\.\d+\.\d+\.\d+$/) {
+            $target = $t; last;
+        }
+    }
+    $target //= $s->{ip} // $s->{host};
     return (@env, 'net-vnc', "$target:$disp_n");
 }
 
