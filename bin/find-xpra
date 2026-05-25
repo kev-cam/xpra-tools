@@ -2407,6 +2407,11 @@ sub _render_row {
     my $set_actions = sub {
         my ($opts, $default) = @_;
         $current_opts = $opts if defined $opts;
+        my %immediate = (
+            Settings => sub { _show_settings($sess) },
+            Apps     => sub { _show_procs($sess) },
+            Edit     => sub { _edit_extra_host($sess) },
+        );
         $action_menu->delete(0, 'end');
         for my $o (@$current_opts) {
             if ($o eq '---') {
@@ -2414,8 +2419,13 @@ sub _render_row {
                 next;
             }
             my $val = $o;
-            $action_menu->add('command', -label => $o,
-                              -command => sub { $action = $val });
+            if (my $cb = $immediate{$val}) {
+                $action_menu->add('command', -label => $o,
+                    -command => $cb);
+            } else {
+                $action_menu->add('command', -label => $o,
+                    -command => sub { $action = $val });
+            }
         }
         if (defined $default) {
             $action = $default;
