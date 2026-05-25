@@ -2671,7 +2671,8 @@ sub _vnc_attach_cmd {
                        ('ssh', @sopts, @tgt,
                         '-L', "$local_port:localhost:$port", '-N'));
     $env_sh //= '';
-    my $script = "$ssh_str & VNC_SSH=\$!; sleep 1; "
+    my $script = "trap 'kill 0' TERM; "
+               . "$ssh_str & VNC_SSH=\$!; sleep 1; "
                . "${env_sh}net-vnc localhost::$local_port; "
                . "kill \$VNC_SSH 2>/dev/null";
     return ('bash', '-c', $script);
@@ -2700,7 +2701,8 @@ sub _x11vnc_cmd {
     my $ssh_str = join(' ', map { /[\s'"]/ ? "'$_'" : $_ }
                        ('ssh', @sopts, @tgt,
                         '-L', "$local_port:localhost:$rfb_port"));
-    my $script = "$ssh_str "
+    my $script = "trap 'kill 0' TERM; "
+               . "$ssh_str "
                . "'x11vnc -display :$disp_n -rfbport $rfb_port -nopw -once' "
                . "& X11VNC_SSH=\$!; sleep 2; "
                . "${env_sh}net-vnc localhost::$local_port; "
