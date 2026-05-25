@@ -594,10 +594,16 @@ for my $h (@extra_hosts) {
 }
 for my $h (@{ $SETTINGS->{_extra_hosts} // [] }) {
     my ($n, $ip) = ($h->{name}, $h->{ip});
-    next if grep { ($_->{name} // '') eq $n || ($_->{ip} // '') eq $ip } @candidates;
-    push @candidates, { name => $n, ip => $ip, _extra => 1,
-                        (defined $h->{user} ? (ssh_user => $h->{user}) : ()),
-                        (defined $h->{disp} ? (_disp => $h->{disp})   : ()) };
+    my ($existing) = grep { ($_->{name} // '') eq $n || ($_->{ip} // '') eq $ip } @candidates;
+    if ($existing) {
+        $existing->{_extra}   = 1;
+        $existing->{ssh_user} = $h->{user} if defined $h->{user};
+        $existing->{_disp}    = $h->{disp} if defined $h->{disp};
+    } else {
+        push @candidates, { name => $n, ip => $ip, _extra => 1,
+                            (defined $h->{user} ? (ssh_user => $h->{user}) : ()),
+                            (defined $h->{disp} ? (_disp => $h->{disp})   : ()) };
+    }
 }
 
 if ($no_local) {
@@ -1901,28 +1907,31 @@ sub _scan_attached {
 my $mw;
 
 sub _ask_host {
-    my ($parent) = @_;
-    my $dlg = $parent->Toplevel(-title => 'Add host');
+    my ($parent, $defaults) = @_;
+    $defaults //= {};
+    my $title = defined $defaults->{name} ? 'Edit host' : 'Add host';
+    my $dlg = $parent->Toplevel(-title => $title);
     $dlg->transient($parent);
     $dlg->grab;
     $dlg->Label(-text => 'Hostname:')->pack(-padx => 8, -pady => [8,2]);
-    my $name_val = '';
+    my $name_val = $defaults->{name} // '';
     my $name_e = $dlg->Entry(-textvariable => \$name_val, -width => 30);
     $name_e->pack(-padx => 8);
     $name_e->focus;
     $dlg->Label(-text => 'IP (optional if hostname resolves):')
         ->pack(-padx => 8, -pady => [6,2]);
-    my $ip_val = '';
+    my $ip_val = $defaults->{ip} // '';
+    $ip_val = '' if $ip_val eq $name_val;
     my $ip_e = $dlg->Entry(-textvariable => \$ip_val, -width => 30);
     $ip_e->pack(-padx => 8);
     $dlg->Label(-text => 'User (optional):')
         ->pack(-padx => 8, -pady => [6,2]);
-    my $user_val = '';
+    my $user_val = $defaults->{user} // '';
     my $user_e = $dlg->Entry(-textvariable => \$user_val, -width => 30);
     $user_e->pack(-padx => 8);
     $dlg->Label(-text => 'Display (optional, e.g. 0, 2):')
         ->pack(-padx => 8, -pady => [6,2]);
-    my $disp_val = '';
+    my $disp_val = defined $defaults->{disp} ? $defaults->{disp} : '';
     my $disp_e = $dlg->Entry(-textvariable => \$disp_val, -width => 30);
     $disp_e->pack(-padx => 8);
     my $err_msg = '';
@@ -1988,9 +1997,22 @@ sub _remove_extra_host {
     @sessions = @keep;
 }
 
+sub _edit_extra_host {
+    my ($sess) = @_;
+    my $old_host = $sess->{host};
+    my $old_ip   = $sess->{ip} // '';
+    my $extras = $SETTINGS->{_extra_hosts} // [];
+    my ($cur) = grep { $_->{name} eq $old_host || $_->{ip} eq $old_ip } @$extras;
+    $cur //= { name => $old_host, ip => $old_ip };
+    my $h = _ask_host($mw, $cur);
+    return unless defined $h;
+    _remove_extra_host($old_host);
+    _add_host_probe($mw, $h);
+}
+
 sub _add_host_probe {
-    my ($parent) = @_;
-    my $h = _ask_host($parent);
+    my ($parent, $prefilled) = @_;
+    my $h = $prefilled // _ask_host($parent);
     return unless defined $h;
     my $host      = $h->{name};
     my $host_ip   = $h->{ip};
@@ -2365,8 +2387,8 @@ sub _render_row {
            'Restart app', 'Restart Xpra', 'Restart Xpra with web',
            '---', 'SSH', 'Helper', 'Apps', 'Settings');
     if ($sess->{_extra}) {
-        push @ACTIONS_DETACHED, '---', 'Remove';
-        push @ACTIONS_ATTACHED, '---', 'Remove';
+        push @ACTIONS_DETACHED, '---', 'Edit', 'Remove';
+        push @ACTIONS_ATTACHED, '---', 'Edit', 'Remove';
     }
     my $detached_default = $sess->{kind} eq 'X' ? 'Secure VNC' : 'Attach';
     my $action = $detached_default;
@@ -2456,6 +2478,10 @@ sub _render_row {
             }
             elsif ($picked eq 'Helper') {
                 spawn_detached('xpra-helper', '--pin');
+            }
+            elsif ($picked eq 'Edit') {
+                _edit_extra_host($sess);
+                return;
             }
             elsif ($picked eq 'Remove') {
                 _remove_extra_host($sess->{host});
