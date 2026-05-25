@@ -1782,6 +1782,11 @@ for my $s (@sessions) {
                : $other_user            ? '(login required)'
                :                          '(daemons only)';
 }
+# Apply per-host SSH user overrides from Settings.
+for my $s (@sessions) {
+    my $u = $SETTINGS->{$s->{host}}{ssh_user};
+    $s->{_attach_as} = $u if defined $u && length $u;
+}
 
 # Drop sessions whose only contents are session plumbing (no real app to
 # attach to).  Keep xpra-listed and vnc sessions even if empty — the user
@@ -2689,6 +2694,14 @@ sub _show_settings {
     $top->Entry(-textvariable => \$host_dpi, -width => 8, -justify => 'right')
         ->pack(-anchor => 'w', -padx => 30);
 
+    # SSH user override — used as the login for attach / VNC / SSH actions.
+    $top->Label(-text => "SSH user for $host (blank = default):",
+                -font => 'sans-serif 11 bold')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [10, 6]);
+    my $host_ssh_user = $SETTINGS->{$host}{ssh_user} // '';
+    $top->Entry(-textvariable => \$host_ssh_user, -width => 20)
+        ->pack(-anchor => 'w', -padx => 30);
+
     # VNC zoom factor — percentage applied via FLTK_SCALING_FACTOR /
     # GDK_DPI_SCALE / QT_SCALE_FACTOR when launching vncviewer.
     $top->Label(-text => "VNC zoom % for $host (blank = 100%):",
@@ -2701,6 +2714,14 @@ sub _show_settings {
     my $btns = $top->Frame->pack(-pady => 10);
     $btns->Button(-text => 'Save', -command => sub {
         $SETTINGS->{$host}{terminal} = $sel;
+        $host_ssh_user =~ s/^\s+|\s+$//g;
+        if (length $host_ssh_user) {
+            $SETTINGS->{$host}{ssh_user} = $host_ssh_user;
+            $s->{_attach_as} = $host_ssh_user;
+        } else {
+            delete $SETTINGS->{$host}{ssh_user};
+            delete $s->{_attach_as};
+        }
         $host_dpi =~ s/^\s+|\s+$//g;
         if (length $host_dpi && $host_dpi =~ /^\d+$/) {
             $SETTINGS->{$host}{dpi} = $host_dpi + 0;
