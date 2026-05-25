@@ -2365,12 +2365,17 @@ $canvas->pack(-side => 'left', -fill => 'both', -expand => 1);
 $rows_f = $canvas->Frame;
 my $rows_id = $canvas->createWindow(0, 0, -window => $rows_f, -anchor => 'nw');
 $rows_f->gridColumnconfigure(2, -weight => 1);
+$rows_f->gridPropagate(0);
 $_update_scroll = sub {
     $rows_f->update;
-    $canvas->configure(-scrollregion => [$canvas->bbox('all')]);
+    my $rh = $rows_f->reqheight;
+    $canvas->configure(-scrollregion => [0, 0, $canvas->width, $rh]);
+    $rows_f->configure(-height => $rh);
 };
 $canvas->bind('<Configure>', sub {
-    $canvas->itemconfigure($rows_id, -width => $canvas->width);
+    my $w = $canvas->width;
+    $canvas->itemconfigure($rows_id, -width => $w);
+    $rows_f->configure(-width => $w);
 });
 $canvas->Tk::bind('<MouseWheel>', sub {
     $canvas->yview('scroll', -($_[0]->XEvent->D / 120), 'units');
