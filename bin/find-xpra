@@ -2276,27 +2276,28 @@ sub _render_row {
     }
     my $sess = $s;
     my @ACTIONS_DETACHED = $sess->{kind} eq 'vnc'
-        ? ('Attach', '---', 'SSH', 'Apps', 'Settings')
+        ? ('Attach', 'Insecure VNC', '---', 'SSH', 'Apps', 'Settings')
         : $sess->{kind} eq 'X'
-        ? ('Connect as VNC', 'X11-VNC', '---', 'SSH', 'Settings')
-        : ('Attach', 'Connect as VNC', 'X11-VNC',
+        ? ('Secure VNC', 'Insecure VNC', 'X11-VNC',
+           '---', 'SSH', 'Settings')
+        : ('Attach', 'Secure VNC', 'Insecure VNC', 'X11-VNC',
            'Restart app', 'Restart Xpra', 'Restart Xpra with web',
            '---', 'SSH', 'Helper', 'Apps', 'Settings');
     my @ACTIONS_ATTACHED = $sess->{kind} eq 'vnc'
         ? ('Disconnect', 'Force kill', 'KILL',
-           '---', 'SSH', 'Apps', 'Settings')
+           'Insecure VNC', '---', 'SSH', 'Apps', 'Settings')
         : $sess->{kind} eq 'X'
         ? ('Disconnect', 'Force kill', 'KILL',
-           '---', 'SSH', 'Settings')
+           'Insecure VNC', '---', 'SSH', 'Settings')
         : ('Disconnect', 'Force kill', 'KILL', 'Terminal',
-           'Connect as VNC', 'X11-VNC',
+           'Secure VNC', 'Insecure VNC', 'X11-VNC',
            'Restart app', 'Restart Xpra', 'Restart Xpra with web',
            '---', 'SSH', 'Helper', 'Apps', 'Settings');
     if ($sess->{_extra}) {
         push @ACTIONS_DETACHED, '---', 'Remove';
         push @ACTIONS_ATTACHED, '---', 'Remove';
     }
-    my $detached_default = $sess->{kind} eq 'X' ? 'Connect as VNC' : 'Attach';
+    my $detached_default = $sess->{kind} eq 'X' ? 'Secure VNC' : 'Attach';
     my $action = $detached_default;
     my $current_opts = \@ACTIONS_DETACHED;
     my $default_action = sub {
@@ -2340,9 +2341,15 @@ sub _render_row {
     my $go_btn = $mw->Button(-text => "\x{25B6}",
         -command => sub {
             my $picked = $action;
-            if ($picked eq 'Connect as VNC') {
+            if ($picked eq 'Secure VNC') {
                 _keys_ensure() unless $sess->{local};
                 my $pid = spawn_attach(_vnc_attach_cmd($sess));
+                $sess->{pid} = $pid;
+                $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
+                return;
+            }
+            if ($picked eq 'Insecure VNC') {
+                my $pid = spawn_attach(_vnc_direct_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
                 return;
@@ -2736,6 +2743,19 @@ sub _vnc_attach_cmd {
                . "${env_sh}net-vnc localhost::$local_port; "
                . "kill \$VNC_SSH 2>/dev/null";
     return ('bash', '-c', $script);
+}
+
+sub _vnc_direct_cmd {
+    my ($s) = @_;
+    (my $disp_n = $s->{disp}) =~ s/^://;
+    my @env;
+    if (defined(my $zoom = _zoom_for($s->{host}))) {
+        my $scale = sprintf("%.2f", $zoom / 100);
+        @env = ('env', "FLTK_SCALING_FACTOR=$scale",
+                "GDK_DPI_SCALE=$scale", "QT_SCALE_FACTOR=$scale");
+    }
+    my $target = $s->{ip} // $s->{host};
+    return (@env, 'net-vnc', "$target:$disp_n");
 }
 
 sub _x11vnc_cmd {
