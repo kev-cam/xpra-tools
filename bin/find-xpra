@@ -1332,6 +1332,7 @@ for my $pid (keys %pid_for) {
 my %ip_for_name    = map { _name_for($_) => $_->{ip}       } @candidates;
 my %local_for_name = map { _name_for($_) => $_->{local}    } @candidates;
 my %user_for_name  = map { _name_for($_) => $_->{ssh_user} } @candidates;
+my %extra_for_name = map { _name_for($_) => $_->{_extra}   } grep { $_->{_extra} } @candidates;
 my %by_session;       # "$host\t$disp" -> { host, disp, kind, user, cmds, n }
 # Seed sessions reported by `xpra list` first — that way an xpra session
 # with no surviving show-x11 procs (or no apps at all) still appears.
@@ -1522,6 +1523,7 @@ for my $s (@sessions) {
     ($s->{disp_n}) = $s->{disp} =~ /^:(\d+)/;
     $s->{ip}       = $ip_for_name{$s->{host}};
     $s->{local}    = $local_for_name{$s->{host}} ? 1 : 0;
+    $s->{_extra}   = 1 if $extra_for_name{$s->{host}};
 }
 # --host fallback: if a manually-added host produced no sessions, offer :0.
 {
