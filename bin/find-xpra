@@ -79,7 +79,10 @@ $ssh_user //= $user if defined $user;
 # probe forks have stdin closed and a fresh session, so ssh can't ask on the
 # tty even if it wanted to.  SSH_ASKPASS_REQUIRE=force makes OpenSSH 8.4+
 # use askpass even with $DISPLAY unset on systems that ship one.
-$ENV{SSH_ASKPASS_REQUIRE} //= 'force' unless $no_prompt;
+unless ($no_prompt) {
+    $ENV{SSH_ASKPASS}         //= 'ssh-askpass';
+    $ENV{SSH_ASKPASS_REQUIRE} //= 'force';
+}
 
 # Debug log: when --debug is on, mirror stderr trace to a file too so
 # the trace survives launching from a Tk/desktop context where stderr
@@ -263,7 +266,8 @@ sub ssh_target {
     } else {
         $host = $ip // $name;
     }
-    my $login = defined $ssh_user ? "$ssh_user\@$host" : $host;
+    my $user = $c->{ssh_user} // $ssh_user;
+    my $login = defined $user ? "$user\@$host" : $host;
     return (@args, $login);
 }
 
@@ -583,7 +587,8 @@ for my $h (@extra_hosts) {
 for my $h (@{ $SETTINGS->{_extra_hosts} // [] }) {
     my ($n, $ip) = ($h->{name}, $h->{ip});
     next if grep { ($_->{name} // '') eq $n || ($_->{ip} // '') eq $ip } @candidates;
-    push @candidates, { name => $n, ip => $ip, _extra => 1 };
+    push @candidates, { name => $n, ip => $ip, _extra => 1,
+                        (defined $h->{user} ? (ssh_user => $h->{user}) : ()) };
 }
 
 if ($no_local) {
@@ -1895,10 +1900,16 @@ sub _ask_host {
     my $ip_val = '';
     my $ip_e = $dlg->Entry(-textvariable => \$ip_val, -width => 30);
     $ip_e->pack(-padx => 8);
+    $dlg->Label(-text => 'User (optional):')
+        ->pack(-padx => 8, -pady => [6,2]);
+    my $user_val = '';
+    my $user_e = $dlg->Entry(-textvariable => \$user_val, -width => 30);
+    $user_e->pack(-padx => 8);
     my $ok;
     my $submit = sub { $ok = 1; $dlg->destroy };
     $name_e->bind('<Return>', sub { $ip_e->focus });
-    $ip_e->bind('<Return>', $submit);
+    $ip_e->bind('<Return>', sub { $user_e->focus });
+    $user_e->bind('<Return>', $submit);
     my $bf = $dlg->Frame->pack(-pady => 8);
     $bf->Button(-text => 'OK',     -command => $submit)
        ->pack(-side => 'left', -padx => 4);
@@ -1908,10 +1919,12 @@ sub _ask_host {
     return undef unless $ok;
     $name_val =~ s/^\s+|\s+$//g;
     $ip_val   =~ s/^\s+|\s+$//g;
+    $user_val =~ s/^\s+|\s+$//g;
     return undef unless length $name_val || length $ip_val;
     $name_val = $ip_val unless length $name_val;
     $ip_val = $name_val unless length $ip_val;
-    return { name => $name_val, ip => $ip_val };
+    return { name => $name_val, ip => $ip_val,
+             (length $user_val ? (user => $user_val) : ()) };
 }
 
 sub _remove_extra_host {
@@ -1934,12 +1947,15 @@ sub _add_host_probe {
     my ($parent) = @_;
     my $h = _ask_host($parent);
     return unless defined $h;
-    my $host = $h->{name};
+    my $host    = $h->{name};
     my $host_ip = $h->{ip};
+    my $host_user = $h->{user};
     # Persist
     my $extras = $SETTINGS->{_extra_hosts} //= [];
     unless (grep { $_->{name} eq $host && $_->{ip} eq $host_ip } @$extras) {
-        push @$extras, { name => $host, ip => $host_ip };
+        my $entry = { name => $host, ip => $host_ip };
+        $entry->{user} = $host_user if defined $host_user;
+        push @$extras, $entry;
         _save_settings($SETTINGS);
     }
     _keys_ensure();
@@ -1955,14 +1971,17 @@ sub _add_host_probe {
     if (!$cpid) {
         close $rd;
         $wr->autoflush(1);
-        open STDERR, '>', '/dev/null' unless $debug;
         POSIX::setsid();
         open STDIN, '<', '/dev/null';
+        $ENV{SSH_ASKPASS} //= 'ssh-askpass';
         $SIG{ALRM} = sub { POSIX::_exit(1) };
-        alarm($overall_to + 1);
-        my @cmd = ('ssh', ssh_opts(),
-                   ssh_target({ name => $host, ip => $host_ip }),
-                   $remote);
+        alarm($overall_to + 5);
+        my @tgt = ssh_target({ name => $host, ip => $host_ip });
+        if (defined $host_user) {
+            $tgt[-1] =~ s/^[^\@]*\@//;
+            $tgt[-1] = "$host_user\@$tgt[-1]";
+        }
+        my @cmd = ('ssh', ssh_opts(), @tgt, $remote);
         if (open my $oh, '-|', @cmd) {
             my ($disp, $in_xpra, $in_xstart, $in_vnc, $in_psvnc, $in_disps) =
                 (undef, 0, 0, 0, 0, 0);
@@ -2041,13 +2060,14 @@ sub _add_host_probe {
     my $buf = '';
     my $probe_host = $host;
     my $probe_ip   = $host_ip;
+    my $probe_user = $host_user;
     $mw->fileevent($rd, 'readable', sub {
         my $n = sysread($rd, my $chunk, 4096);
         if (!$n) {
             $mw->fileevent($rd, 'readable', '');
             close $rd;
             waitpid($cpid, 0);
-            _finish_add_host($probe_host, $probe_ip);
+            _finish_add_host($probe_host, $probe_ip, $probe_user);
             return;
         }
         $buf .= $chunk;
@@ -2086,8 +2106,8 @@ sub _add_host_probe {
     }
 
     sub _finish_add_host {
-        my ($host, $host_ip) = @_;
-        my $own_user = $ssh_user // $ENV{USER} // '';
+        my ($host, $host_ip, $host_user) = @_;
+        my $own_user = $host_user // $ssh_user // $ENV{USER} // '';
         my %by_sess;
         for my $key (keys %ah_xpra) {
             my ($h, $disp) = split /\t/, $key, 2;
