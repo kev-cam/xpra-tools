@@ -1908,7 +1908,7 @@ sub _scan_attached {
 # the window up so several sessions can be attached.  Closing the window
 # (regular decoration) ends the program.
 
-my $mw;
+my ($mw, $rows_f, $_update_scroll);
 
 sub _ask_host {
     my ($parent, $defaults) = @_;
@@ -2299,6 +2299,7 @@ sub _add_host_probe {
             push @sessions, $s;
             _render_row($s);
         }
+        $mw->after(50, $_update_scroll);
         # Reset accumulators
         %ah_xpra = (); %ah_vnc = (); %ah_xs = (); %ah_disp = ();
         @ah_psvnc = (); @ah_psxpra = (); @ah_rows = ();
@@ -2316,9 +2317,8 @@ my @cols = ('Host', 'Disp', 'Info', '', '');
 # UI rebuilds.  In-flight xpra-attach children are setsid'd so they
 # survive the exec; their Disconnect tracking is lost (close the viewer
 # via xpra's own UI in that case).
-my $header_f = $mw->Frame->grid(-row => 0, -column => 0,
-                                -columnspan => scalar(@cols),
-                                -sticky => 'ew', -padx => 6, -pady => 4);
+my $header_f = $mw->Frame;
+$header_f->pack(-fill => 'x', -padx => 6, -pady => 4);
 $header_f->Button(-text => 'Rescan',
                   -command => sub { exec { $^X } $^X, $0, @ORIG_ARGV })
          ->pack(-side => 'left', -fill => 'x', -expand => 1);
@@ -2348,13 +2348,39 @@ my $save_default_dpi = sub {
 $dpi_entry->bind('<FocusOut>', $save_default_dpi);
 $dpi_entry->bind('<Return>',   $save_default_dpi);
 
+my $hdr_f = $mw->Frame;
+$hdr_f->pack(-fill => 'x', -padx => 2);
 for my $i (0 .. $#cols) {
-    $mw->Label(-text => $cols[$i], -font => 'sans-serif 11 bold',
-               -relief => 'ridge', -padx => 6, -pady => 2)
-       ->grid(-row => 1, -column => $i, -sticky => 'ew');
+    $hdr_f->Label(-text => $cols[$i], -font => 'sans-serif 11 bold',
+                  -relief => 'ridge', -padx => 6, -pady => 2)
+       ->grid(-row => 0, -column => $i, -sticky => 'ew');
 }
-$mw->gridColumnconfigure(2, -weight => 1);
-my $r = 2;
+$hdr_f->gridColumnconfigure(2, -weight => 1);
+
+my $canvas = $mw->Canvas(-highlightthickness => 0);
+my $scroll = $mw->Scrollbar(-orient => 'vertical', -command => ['yview', $canvas]);
+$canvas->configure(-yscrollcommand => ['set', $scroll]);
+$scroll->pack(-side => 'right', -fill => 'y');
+$canvas->pack(-side => 'left', -fill => 'both', -expand => 1);
+$rows_f = $canvas->Frame;
+my $rows_id = $canvas->createWindow(0, 0, -window => $rows_f, -anchor => 'nw');
+$rows_f->gridColumnconfigure(2, -weight => 1);
+$_update_scroll = sub {
+    $rows_f->update;
+    $canvas->configure(-scrollregion => [$canvas->bbox('all')]);
+    my $rw = $rows_f->reqwidth;
+    $canvas->configure(-width => $rw) if $rw;
+};
+$canvas->bind('<Configure>', sub {
+    $canvas->itemconfigure($rows_id, -width => $canvas->width);
+});
+$canvas->Tk::bind('<MouseWheel>', sub {
+    $canvas->yview('scroll', -($_[0]->XEvent->D / 120), 'units');
+});
+$canvas->Tk::bind('<Button-4>', sub { $canvas->yview('scroll', -3, 'units') });
+$canvas->Tk::bind('<Button-5>', sub { $canvas->yview('scroll',  3, 'units') });
+
+my $r = 0;
 sub _render_row {
     my ($s) = @_;
     my $own_user = $ssh_user // $ENV{USER} // '';
@@ -2378,7 +2404,7 @@ sub _render_row {
     }
     my @widgets;
     for my $c (0 .. $#vals) {
-        my $w = $mw->Label(-text => $vals[$c], -anchor => 'w', -padx => 6, %fg);
+        my $w = $rows_f->Label(-text => $vals[$c], -anchor => 'w', -padx => 6, %fg);
         $w->grid(-row => $r, -column => $c, -sticky => 'ew');
         push @widgets, $w;
     }
@@ -2444,7 +2470,7 @@ sub _render_row {
             $action = $current_opts->[0] // '';
         }
     };
-    $action_mb = $mw->Menubutton(
+    $action_mb = $rows_f->Menubutton(
         -textvariable => \$action,
         -indicatoron  => 1,
         -relief       => 'raised',
@@ -2459,7 +2485,7 @@ sub _render_row {
     } else {
         $set_actions->(\@ACTIONS_DETACHED, $detached_default);
     }
-    my $go_btn = $mw->Button(-text => "\x{25B6}",
+    my $go_btn = $rows_f->Button(-text => "\x{25B6}",
         -command => sub {
             my $picked = $action;
             if ($picked eq 'Secure VNC') {
@@ -2572,6 +2598,7 @@ sub _render_row {
     $r++;
 }
 for my $s (@sessions) { _render_row($s) }
+$mw->after(50, $_update_scroll);
 
 # Background HTML5-port probe.  We can't synchronously TCP-connect from
 # the Tk thread without freezing the UI on closed/firewalled ports
