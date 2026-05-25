@@ -1925,14 +1925,36 @@ sub _ask_host {
     my $disp_val = '';
     my $disp_e = $dlg->Entry(-textvariable => \$disp_val, -width => 30);
     $disp_e->pack(-padx => 8);
+    my $err_msg = '';
+    my $err_lbl = $dlg->Label(-textvariable => \$err_msg,
+                              -foreground => '#c00000');
+    $err_lbl->pack(-padx => 8, -pady => [4,0]);
     my $ok;
-    my $submit = sub { $ok = 1; $dlg->destroy };
+    my $validate = sub {
+        (my $ip = $ip_val) =~ s/^\s+|\s+$//g;
+        if (length $ip) {
+            unless ($ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/
+                    && $1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255) {
+                $err_msg = 'Invalid IP address';
+                $ip_e->focus;
+                return;
+            }
+        }
+        (my $n = $name_val) =~ s/^\s+|\s+$//g;
+        unless (length $n || length $ip) {
+            $err_msg = 'Hostname or IP required';
+            $name_e->focus;
+            return;
+        }
+        $ok = 1;
+        $dlg->destroy;
+    };
     $name_e->bind('<Return>', sub { $ip_e->focus });
     $ip_e->bind('<Return>', sub { $user_e->focus });
     $user_e->bind('<Return>', sub { $disp_e->focus });
-    $disp_e->bind('<Return>', $submit);
+    $disp_e->bind('<Return>', $validate);
     my $bf = $dlg->Frame->pack(-pady => 8);
-    $bf->Button(-text => 'OK',     -command => $submit)
+    $bf->Button(-text => 'OK',     -command => $validate)
        ->pack(-side => 'left', -padx => 4);
     $bf->Button(-text => 'Cancel', -command => sub { $dlg->destroy })
        ->pack(-side => 'left', -padx => 4);
@@ -1943,7 +1965,6 @@ sub _ask_host {
     $user_val =~ s/^\s+|\s+$//g;
     $disp_val =~ s/^\s+|\s+$//g;
     $disp_val =~ s/^://;
-    return undef unless length $name_val || length $ip_val;
     $name_val = $ip_val unless length $name_val;
     $ip_val = $name_val unless length $ip_val;
     return { name => $name_val, ip => $ip_val,
