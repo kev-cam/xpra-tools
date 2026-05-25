@@ -2368,7 +2368,8 @@ sub _render_row {
     }
     my $sess = $s;
     my @ACTIONS_DETACHED = $sess->{kind} eq 'vnc'
-        ? ('Attach', 'Insecure VNC', '---', 'SSH', 'Apps', 'Settings')
+        ? ('Attach', 'Secure VNC', 'Insecure VNC', 'X11-VNC',
+           '---', 'SSH', 'Apps', 'Settings')
         : $sess->{kind} eq 'X'
         ? ('Secure VNC', 'Insecure VNC', 'X11-VNC',
            '---', 'SSH', 'Settings')
@@ -2377,10 +2378,12 @@ sub _render_row {
            '---', 'SSH', 'Helper', 'Apps', 'Settings');
     my @ACTIONS_ATTACHED = $sess->{kind} eq 'vnc'
         ? ('Disconnect', 'Force kill', 'KILL',
-           'Insecure VNC', '---', 'SSH', 'Apps', 'Settings')
+           'Secure VNC', 'Insecure VNC', 'X11-VNC',
+           '---', 'SSH', 'Apps', 'Settings')
         : $sess->{kind} eq 'X'
         ? ('Disconnect', 'Force kill', 'KILL',
-           'Insecure VNC', '---', 'SSH', 'Settings')
+           'Secure VNC', 'Insecure VNC', 'X11-VNC',
+           '---', 'SSH', 'Settings')
         : ('Disconnect', 'Force kill', 'KILL', 'Terminal',
            'Secure VNC', 'Insecure VNC', 'X11-VNC',
            'Restart app', 'Restart Xpra', 'Restart Xpra with web',
