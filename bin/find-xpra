@@ -2364,18 +2364,13 @@ $scroll->pack(-side => 'right', -fill => 'y');
 $canvas->pack(-side => 'left', -fill => 'both', -expand => 1);
 $rows_f = $canvas->Frame;
 my $rows_id = $canvas->createWindow(0, 0, -window => $rows_f, -anchor => 'nw');
-$rows_f->gridColumnconfigure(2, -weight => 1);
-$rows_f->gridPropagate(0);
+$rows_f->gridColumnconfigure(2, -weight => 1, -minsize => 0);
 $_update_scroll = sub {
     $rows_f->update;
-    my $rh = $rows_f->reqheight;
-    $canvas->configure(-scrollregion => [0, 0, $canvas->width, $rh]);
-    $rows_f->configure(-height => $rh);
+    $canvas->configure(-scrollregion => [$canvas->bbox('all')]);
 };
 $canvas->bind('<Configure>', sub {
-    my $w = $canvas->width;
-    $canvas->itemconfigure($rows_id, -width => $w);
-    $rows_f->configure(-width => $w);
+    $canvas->itemconfigure($rows_id, -width => $canvas->width);
 });
 $canvas->Tk::bind('<MouseWheel>', sub {
     $canvas->yview('scroll', -($_[0]->XEvent->D / 120), 'units');
@@ -2407,7 +2402,10 @@ sub _render_row {
     }
     my @widgets;
     for my $c (0 .. $#vals) {
-        my $w = $rows_f->Label(-text => $vals[$c], -anchor => 'w', -padx => 6, %fg);
+        my @extra;
+        @extra = (-width => 1) if $c == 2;
+        my $w = $rows_f->Label(-text => $vals[$c], -anchor => 'w',
+                               -padx => 6, @extra, %fg);
         $w->grid(-row => $r, -column => $c, -sticky => 'ew');
         push @widgets, $w;
     }
@@ -2419,7 +2417,7 @@ sub _render_row {
         ? ('Secure VNC', 'Insecure VNC', 'X11-VNC',
            '---', 'SSH', 'Settings')
         : ('Attach', 'Secure VNC', 'Insecure VNC', 'X11-VNC',
-           'Restart app', 'Restart Xpra', 'Restart Xpra with web',
+           'Restart app', 'Restart Xpra', 'Restart Xpra+WWW',
            '---', 'SSH', 'Helper', 'Apps', 'Settings');
     my @ACTIONS_ATTACHED = $sess->{kind} eq 'vnc'
         ? ('Disconnect', 'Force kill', 'KILL',
@@ -2431,7 +2429,7 @@ sub _render_row {
            '---', 'SSH', 'Settings')
         : ('Disconnect', 'Force kill', 'KILL', 'Terminal',
            'Secure VNC', 'Insecure VNC', 'X11-VNC',
-           'Restart app', 'Restart Xpra', 'Restart Xpra with web',
+           'Restart app', 'Restart Xpra', 'Restart Xpra+WWW',
            '---', 'SSH', 'Helper', 'Apps', 'Settings');
     if ($sess->{_extra}) {
         push @ACTIONS_DETACHED, '---', 'Edit', 'Remove';
@@ -2554,7 +2552,7 @@ sub _render_row {
             }
             elsif ($picked eq 'Restart app'
                 || $picked eq 'Restart Xpra'
-                || $picked eq 'Restart Xpra with web') {
+                || $picked eq 'Restart Xpra+WWW') {
                 _keys_ensure() unless $sess->{local};
                 spawn_detached(_launch_xpra_cmd($sess, $picked));
             }
@@ -2981,7 +2979,7 @@ sub _launch_xpra_cmd {
         if (defined(my $dpi = _dpi_for($s->{host}))) {
             push @lx, "--dpi=$dpi";
         }
-        push @lx, '--web' if $action eq 'Restart Xpra with web';
+        push @lx, '--web' if $action eq 'Restart Xpra+WWW';
     }
     return @lx if $s->{local};
     return ('ssh', ssh_opts(interactive => 1),
