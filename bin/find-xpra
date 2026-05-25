@@ -2368,8 +2368,6 @@ $rows_f->gridColumnconfigure(2, -weight => 1);
 $_update_scroll = sub {
     $rows_f->update;
     $canvas->configure(-scrollregion => [$canvas->bbox('all')]);
-    my $rw = $rows_f->reqwidth;
-    $canvas->configure(-width => $rw) if $rw;
 };
 $canvas->bind('<Configure>', sub {
     $canvas->itemconfigure($rows_id, -width => $canvas->width);
