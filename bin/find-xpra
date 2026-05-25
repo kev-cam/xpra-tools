@@ -2474,7 +2474,9 @@ sub _render_row {
             }
             elsif ($picked eq 'SSH') {
                 _keys_ensure() unless $sess->{local};
-                spawn_detached(_ssh_cmd($sess));
+                my @cmd = _ssh_cmd($sess);
+                _dbg("[debug] SSH: ", join(' ', map { /\s/ ? "'$_'" : $_ } @cmd));
+                spawn_detached(@cmd);
             }
             elsif ($picked eq 'Helper') {
                 spawn_detached('xpra-helper', '--pin');
