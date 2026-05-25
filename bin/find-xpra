@@ -2230,22 +2230,22 @@ sub _render_row {
     }
     my $sess = $s;
     my @ACTIONS_DETACHED = $sess->{kind} eq 'vnc'
-        ? ('Attach', '---', 'Apps', 'Settings')
+        ? ('Attach', '---', 'SSH', 'Apps', 'Settings')
         : $sess->{kind} eq 'X'
-        ? ('Connect as VNC', 'X11-VNC', '---', 'Settings')
+        ? ('Connect as VNC', 'X11-VNC', '---', 'SSH', 'Settings')
         : ('Attach', 'Connect as VNC', 'X11-VNC',
            'Restart app', 'Restart Xpra', 'Restart Xpra with web',
-           '---', 'Helper', 'Apps', 'Settings');
+           '---', 'SSH', 'Helper', 'Apps', 'Settings');
     my @ACTIONS_ATTACHED = $sess->{kind} eq 'vnc'
         ? ('Disconnect', 'Force kill', 'KILL',
-           '---', 'Apps', 'Settings')
+           '---', 'SSH', 'Apps', 'Settings')
         : $sess->{kind} eq 'X'
         ? ('Disconnect', 'Force kill', 'KILL',
-           '---', 'Settings')
+           '---', 'SSH', 'Settings')
         : ('Disconnect', 'Force kill', 'KILL', 'Terminal',
            'Connect as VNC', 'X11-VNC',
            'Restart app', 'Restart Xpra', 'Restart Xpra with web',
-           '---', 'Helper', 'Apps', 'Settings');
+           '---', 'SSH', 'Helper', 'Apps', 'Settings');
     my $detached_default = $sess->{kind} eq 'X' ? 'Connect as VNC' : 'Attach';
     my $action = $detached_default;
     my $current_opts = \@ACTIONS_DETACHED;
@@ -2321,6 +2321,10 @@ sub _render_row {
             elsif ($picked eq 'Terminal') {
                 _keys_ensure() unless $sess->{local};
                 spawn_detached(_term_cmd($sess));
+            }
+            elsif ($picked eq 'SSH') {
+                _keys_ensure() unless $sess->{local};
+                spawn_detached(_ssh_cmd($sess));
             }
             elsif ($picked eq 'Helper') {
                 spawn_detached('xpra-helper', '--pin');
@@ -2804,6 +2808,23 @@ sub _zoom_for {
     my $zoom = $SETTINGS->{$host}{vnc_zoom} // $SETTINGS->{'*'}{vnc_zoom};
     return undef unless defined $zoom && $zoom =~ /^\d+$/ && $zoom > 0 && $zoom != 100;
     return $zoom + 0;
+}
+
+sub _ssh_cmd {
+    my ($s) = @_;
+    my $term = _terminal_for($s->{host});
+    my @ssh = ('ssh', ssh_opts(),
+               ssh_target({ name => $s->{host}, ip => $s->{ip} }));
+    my $login_user = $s->{_attach_as};
+    if (defined $login_user) {
+        $ssh[-1] =~ s/^[^\@]*\@//;
+        $ssh[-1] = "$login_user\@$ssh[-1]";
+    }
+    my $ssh_str = join(' ', map { /[\s'"]/ ? "'$_'" : $_ } @ssh);
+    if ($term eq 'xterm') {
+        return ($term, '-e', @ssh);
+    }
+    return ($term, '--', @ssh);
 }
 
 sub _term_cmd {
