@@ -2820,11 +2820,12 @@ sub _ssh_cmd {
         $ssh[-1] =~ s/^[^\@]*\@//;
         $ssh[-1] = "$login_user\@$ssh[-1]";
     }
-    my $ssh_str = join(' ', map { /[\s'"]/ ? "'$_'" : $_ } @ssh);
+    my @env = ('env', 'SSH_ASKPASS=ssh-askpass',
+               'SSH_ASKPASS_REQUIRE=prefer');
     if ($term eq 'xterm') {
-        return ($term, '-e', @ssh);
+        return (@env, $term, '-e', @ssh);
     }
-    return ($term, '--', @ssh);
+    return (@env, $term, '--', @ssh);
 }
 
 sub _term_cmd {
