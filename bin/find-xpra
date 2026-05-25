@@ -2310,7 +2310,7 @@ $mw = _tk_mw();
 _dbg("[debug] parent: MainWindow created");
 $mw->title('find-xpra: attach to X11 session');
 $mw->deiconify;
-my @cols = ('Host', 'Display', 'Kind', 'User', 'Apps', '', '');
+my @cols = ('Host', 'Disp', 'Info', '', '');
 
 # Rescan: re-exec self with the same args.  Discovery runs again and the
 # UI rebuilds.  In-flight xpra-attach children are setsid'd so they
@@ -2353,10 +2353,21 @@ for my $i (0 .. $#cols) {
                -relief => 'ridge', -padx => 6, -pady => 2)
        ->grid(-row => 1, -column => $i, -sticky => 'ew');
 }
+$mw->gridColumnconfigure(2, -weight => 1);
 my $r = 2;
 sub _render_row {
     my ($s) = @_;
-    my @vals = ($s->{host}, $s->{disp}, $s->{kind}, $s->{user}, $s->{apps});
+    my $own_user = $ssh_user // $ENV{USER} // '';
+    my @info;
+    push @info, $s->{kind} if defined $s->{kind} && $s->{kind} ne 'xpra';
+    my $su = $s->{user} // '';
+    push @info, $su if length $su && $su ne $own_user;
+    if (defined $s->{apps} && $s->{apps} ne '(root display)'
+        && $s->{apps} ne '(daemons only)') {
+        push @info, $s->{apps};
+    }
+    my $info = join(' | ', @info);
+    my @vals = ($s->{host}, $s->{disp}, $info);
     my %fg;
     if (defined $s->{_xs_cmd}) {
         if ($s->{_xs_other_user}) {
@@ -2547,8 +2558,8 @@ sub _render_row {
             $action = $default_action->();
         });
     push @widgets, $action_mb, $go_btn;
-    $action_mb->grid(-row => $r, -column => 5, -padx => 6, -pady => 1, -sticky => 'ew');
-    $go_btn   ->grid(-row => $r, -column => 6, -padx => 6, -pady => 1, -sticky => 'ew');
+    $action_mb->grid(-row => $r, -column => 3, -padx => 6, -pady => 1, -sticky => 'ew');
+    $go_btn   ->grid(-row => $r, -column => 4, -padx => 6, -pady => 1, -sticky => 'ew');
     $sess->{_widgets} = \@widgets;
     $sess->{_enable_browser} = sub {
         return if grep { $_ eq 'Attach Browser' } @ACTIONS_DETACHED;
