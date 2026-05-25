@@ -2311,7 +2311,7 @@ $mw = _tk_mw();
 _dbg("[debug] parent: MainWindow created");
 $mw->title('find-xpra: attach to X11 session');
 $mw->deiconify;
-my @cols = ('Host', 'Disp', 'Info', '', '');
+my @cols = ('', '', 'Host', 'Disp', 'Info');
 
 # Rescan: re-exec self with the same args.  Discovery runs again and the
 # UI rebuilds.  In-flight xpra-attach children are setsid'd so they
@@ -2355,7 +2355,7 @@ for my $i (0 .. $#cols) {
                   -relief => 'ridge', -padx => 6, -pady => 2)
        ->grid(-row => 0, -column => $i, -sticky => 'ew');
 }
-$hdr_f->gridColumnconfigure(2, -weight => 1);
+$hdr_f->gridColumnconfigure(4, -weight => 1);
 
 my $canvas = $mw->Canvas(-highlightthickness => 0);
 my $scroll = $mw->Scrollbar(-orient => 'vertical', -command => ['yview', $canvas]);
@@ -2364,7 +2364,7 @@ $scroll->pack(-side => 'right', -fill => 'y');
 $canvas->pack(-side => 'left', -fill => 'both', -expand => 1);
 $rows_f = $canvas->Frame;
 my $rows_id = $canvas->createWindow(0, 0, -window => $rows_f, -anchor => 'nw');
-$rows_f->gridColumnconfigure(2, -weight => 1, -minsize => 0);
+$rows_f->gridColumnconfigure(4, -weight => 1, -minsize => 0);
 $_update_scroll = sub {
     $rows_f->update;
     $canvas->configure(-scrollregion => [$canvas->bbox('all')]);
@@ -2406,7 +2406,7 @@ sub _render_row {
         @extra = (-width => 1) if $c == 2;
         my $w = $rows_f->Label(-text => $vals[$c], -anchor => 'w',
                                -padx => 6, @extra, %fg);
-        $w->grid(-row => $r, -column => $c, -sticky => 'ew');
+        $w->grid(-row => $r, -column => $c + 2, -sticky => 'ew');
         push @widgets, $w;
     }
     my $sess = $s;
@@ -2585,8 +2585,8 @@ sub _render_row {
             $action = $default_action->();
         });
     push @widgets, $action_mb, $go_btn;
-    $action_mb->grid(-row => $r, -column => 3, -padx => 6, -pady => 1, -sticky => 'ew');
-    $go_btn   ->grid(-row => $r, -column => 4, -padx => 6, -pady => 1, -sticky => 'ew');
+    $action_mb->grid(-row => $r, -column => 0, -padx => 6, -pady => 1, -sticky => 'ew');
+    $go_btn   ->grid(-row => $r, -column => 1, -padx => 6, -pady => 1, -sticky => 'ew');
     $sess->{_widgets} = \@widgets;
     $sess->{_enable_browser} = sub {
         return if grep { $_ eq 'Attach Browser' } @ACTIONS_DETACHED;
