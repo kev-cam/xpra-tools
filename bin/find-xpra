@@ -47,6 +47,7 @@ my $ssh_key;
 my $debug;
 my $any;
 my $all;
+my @extra_hosts;
 my $help;
 
 GetOptions(
@@ -65,6 +66,7 @@ GetOptions(
     'debug'      => \$debug,
     'any'        => \$any,
     'a|all'      => \$all,
+    'host=s@'    => \@extra_hosts,
     'h|help'     => \$help,
 ) or die usage();
 print(usage()), exit 0 if $help;
@@ -408,6 +410,8 @@ usage: find-xpra [options]
   -a, --all             show everything otherwise hidden: displays under
                         :20 (presumed plain X), displays over :1000, and
                         sessions whose only contents are session plumbing
+  --host HOST           add HOST to the probe list (repeatable); if no
+                        sessions are discovered, offers :0 as fallback
   --debug               print the probe command for each candidate and
                         leave ssh's stderr attached so failures show why
   -h, --help            this message
@@ -570,6 +574,11 @@ my $mgr_is_local = $mgr_host =~ /^(?:127\.|::1$|localhost$)/
 unless ($mgr_is_local
         || grep { ($_->{name} // '') eq $mgr_host || ($_->{ip} // '') eq $mgr_host } @candidates) {
     push @candidates, { name => $mgr_host, ip => $mgr_host };
+}
+
+for my $h (@extra_hosts) {
+    next if grep { ($_->{name} // '') eq $h || ($_->{ip} // '') eq $h } @candidates;
+    push @candidates, { name => $h, ip => $h, _extra => 1 };
 }
 
 if ($no_local) {
@@ -1496,9 +1505,22 @@ for my $s (@sessions) {
     $s->{ip}       = $ip_for_name{$s->{host}};
     $s->{local}    = $local_for_name{$s->{host}} ? 1 : 0;
 }
+# --host fallback: if a manually-added host produced no sessions, offer :0.
+{
+    my %seen_host = map { $_->{host} => 1 } @sessions;
+    for my $c (grep { $_->{_extra} } @candidates) {
+        my $name = _name_for($c);
+        next if $seen_host{$name};
+        push @sessions, { host => $name, disp => ':0', disp_n => 0,
+                          ip => $c->{ip}, local => 0, kind => 'X',
+                          user => $ssh_user // $user_for_name{$name} // $ENV{USER} // '',
+                          cmds => [], procs => [], n => 0,
+                          apps => '(root display)', _extra => 1 };
+    }
+}
 unless ($all || $any) {
     @sessions = grep {
-        $_->{kind} eq 'vnc'
+        $_->{kind} eq 'vnc' || $_->{_extra}
         || (defined $_->{disp_n} && $_->{disp_n} >= 20 && $_->{disp_n} <= 1000)
     } @sessions;
 }
@@ -1716,6 +1738,7 @@ if ($any) {
 # command, regardless of what's actually running on the display.
 for my $s (@sessions) {
     next if defined $s->{_xs_cmd};
+    next if $s->{_extra} && defined $s->{apps};
     my $main = _main_cmd(@{ $s->{cmds} });
     my $own_user = $ssh_user // $ENV{USER} // '';
     my $other_user = $any && defined $s->{user} && length $s->{user}
@@ -1850,6 +1873,29 @@ sub _scan_attached {
 # the window up so several sessions can be attached.  Closing the window
 # (regular decoration) ends the program.
 
+sub _ask_host {
+    my ($parent) = @_;
+    my $dlg = $parent->Toplevel(-title => 'Add host');
+    $dlg->transient($parent);
+    $dlg->grab;
+    $dlg->Label(-text => 'Hostname or IP:')->pack(-padx => 8, -pady => [8,4]);
+    my $val = '';
+    my $entry = $dlg->Entry(-textvariable => \$val, -width => 30);
+    $entry->pack(-padx => 8);
+    $entry->focus;
+    my $ok;
+    my $submit = sub { $ok = 1; $dlg->destroy };
+    $entry->bind('<Return>', $submit);
+    my $bf = $dlg->Frame->pack(-pady => 8);
+    $bf->Button(-text => 'OK',     -command => $submit)
+       ->pack(-side => 'left', -padx => 4);
+    $bf->Button(-text => 'Cancel', -command => sub { $dlg->destroy })
+       ->pack(-side => 'left', -padx => 4);
+    $dlg->waitWindow;
+    $val =~ s/^\s+|\s+$//g;
+    return $ok ? $val : undef;
+}
+
 _dbg("[debug] parent: requiring Tk for chooser");
 my $mw = _tk_mw();
 _dbg("[debug] parent: MainWindow created");
@@ -1866,6 +1912,13 @@ my $header_f = $mw->Frame->grid(-row => 0, -column => 0,
                                 -sticky => 'ew', -padx => 6, -pady => 4);
 $header_f->Button(-text => 'Rescan',
                   -command => sub { exec { $^X } $^X, $0, @ORIG_ARGV })
+         ->pack(-side => 'left', -fill => 'x', -expand => 1);
+$header_f->Button(-text => 'Add host',
+                  -command => sub {
+                      my $host = _ask_host($mw);
+                      return unless defined $host && length $host;
+                      exec { $^X } $^X, $0, @ORIG_ARGV, '--host', $host;
+                  })
          ->pack(-side => 'left', -fill => 'x', -expand => 1);
 # Global default DPI — passed to `xpra attach --dpi=N` for every session
 # unless the host's Settings dialog overrides it.  Blank means "let xpra
@@ -1922,23 +1975,29 @@ for my $s (@sessions) {
     # lists when the async HTML5-port probe (below) finds xpra-web open.
     my @ACTIONS_DETACHED = $sess->{kind} eq 'vnc'
         ? ('Attach', '---', 'Apps', 'Settings')
+        : $sess->{kind} eq 'X'
+        ? ('Connect as VNC', '---', 'Settings')
         : ('Attach', 'Connect as VNC',
            'Restart app', 'Restart Xpra', 'Restart Xpra with web',
            '---', 'Helper', 'Apps', 'Settings');
     my @ACTIONS_ATTACHED = $sess->{kind} eq 'vnc'
         ? ('Disconnect', 'Force kill', 'KILL',
            '---', 'Apps', 'Settings')
+        : $sess->{kind} eq 'X'
+        ? ('Disconnect', 'Force kill', 'KILL',
+           '---', 'Settings')
         : ('Disconnect', 'Force kill', 'KILL', 'Terminal',
            'Connect as VNC',
            'Restart app', 'Restart Xpra', 'Restart Xpra with web',
            '---', 'Helper', 'Apps', 'Settings');
-    my $action = 'Attach';
+    my $detached_default = $sess->{kind} eq 'X' ? 'Connect as VNC' : 'Attach';
+    my $action = $detached_default;
     my $current_opts = \@ACTIONS_DETACHED;
     # Default-action helper: the menu reverts to this after any Go click
     # so the dropdown always shows the most likely next action for the
     # session's state, not the one the user just fired.
     my $default_action = sub {
-        return $sess->{pid} ? 'Disconnect' : 'Attach';
+        return $sess->{pid} ? 'Disconnect' : $detached_default;
     };
     my ($action_mb, $action_menu);
     # Rebuild the menu items for the currently displayed list.  When
@@ -1977,7 +2036,7 @@ for my $s (@sessions) {
     if ($sess->{pid}) {
         $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
     } else {
-        $set_actions->(\@ACTIONS_DETACHED, 'Attach');
+        $set_actions->(\@ACTIONS_DETACHED, $detached_default);
     }
     # Escalating disconnect: xpra viewers occasionally ignore a plain TERM
     # (mid-handshake, stuck modal, hung ssh transport, ...) so the user
