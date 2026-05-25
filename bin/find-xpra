@@ -580,6 +580,11 @@ for my $h (@extra_hosts) {
     next if grep { ($_->{name} // '') eq $h || ($_->{ip} // '') eq $h } @candidates;
     push @candidates, { name => $h, ip => $h, _extra => 1 };
 }
+for my $h (@{ $SETTINGS->{_extra_hosts} // [] }) {
+    my ($n, $ip) = ($h->{name}, $h->{ip});
+    next if grep { ($_->{name} // '') eq $n || ($_->{ip} // '') eq $ip } @candidates;
+    push @candidates, { name => $n, ip => $ip, _extra => 1 };
+}
 
 if ($no_local) {
     @candidates = grep { !$_->{local} } @candidates;
@@ -1880,28 +1885,63 @@ sub _ask_host {
     my $dlg = $parent->Toplevel(-title => 'Add host');
     $dlg->transient($parent);
     $dlg->grab;
-    $dlg->Label(-text => 'Hostname or IP:')->pack(-padx => 8, -pady => [8,4]);
-    my $val = '';
-    my $entry = $dlg->Entry(-textvariable => \$val, -width => 30);
-    $entry->pack(-padx => 8);
-    $entry->focus;
+    $dlg->Label(-text => 'Hostname:')->pack(-padx => 8, -pady => [8,2]);
+    my $name_val = '';
+    my $name_e = $dlg->Entry(-textvariable => \$name_val, -width => 30);
+    $name_e->pack(-padx => 8);
+    $name_e->focus;
+    $dlg->Label(-text => 'IP (optional if hostname resolves):')
+        ->pack(-padx => 8, -pady => [6,2]);
+    my $ip_val = '';
+    my $ip_e = $dlg->Entry(-textvariable => \$ip_val, -width => 30);
+    $ip_e->pack(-padx => 8);
     my $ok;
     my $submit = sub { $ok = 1; $dlg->destroy };
-    $entry->bind('<Return>', $submit);
+    $name_e->bind('<Return>', sub { $ip_e->focus });
+    $ip_e->bind('<Return>', $submit);
     my $bf = $dlg->Frame->pack(-pady => 8);
     $bf->Button(-text => 'OK',     -command => $submit)
        ->pack(-side => 'left', -padx => 4);
     $bf->Button(-text => 'Cancel', -command => sub { $dlg->destroy })
        ->pack(-side => 'left', -padx => 4);
     $dlg->waitWindow;
-    $val =~ s/^\s+|\s+$//g;
-    return $ok ? $val : undef;
+    return undef unless $ok;
+    $name_val =~ s/^\s+|\s+$//g;
+    $ip_val   =~ s/^\s+|\s+$//g;
+    return undef unless length $name_val || length $ip_val;
+    $name_val = $ip_val unless length $name_val;
+    $ip_val = $name_val unless length $ip_val;
+    return { name => $name_val, ip => $ip_val };
+}
+
+sub _remove_extra_host {
+    my ($host) = @_;
+    my $extras = $SETTINGS->{_extra_hosts} // [];
+    @$extras = grep { $_->{name} ne $host } @$extras;
+    _save_settings($SETTINGS);
+    my @keep;
+    for my $s (@sessions) {
+        if ($s->{_extra} && $s->{host} eq $host) {
+            $_->destroy for @{ $s->{_widgets} // [] };
+        } else {
+            push @keep, $s;
+        }
+    }
+    @sessions = @keep;
 }
 
 sub _add_host_probe {
     my ($parent) = @_;
-    my $host = _ask_host($parent);
-    return unless defined $host && length $host;
+    my $h = _ask_host($parent);
+    return unless defined $h;
+    my $host = $h->{name};
+    my $host_ip = $h->{ip};
+    # Persist
+    my $extras = $SETTINGS->{_extra_hosts} //= [];
+    unless (grep { $_->{name} eq $host && $_->{ip} eq $host_ip } @$extras) {
+        push @$extras, { name => $host, ip => $host_ip };
+        _save_settings($SETTINGS);
+    }
     _keys_ensure();
     my $remote = 'show-x11 -ns -id; echo __XPRA__; xpra list; '
                . 'echo __XSTART__; cat ~/.xpra-start; '
@@ -1920,7 +1960,9 @@ sub _add_host_probe {
         open STDIN, '<', '/dev/null';
         $SIG{ALRM} = sub { POSIX::_exit(1) };
         alarm($overall_to + 1);
-        my @cmd = ('ssh', ssh_opts(), $host, $remote);
+        my @cmd = ('ssh', ssh_opts(),
+                   ssh_target({ name => $host, ip => $host_ip }),
+                   $remote);
         if (open my $oh, '-|', @cmd) {
             my ($disp, $in_xpra, $in_xstart, $in_vnc, $in_psvnc, $in_disps) =
                 (undef, 0, 0, 0, 0, 0);
@@ -1998,13 +2040,14 @@ sub _add_host_probe {
     close $wr;
     my $buf = '';
     my $probe_host = $host;
+    my $probe_ip   = $host_ip;
     $mw->fileevent($rd, 'readable', sub {
         my $n = sysread($rd, my $chunk, 4096);
         if (!$n) {
             $mw->fileevent($rd, 'readable', '');
             close $rd;
             waitpid($cpid, 0);
-            _finish_add_host($probe_host);
+            _finish_add_host($probe_host, $probe_ip);
             return;
         }
         $buf .= $chunk;
@@ -2043,7 +2086,7 @@ sub _add_host_probe {
     }
 
     sub _finish_add_host {
-        my ($host) = @_;
+        my ($host, $host_ip) = @_;
         my $own_user = $ssh_user // $ENV{USER} // '';
         my %by_sess;
         for my $key (keys %ah_xpra) {
@@ -2130,8 +2173,9 @@ sub _add_host_probe {
         my @new = values %by_sess;
         for my $s (@new) {
             ($s->{disp_n}) = $s->{disp} =~ /^:(\d+)/;
-            $s->{ip} = $host;
-            $s->{local} = 0;
+            $s->{ip}     = $host_ip;
+            $s->{local}  = 0;
+            $s->{_extra} = 1;
         }
         # If nothing found, offer :0 as fallback
         unless (@new) {
@@ -2224,9 +2268,11 @@ sub _render_row {
             %fg = (-foreground => $s->{_xs_running} ? '#0a7d10' : '#c00000');
         }
     }
+    my @widgets;
     for my $c (0 .. $#vals) {
-        $mw->Label(-text => $vals[$c], -anchor => 'w', -padx => 6, %fg)
-           ->grid(-row => $r, -column => $c, -sticky => 'ew');
+        my $w = $mw->Label(-text => $vals[$c], -anchor => 'w', -padx => 6, %fg);
+        $w->grid(-row => $r, -column => $c, -sticky => 'ew');
+        push @widgets, $w;
     }
     my $sess = $s;
     my @ACTIONS_DETACHED = $sess->{kind} eq 'vnc'
@@ -2246,6 +2292,10 @@ sub _render_row {
            'Connect as VNC', 'X11-VNC',
            'Restart app', 'Restart Xpra', 'Restart Xpra with web',
            '---', 'SSH', 'Helper', 'Apps', 'Settings');
+    if ($sess->{_extra}) {
+        push @ACTIONS_DETACHED, '---', 'Remove';
+        push @ACTIONS_ATTACHED, '---', 'Remove';
+    }
     my $detached_default = $sess->{kind} eq 'X' ? 'Connect as VNC' : 'Attach';
     my $action = $detached_default;
     my $current_opts = \@ACTIONS_DETACHED;
@@ -2329,6 +2379,10 @@ sub _render_row {
             elsif ($picked eq 'Helper') {
                 spawn_detached('xpra-helper', '--pin');
             }
+            elsif ($picked eq 'Remove') {
+                _remove_extra_host($sess->{host});
+                return;
+            }
             elsif ($picked eq 'Apps') {
                 _show_procs($sess);
             }
@@ -2369,8 +2423,10 @@ sub _render_row {
             }
             $action = $default_action->();
         });
+    push @widgets, $action_mb, $go_btn;
     $action_mb->grid(-row => $r, -column => 5, -padx => 6, -pady => 1, -sticky => 'ew');
     $go_btn   ->grid(-row => $r, -column => 6, -padx => 6, -pady => 1, -sticky => 'ew');
+    $sess->{_widgets} = \@widgets;
     $sess->{_enable_browser} = sub {
         return if grep { $_ eq 'Attach Browser' } @ACTIONS_DETACHED;
         splice(@ACTIONS_DETACHED, 1, 0, 'Attach Browser');
