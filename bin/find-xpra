@@ -1976,8 +1976,8 @@ for my $s (@sessions) {
     my @ACTIONS_DETACHED = $sess->{kind} eq 'vnc'
         ? ('Attach', '---', 'Apps', 'Settings')
         : $sess->{kind} eq 'X'
-        ? ('Connect as VNC', '---', 'Settings')
-        : ('Attach', 'Connect as VNC',
+        ? ('Connect as VNC', 'X11-VNC', '---', 'Settings')
+        : ('Attach', 'Connect as VNC', 'X11-VNC',
            'Restart app', 'Restart Xpra', 'Restart Xpra with web',
            '---', 'Helper', 'Apps', 'Settings');
     my @ACTIONS_ATTACHED = $sess->{kind} eq 'vnc'
@@ -1987,7 +1987,7 @@ for my $s (@sessions) {
         ? ('Disconnect', 'Force kill', 'KILL',
            '---', 'Settings')
         : ('Disconnect', 'Force kill', 'KILL', 'Terminal',
-           'Connect as VNC',
+           'Connect as VNC', 'X11-VNC',
            'Restart app', 'Restart Xpra', 'Restart Xpra with web',
            '---', 'Helper', 'Apps', 'Settings');
     my $detached_default = $sess->{kind} eq 'X' ? 'Connect as VNC' : 'Attach';
@@ -2048,6 +2048,13 @@ for my $s (@sessions) {
             if ($picked eq 'Connect as VNC') {
                 _keys_ensure() unless $sess->{local};
                 my $pid = spawn_attach(_vnc_attach_cmd($sess));
+                $sess->{pid} = $pid;
+                $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
+                return;
+            }
+            if ($picked eq 'X11-VNC') {
+                _keys_ensure() unless $sess->{local};
+                my $pid = spawn_attach(_x11vnc_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
                 return;
@@ -2434,6 +2441,37 @@ sub _vnc_attach_cmd {
     my $script = "$ssh_str & VNC_SSH=\$!; sleep 1; "
                . "${env_sh}net-vnc localhost::$local_port; "
                . "kill \$VNC_SSH 2>/dev/null";
+    return ('bash', '-c', $script);
+}
+
+sub _x11vnc_cmd {
+    my ($s) = @_;
+    (my $disp_n = $s->{disp}) =~ s/^://;
+    my $rfb_port = 5900 + $disp_n;
+    my $local_port = 15900 + $disp_n;
+    my $env_sh = '';
+    if (defined(my $zoom = _zoom_for($s->{host}))) {
+        my $scale = sprintf("%.2f", $zoom / 100);
+        $env_sh = "FLTK_SCALING_FACTOR=$scale GDK_DPI_SCALE=$scale"
+                . " QT_SCALE_FACTOR=$scale ";
+    }
+    my $name = $s->{host};
+    my $ip   = $s->{ip};
+    my @tgt  = ssh_target({ name => $name, ip => $ip });
+    my $login_user = $s->{_attach_as};
+    if (defined $login_user) {
+        $tgt[-1] =~ s/^[^\@]*\@//;
+        $tgt[-1] = "$login_user\@$tgt[-1]";
+    }
+    my @sopts = ssh_opts();
+    my $ssh_str = join(' ', map { /[\s'"]/ ? "'$_'" : $_ }
+                       ('ssh', @sopts, @tgt,
+                        '-L', "$local_port:localhost:$rfb_port"));
+    my $script = "$ssh_str "
+               . "'x11vnc -display :$disp_n -rfbport $rfb_port -nopw -once' "
+               . "& X11VNC_SSH=\$!; sleep 2; "
+               . "${env_sh}net-vnc localhost::$local_port; "
+               . "kill \$X11VNC_SSH 2>/dev/null";
     return ('bash', '-c', $script);
 }
 
