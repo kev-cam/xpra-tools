@@ -226,20 +226,19 @@ sub _keys_wait_ready {
 }
 
 sub ssh_opts {
+    my (%o) = @_;
     my @opts = (
         '-o', "ConnectTimeout=$ssh_to",
         '-o', 'StrictHostKeyChecking=accept-new',
         '-o', 'ServerAliveInterval=3',
         '-o', 'ServerAliveCountMax=2',
     );
-    # Identity: --ssh-key wins, else fall back to the per-user key the
-    # picker's "Keys" dialog saved in $SETTINGS->{_user_keys}{$user}.
     my $key = $ssh_key;
     if (!defined $key && defined $ssh_user) {
         $key = $SETTINGS->{_user_keys}{$ssh_user};
     }
     push @opts, '-i', $key if defined $key && length $key;
-    if ($no_prompt) {
+    if ($no_prompt && !$o{interactive}) {
         push @opts,
             '-o', 'BatchMode=yes',
             '-o', 'NumberOfPasswordPrompts=0',
@@ -2831,7 +2830,7 @@ sub _vnc_attach_cmd {
         return (@env, 'net-vnc', "localhost:$disp_n");
     }
     my @tgt  = ssh_target(_sess_target($s));
-    my @sopts = ssh_opts();
+    my @sopts = ssh_opts(interactive => 1);
     my $local_port = 15900 + $disp_n;
     my $ssh_str = join(' ', map { /[\s'"]/ ? "'$_'" : $_ }
                        ('ssh', @sopts, @tgt,
@@ -2881,7 +2880,7 @@ sub _x11vnc_cmd {
         $tgt[-1] =~ s/^[^\@]*\@//;
         $tgt[-1] = "$login_user\@$tgt[-1]";
     }
-    my @sopts = ssh_opts();
+    my @sopts = ssh_opts(interactive => 1);
     my $ssh_str = join(' ', map { /[\s'"]/ ? "'$_'" : $_ }
                        ('ssh', @sopts, @tgt,
                         '-L', "$local_port:localhost:$rfb_port"));
@@ -2910,7 +2909,7 @@ sub _launch_xpra_cmd {
         push @lx, '--web' if $action eq 'Restart Xpra with web';
     }
     return @lx if $s->{local};
-    return ('ssh', ssh_opts(),
+    return ('ssh', ssh_opts(interactive => 1),
             ssh_target(_sess_target($s)),
             @lx);
 }
@@ -2993,7 +2992,7 @@ sub _zoom_for {
 sub _ssh_cmd {
     my ($s) = @_;
     my $term = _terminal_for($s->{host});
-    my @ssh = ('ssh', ssh_opts(),
+    my @ssh = ('ssh', ssh_opts(interactive => 1),
                ssh_target(_sess_target($s)));
     my $login_user = $s->{_attach_as};
     if (defined $login_user) {
@@ -3025,7 +3024,7 @@ sub _term_cmd {
     # the remote shell, which re-parses.  Without literal single quotes
     # around the bash arg, the remote shell would interpret the parens
     # as a subshell of *its own* and bash -c would get an empty arg.
-    return ('ssh', ssh_opts(),
+    return ('ssh', ssh_opts(interactive => 1),
             ssh_target(_sess_target($s)),
             'bash', '-c', "'$cmd'");
 }
