@@ -2402,10 +2402,8 @@ sub _render_row {
     }
     my @widgets;
     for my $c (0 .. $#vals) {
-        my @extra;
-        @extra = (-width => 1) if $c == 2;
         my $w = $rows_f->Label(-text => $vals[$c], -anchor => 'w',
-                               -padx => 6, @extra, %fg);
+                               -padx => 6, %fg);
         $w->grid(-row => $r, -column => $c + 2, -sticky => 'ew');
         push @widgets, $w;
     }
