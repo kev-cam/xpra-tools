@@ -1873,6 +1873,8 @@ sub _scan_attached {
 # the window up so several sessions can be attached.  Closing the window
 # (regular decoration) ends the program.
 
+my $mw;
+
 sub _ask_host {
     my ($parent) = @_;
     my $dlg = $parent->Toplevel(-title => 'Add host');
@@ -1896,8 +1898,274 @@ sub _ask_host {
     return $ok ? $val : undef;
 }
 
+sub _add_host_probe {
+    my ($parent) = @_;
+    my $host = _ask_host($parent);
+    return unless defined $host && length $host;
+    _keys_ensure();
+    my $remote = 'show-x11 -ns -id; echo __XPRA__; xpra list; '
+               . 'echo __XSTART__; cat ~/.xpra-start; '
+               . 'echo __VNC__; (ss -tln 2>/dev/null || netstat -tln 2>/dev/null); '
+               . 'echo __PSVNC__; ps -eo user,pid,args';
+    $remote .= q{; echo __DISPLAYS__; stat -c '%n %U' /tmp/.X11-unix/X*}
+        if $any;
+    pipe(my $rd, my $wr) or do { warn "add-host pipe: $!\n"; return };
+    my $cpid = fork;
+    if (!defined $cpid) { warn "add-host fork: $!\n"; close $rd; close $wr; return }
+    if (!$cpid) {
+        close $rd;
+        $wr->autoflush(1);
+        open STDERR, '>', '/dev/null' unless $debug;
+        POSIX::setsid();
+        open STDIN, '<', '/dev/null';
+        $SIG{ALRM} = sub { POSIX::_exit(1) };
+        alarm($overall_to + 1);
+        my @cmd = ('ssh', ssh_opts(), $host, $remote);
+        if (open my $oh, '-|', @cmd) {
+            my ($disp, $in_xpra, $in_xstart, $in_vnc, $in_psvnc, $in_disps) =
+                (undef, 0, 0, 0, 0, 0);
+            my %vnc_seen;
+            while (defined(my $line = <$oh>)) {
+                chomp $line;
+                if ($line eq '__XPRA__')     { $in_xpra=1; $in_xstart=0; $in_vnc=0; $in_disps=0; $in_psvnc=0; next }
+                if ($line eq '__XSTART__')  { $in_xpra=0; $in_xstart=1; $in_vnc=0; $in_disps=0; $in_psvnc=0; next }
+                if ($line eq '__VNC__')     { $in_xpra=0; $in_xstart=0; $in_vnc=1; $in_disps=0; $in_psvnc=0; next }
+                if ($line eq '__PSVNC__')   { $in_xpra=0; $in_xstart=0; $in_vnc=0; $in_disps=0; $in_psvnc=1; next }
+                if ($line eq '__DISPLAYS__'){ $in_xpra=0; $in_xstart=0; $in_vnc=0; $in_disps=1; $in_psvnc=0; next }
+                if ($in_vnc) {
+                    if ($line =~ /:(\d+)\b/ && $1 >= 5900 && $1 <= 5999) {
+                        my $port = $1 + 0;
+                        next if $vnc_seen{$port}++;
+                        my $dn = $port - 5900;
+                        print { $wr } "__vnc__\t$host\t$dn\t$port\n";
+                    }
+                    next;
+                }
+                if ($in_xpra) {
+                    if ($line =~ /\s+:(\d+)\s*$/) {
+                        print { $wr } "__xpra__\t$host\t:$1\n";
+                    }
+                    next;
+                }
+                if ($in_xstart) {
+                    if ($line =~ /^(\d+)\s+(.+)/) {
+                        print { $wr } "__xs__\t$host\t$1\t$2\n";
+                    }
+                    next;
+                }
+                if ($in_disps) {
+                    if ($line =~ m{/tmp/\.X11-unix/X(\d+)\s+(\S+)}) {
+                        print { $wr } "__disp__\t$host\t$1\t$2\n";
+                    }
+                    next;
+                }
+                if ($in_psvnc) {
+                    if ($line =~ /^\s*(\S+)\s+(\d+)\s+(.*)/) {
+                        my ($u, $pid, $cmd) = ($1, $2, $3);
+                        if ($cmd =~ m{(?:Xtightvnc|Xvnc|x11vnc|Xtigervnc|krfb|vino-server|tigervncserver)\b}) {
+                            my $dn;
+                            $dn = $1 if $cmd =~ /\s:(\d+)\b/;
+                            my $port;
+                            $port = $1 if $cmd =~ /-rfbport\s+(\d+)/;
+                            print { $wr } join("\t", "__psvnc__", $host,
+                                               $dn // '', $port // '', $u), "\n"
+                                if defined $dn;
+                        }
+                        elsif ($cmd =~ m{(?:Xdummy|Xvfb|xpra\s+start)\b}) {
+                            my $dn;
+                            $dn = $1 if $cmd =~ /\s:(\d+)\b/;
+                            print { $wr } "__psxpra__\t$host\t$dn\t$u\n"
+                                if defined $dn;
+                        }
+                    }
+                    next;
+                }
+                # show-x11 output
+                if ($line =~ /^# host:\s+\S+\s+id:\s+(\S+)/) {
+                    print { $wr } "__id__\t$host\t$1\n";
+                    next;
+                }
+                if ($line =~ /^:(\d+)\b/) { $disp = ":$1" }
+                next unless defined $disp;
+                if ($line =~ /^\s+(\d+)\s+(\S+)\s+(.*)/) {
+                    print { $wr } join("\t", $host, $disp, $1, $2, $3), "\n";
+                }
+            }
+            close $oh;
+        }
+        POSIX::_exit(0);
+    }
+    close $wr;
+    my $buf = '';
+    my $probe_host = $host;
+    $mw->fileevent($rd, 'readable', sub {
+        my $n = sysread($rd, my $chunk, 4096);
+        if (!$n) {
+            $mw->fileevent($rd, 'readable', '');
+            close $rd;
+            waitpid($cpid, 0);
+            _finish_add_host($probe_host);
+            return;
+        }
+        $buf .= $chunk;
+        while ($buf =~ s/^([^\n]*)\n//) {
+            _parse_add_host_line($probe_host, $1);
+        }
+    });
+}
+
+{
+    my (%ah_xpra, %ah_vnc, %ah_xs, %ah_disp, @ah_psvnc, @ah_psxpra, @ah_rows);
+
+    sub _parse_add_host_line {
+        my ($host, $line) = @_;
+        if ($line =~ /^__xpra__\t([^\t]*)\t([^\t]*)$/) {
+            $ah_xpra{"$1\t$2"} = 1;
+        } elsif ($line =~ /^__vnc__\t([^\t]*)\t([^\t]*)\t([^\t]*)$/) {
+            $ah_vnc{"$1\t$2"} = $3 + 0;
+        } elsif ($line =~ /^__xs__\t([^\t]*)\t([^\t]*)\t([^\t]*)$/) {
+            push @{ $ah_xs{$1} }, { disp_n => $2 + 0, cmd => $3 };
+        } elsif ($line =~ /^__disp__\t([^\t]*)\t([^\t]*)\t([^\t]*)$/) {
+            $ah_disp{"$1\t$2"} = $3;
+        } elsif ($line =~ /^__psvnc__\t/) {
+            my @f = split /\t/, $line;
+            push @ah_psvnc, { host => $f[1], disp_n => $f[2]+0,
+                              port => (length $f[3] ? $f[3]+0 : undef),
+                              user => $f[4] } if length $f[2];
+        } elsif ($line =~ /^__psxpra__\t([^\t]*)\t([^\t]*)\t([^\t]*)$/) {
+            push @ah_psxpra, { host => $1, disp_n => $2+0, user => $3 };
+        } elsif ($line =~ /^__id__\t/) {
+            # ignore machine-id for add-host
+        } else {
+            my @f = split /\t/, $line, 5;
+            push @ah_rows, \@f if @f == 5;
+        }
+    }
+
+    sub _finish_add_host {
+        my ($host) = @_;
+        my $own_user = $ssh_user // $ENV{USER} // '';
+        my %by_sess;
+        for my $key (keys %ah_xpra) {
+            my ($h, $disp) = split /\t/, $key, 2;
+            $by_sess{$key} = { host=>$h, disp=>$disp, user=>$own_user,
+                                cmds=>[], procs=>[], n=>0, kind=>'xpra',
+                                xpra_listed=>1 };
+        }
+        for my $key (keys %ah_vnc) {
+            my ($h, $dn) = split /\t/, $key, 2;
+            my $sk = "$h\t:$dn";
+            if (my $e = $by_sess{$sk}) {
+                $e->{kind} = 'vnc' unless $e->{kind} eq 'xpra';
+                $e->{vnc_port} //= $ah_vnc{$key};
+            } else {
+                $by_sess{$sk} = { host=>$h, disp=>":$dn", user=>$own_user,
+                                   cmds=>[], procs=>[], n=>0, kind=>'vnc',
+                                   vnc_port=>$ah_vnc{$key} };
+            }
+        }
+        for my $key (keys %ah_disp) {
+            my ($h, $dn) = split /\t/, $key, 2;
+            my $sk = "$h\t:$dn";
+            my $owner = $ah_disp{$key};
+            my $is_vnc = $ah_vnc{"$h\t$dn"} ? 1 : 0;
+            if (my $e = $by_sess{$sk}) {
+                $e->{user} = $owner;
+                if ($is_vnc) {
+                    $e->{kind} = 'vnc' unless $e->{kind} eq 'xpra';
+                    $e->{vnc_port} //= 5900 + $dn;
+                }
+            } else {
+                my $kind = $is_vnc ? 'vnc' : $dn == 0 ? 'X' : 'xpra';
+                $by_sess{$sk} = { host=>$h, disp=>":$dn", user=>$owner,
+                                   cmds=>[], procs=>[], n=>0, kind=>$kind,
+                                   ($is_vnc ? (vnc_port => 5900+$dn) : ()) };
+            }
+        }
+        for my $v (@ah_psvnc) {
+            my $sk = "$v->{host}\t:$v->{disp_n}";
+            if (my $e = $by_sess{$sk}) {
+                $e->{kind} = 'vnc' unless $e->{kind} eq 'xpra';
+                $e->{vnc_port} //= $v->{port} if defined $v->{port};
+                $e->{user} = $v->{user} if defined $v->{user} && length $v->{user};
+            } else {
+                $by_sess{$sk} = { host=>$v->{host}, disp=>":$v->{disp_n}",
+                                   user=>$v->{user}, cmds=>[], procs=>[], n=>0,
+                                   kind=>'vnc', vnc_port=>$v->{port} };
+            }
+        }
+        for my $v (@ah_psxpra) {
+            my $sk = "$v->{host}\t:$v->{disp_n}";
+            if (my $e = $by_sess{$sk}) {
+                $e->{kind} //= 'xpra';
+                $e->{user} = $v->{user} if defined $v->{user} && length $v->{user};
+            } else {
+                $by_sess{$sk} = { host=>$v->{host}, disp=>":$v->{disp_n}",
+                                   user=>$v->{user}, cmds=>[], procs=>[], n=>0,
+                                   kind=>'xpra' };
+            }
+        }
+        for my $row (@ah_rows) {
+            my ($h, $disp, $pid, $user, $cmd) = @$row;
+            my $sk = "$h\t$disp";
+            my ($dn) = $disp =~ /^:(\d+)$/;
+            my $kind_default = (defined $dn && $dn >= 20) ? 'xpra' : 'X';
+            my $s = $by_sess{$sk} //= { host=>$h, disp=>$disp, user=>$user,
+                                          cmds=>[], procs=>[], n=>0, kind=>$kind_default };
+            $s->{kind} = 'xpra' if $ah_xpra{"$h\t$disp"};
+            $s->{user} = $user if length $user && !length($s->{user} // '');
+            $s->{n}++;
+            next if $cmd =~ m{\b(?:dbus-daemon|dbus-launch|dconf-service|gvfsd|gvfs-?\S*|xdg-\S+|ibus-\S+|pulseaudio|gnome-keyring|at-spi\S*|xpra/?\S*daemonizer|sleep)\b};
+            next if $cmd =~ m{/sbin/init|/lib/systemd|cron|sshd|mate-session|lxsession};
+            next if $cmd =~ m{(?:crashhelper|-helper\b|RemoteSandbox|GMPProcess|NetworkBroker|content-process)};
+            next if $cmd =~ m{\s-contentproc\b|\s--type=\S};
+            if ($cmd =~ m{^(?:\S*/)?(?:Xvnc|Xtightvnc|x11vnc|Xtigervnc|krfb|vino-server|tigervncserver)\b}) {
+                $s->{kind} = 'vnc' unless $s->{kind} eq 'xpra';
+                $s->{vnc_port} //= 5900 + $dn if defined $dn;
+            }
+            $s->{vnc_port} //= $ah_vnc{"$h\t$dn"} if defined $dn;
+            next if $cmd =~ m{^(?:\S*/)?(?:Xvnc|Xtightvnc|x11vnc|Xvfb|Xorg|Xtigervnc|krfb|vino-server|tigervncserver)\b};
+            push @{ $s->{cmds} }, $cmd;
+        }
+        my @new = values %by_sess;
+        for my $s (@new) {
+            ($s->{disp_n}) = $s->{disp} =~ /^:(\d+)/;
+            $s->{ip} = $host;
+            $s->{local} = 0;
+        }
+        # If nothing found, offer :0 as fallback
+        unless (@new) {
+            push @new, { host => $host, disp => ':0', disp_n => 0,
+                         ip => $host, local => 0, kind => 'X',
+                         user => $own_user, cmds => [], procs => [], n => 0,
+                         apps => '(root display)', _extra => 1 };
+        }
+        # Label apps
+        for my $s (@new) {
+            next if $s->{_extra} && defined $s->{apps};
+            my $main = _main_cmd(@{ $s->{cmds} });
+            my $other = $any && defined $s->{user} && length $s->{user}
+                      && $s->{user} ne $own_user;
+            $s->{_attach_as} = $s->{user} if $other;
+            $s->{apps} = length $main        ? _fmt_cmd($main, 60)
+                       : $s->{xpra_listed}   ? '(empty xpra)'
+                       : $s->{kind} eq 'vnc' ? '(vnc)'
+                       : $other              ? '(login required)'
+                       :                       '(daemons only)';
+        }
+        @new = sort { $a->{disp_n} <=> $b->{disp_n} } @new;
+        for my $s (@new) {
+            push @sessions, $s;
+            _render_row($s);
+        }
+        # Reset accumulators
+        %ah_xpra = (); %ah_vnc = (); %ah_xs = (); %ah_disp = ();
+        @ah_psvnc = (); @ah_psxpra = (); @ah_rows = ();
+    }
+}
+
 _dbg("[debug] parent: requiring Tk for chooser");
-my $mw = _tk_mw();
+$mw = _tk_mw();
 _dbg("[debug] parent: MainWindow created");
 $mw->title('find-xpra: attach to X11 session');
 $mw->deiconify;
@@ -1914,11 +2182,7 @@ $header_f->Button(-text => 'Rescan',
                   -command => sub { exec { $^X } $^X, $0, @ORIG_ARGV })
          ->pack(-side => 'left', -fill => 'x', -expand => 1);
 $header_f->Button(-text => 'Add host',
-                  -command => sub {
-                      my $host = _ask_host($mw);
-                      return unless defined $host && length $host;
-                      exec { $^X } $^X, $0, @ORIG_ARGV, '--host', $host;
-                  })
+                  -command => sub { _add_host_probe($mw) })
          ->pack(-side => 'left', -fill => 'x', -expand => 1);
 # Global default DPI — passed to `xpra attach --dpi=N` for every session
 # unless the host's Settings dialog overrides it.  Blank means "let xpra
@@ -1949,11 +2213,9 @@ for my $i (0 .. $#cols) {
        ->grid(-row => 1, -column => $i, -sticky => 'ew');
 }
 my $r = 2;
-for my $s (@sessions) {
+sub _render_row {
+    my ($s) = @_;
     my @vals = ($s->{host}, $s->{disp}, $s->{kind}, $s->{user}, $s->{apps});
-    # When the row was sourced from a remote ~/.xpra-start, color it
-    # green if the listed app appears to be running on its display, red
-    # otherwise.  Plain detected sessions stay the default colour.
     my %fg;
     if (defined $s->{_xs_cmd}) {
         if ($s->{_xs_other_user}) {
@@ -1966,13 +2228,7 @@ for my $s (@sessions) {
         $mw->Label(-text => $vals[$c], -anchor => 'w', -padx => 6, %fg)
            ->grid(-row => $r, -column => $c, -sticky => 'ew');
     }
-    my $sess = $s;     # closure capture
-    # Action menu + Go button.  The dropdown reflects what's possible for
-    # the session's current state — Attach when detached; Disconnect /
-    # Force kill / KILL / Terminal when an xpra-attach child is alive
-    # (Terminal would pop a window on a display nobody's viewing if we
-    # offered it before attaching).  "Attach Browser" is appended to both
-    # lists when the async HTML5-port probe (below) finds xpra-web open.
+    my $sess = $s;
     my @ACTIONS_DETACHED = $sess->{kind} eq 'vnc'
         ? ('Attach', '---', 'Apps', 'Settings')
         : $sess->{kind} eq 'X'
@@ -1993,17 +2249,10 @@ for my $s (@sessions) {
     my $detached_default = $sess->{kind} eq 'X' ? 'Connect as VNC' : 'Attach';
     my $action = $detached_default;
     my $current_opts = \@ACTIONS_DETACHED;
-    # Default-action helper: the menu reverts to this after any Go click
-    # so the dropdown always shows the most likely next action for the
-    # session's state, not the one the user just fired.
     my $default_action = sub {
         return $sess->{pid} ? 'Disconnect' : $detached_default;
     };
     my ($action_mb, $action_menu);
-    # Rebuild the menu items for the currently displayed list.  When
-    # $default is defined, also reset $action (state flip).  Without
-    # $default, keep $action if still valid in the new list (used after
-    # the browser probe appends "Attach Browser" mid-session).
     my $set_actions = sub {
         my ($opts, $default) = @_;
         $current_opts = $opts if defined $opts;
@@ -2038,10 +2287,6 @@ for my $s (@sessions) {
     } else {
         $set_actions->(\@ACTIONS_DETACHED, $detached_default);
     }
-    # Escalating disconnect: xpra viewers occasionally ignore a plain TERM
-    # (mid-handshake, stuck modal, hung ssh transport, ...) so the user
-    # can step up explicitly via the menu — TERM pid, then TERM the whole
-    # process group (ssh + xpra workers), then KILL the group.
     my $go_btn = $mw->Button(-text => "\x{25B6}",
         -command => sub {
             my $picked = $action;
@@ -2066,16 +2311,11 @@ for my $s (@sessions) {
                         ? _vnc_attach_cmd($sess)
                         : _attach_cmd($sess));
                 $sess->{pid} = $pid;
-                # State flip; $set_actions already resets $action to
-                # 'Disconnect' (the new default) so no revert needed.
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
                 return;
             }
             if ($picked eq 'Attach Browser') {
                 my $url = $sess->{_html_url};
-                # Route through xpra-helper so the user's sticky/filter
-                # rules pick the target session + browser profile instead
-                # of dropping the URL on the local default handler.
                 spawn_detached('xpra-helper', $url) if $url;
             }
             elsif ($picked eq 'Terminal') {
@@ -2123,21 +2363,12 @@ for my $s (@sessions) {
                     kill 'KILL',  $pid;
                 }
             }
-            # Revert dropdown to the most-likely next action.  The reap
-            # timer will later flip the whole list back to ACTIONS_DETACHED
-            # if a kill succeeded.
             $action = $default_action->();
         });
     $action_mb->grid(-row => $r, -column => 5, -padx => 6, -pady => 1, -sticky => 'ew');
     $go_btn   ->grid(-row => $r, -column => 6, -padx => 6, -pady => 1, -sticky => 'ew');
-    # Called by the html port-probe fileevent when xpra-web is reachable.
-    # Mutates the action lists in place so future state flips also offer
-    # the browser action; refreshes the visible menu without disturbing
-    # the user's current selection.
     $sess->{_enable_browser} = sub {
         return if grep { $_ eq 'Attach Browser' } @ACTIONS_DETACHED;
-        # Splice in right after the primary action so users don't have
-        # to scroll past kill/restart entries to find it.
         splice(@ACTIONS_DETACHED, 1, 0, 'Attach Browser');
         splice(@ACTIONS_ATTACHED, 1, 0, 'Attach Browser');
         $set_actions->();
@@ -2146,6 +2377,7 @@ for my $s (@sessions) {
     $sess->{_actions_detached} = \@ACTIONS_DETACHED;
     $r++;
 }
+for my $s (@sessions) { _render_row($s) }
 
 # Background HTML5-port probe.  We can't synchronously TCP-connect from
 # the Tk thread without freezing the UI on closed/firewalled ports
@@ -2253,7 +2485,8 @@ $mw->repeat(750, sub {
         if ($gone) {
             $s->{pid} = undef;
             $s->{_adopted} = 0;
-            $s->{_set_actions}->($s->{_actions_detached}, 'Attach');
+            $s->{_set_actions}->($s->{_actions_detached},
+                                 $s->{_actions_detached}[0]);
         }
     }
 });
