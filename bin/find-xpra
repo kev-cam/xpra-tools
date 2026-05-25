@@ -1938,11 +1938,11 @@ sub _ask_host {
 sub _remove_extra_host {
     my ($host) = @_;
     my $extras = $SETTINGS->{_extra_hosts} // [];
-    @$extras = grep { $_->{name} ne $host } @$extras;
+    @$extras = grep { $_->{name} ne $host && $_->{ip} ne $host } @$extras;
     _save_settings($SETTINGS);
     my @keep;
     for my $s (@sessions) {
-        if ($s->{_extra} && $s->{host} eq $host) {
+        if ($s->{_extra} && ($s->{host} eq $host || ($s->{ip} // '') eq $host)) {
             $_->destroy for @{ $s->{_widgets} // [] };
         } else {
             push @keep, $s;
@@ -1958,14 +1958,13 @@ sub _add_host_probe {
     my $host    = $h->{name};
     my $host_ip = $h->{ip};
     my $host_user = $h->{user};
-    # Persist
+    # Persist — remove any stale entries for this name or IP first
     my $extras = $SETTINGS->{_extra_hosts} //= [];
-    unless (grep { $_->{name} eq $host && $_->{ip} eq $host_ip } @$extras) {
-        my $entry = { name => $host, ip => $host_ip };
-        $entry->{user} = $host_user if defined $host_user;
-        push @$extras, $entry;
-        _save_settings($SETTINGS);
-    }
+    @$extras = grep { $_->{name} ne $host && $_->{ip} ne $host_ip } @$extras;
+    my $entry = { name => $host, ip => $host_ip };
+    $entry->{user} = $host_user if defined $host_user;
+    push @$extras, $entry;
+    _save_settings($SETTINGS);
     _keys_ensure();
     my $remote = 'show-x11 -ns -id; echo __XPRA__; xpra list; '
                . 'echo __XSTART__; cat ~/.xpra-start; '
