@@ -260,7 +260,9 @@ sub ssh_target {
     my $ip   = $c->{ip};
     my @args;
     my $host;
-    if (defined $name && defined $ip && $name ne $ip) {
+    if ($c->{_extra}) {
+        $host = $ip // $name;
+    } elsif (defined $name && defined $ip && $name ne $ip) {
         push @args, '-o', "HostName=$ip";
         $host = $name;
     } else {
@@ -269,6 +271,12 @@ sub ssh_target {
     my $user = $c->{ssh_user} // $ssh_user;
     my $login = defined $user ? "$user\@$host" : $host;
     return (@args, $login);
+}
+
+sub _sess_target {
+    my ($s) = @_;
+    return { name => $s->{host}, ip => $s->{ip},
+             ($s->{_extra} ? (_extra => 1) : ()) };
 }
 
 # Resolve the ssh login user for a candidate by consulting ssh_config.
@@ -2722,7 +2730,9 @@ sub _attach_cmd {
     my $name = $s->{host};
     my $ip   = $s->{ip};
     my @opts;
-    if (defined $name && defined $ip && $name ne $ip) {
+    if ($s->{_extra}) {
+        $name = $ip // $name;
+    } elsif (defined $name && defined $ip && $name ne $ip) {
         push @opts, "--ssh=ssh -o HostName=$ip";
     } else {
         $name = $ip if defined $ip;
@@ -2749,9 +2759,7 @@ sub _vnc_attach_cmd {
     if ($s->{local}) {
         return (@env, 'net-vnc', "localhost:$disp_n");
     }
-    my $name = $s->{host};
-    my $ip   = $s->{ip};
-    my @tgt  = ssh_target({ name => $name, ip => $ip });
+    my @tgt  = ssh_target(_sess_target($s));
     my @sopts = ssh_opts();
     my $local_port = 15900 + $disp_n;
     my $ssh_str = join(' ', map { /[\s'"]/ ? "'$_'" : $_ }
@@ -2789,9 +2797,7 @@ sub _x11vnc_cmd {
         $env_sh = "FLTK_SCALING_FACTOR=$scale GDK_DPI_SCALE=$scale"
                 . " QT_SCALE_FACTOR=$scale ";
     }
-    my $name = $s->{host};
-    my $ip   = $s->{ip};
-    my @tgt  = ssh_target({ name => $name, ip => $ip });
+    my @tgt  = ssh_target(_sess_target($s));
     my $login_user = $s->{_attach_as};
     if (defined $login_user) {
         $tgt[-1] =~ s/^[^\@]*\@//;
@@ -2827,7 +2833,7 @@ sub _launch_xpra_cmd {
     }
     return @lx if $s->{local};
     return ('ssh', ssh_opts(),
-            ssh_target({ name => $s->{host}, ip => $s->{ip} }),
+            ssh_target(_sess_target($s)),
             @lx);
 }
 
@@ -2910,7 +2916,7 @@ sub _ssh_cmd {
     my ($s) = @_;
     my $term = _terminal_for($s->{host});
     my @ssh = ('ssh', ssh_opts(),
-               ssh_target({ name => $s->{host}, ip => $s->{ip} }));
+               ssh_target(_sess_target($s)));
     my $login_user = $s->{_attach_as};
     if (defined $login_user) {
         $ssh[-1] =~ s/^[^\@]*\@//;
@@ -2942,7 +2948,7 @@ sub _term_cmd {
     # around the bash arg, the remote shell would interpret the parens
     # as a subshell of *its own* and bash -c would get an empty arg.
     return ('ssh', ssh_opts(),
-            ssh_target({ name => $s->{host}, ip => $s->{ip} }),
+            ssh_target(_sess_target($s)),
             'bash', '-c', "'$cmd'");
 }
 
