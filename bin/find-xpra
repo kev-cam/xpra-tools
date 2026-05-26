@@ -1755,8 +1755,10 @@ if ($any) {
     }
 }
 
+my %_usage = %{ $SETTINGS->{_usage} // {} };
 @sessions = sort {
        ($b->{local}//0) <=> ($a->{local}//0)
+    || ($_usage{$b->{host}}//0) <=> ($_usage{$a->{host}}//0)
     || $a->{host} cmp $b->{host}
     || $a->{disp_n} <=> $b->{disp_n}
 } @sessions;
@@ -2311,7 +2313,7 @@ $mw = _tk_mw();
 _dbg("[debug] parent: MainWindow created");
 $mw->title('find-xpra: attach to X11 session');
 $mw->deiconify;
-my @cols = ('', '', 'Host', 'Disp', 'Info');
+my @cols = ('', '', 'Host', 'Disp', 'User', 'Info');
 
 # Rescan: re-exec self with the same args.  Discovery runs again and the
 # UI rebuilds.  In-flight xpra-attach children are setsid'd so they
@@ -2355,7 +2357,7 @@ for my $i (0 .. $#cols) {
                   -relief => 'ridge', -padx => 6, -pady => 2)
        ->grid(-row => 0, -column => $i, -sticky => 'ew');
 }
-$hdr_f->gridColumnconfigure(4, -weight => 1);
+$hdr_f->gridColumnconfigure(5, -weight => 1);
 
 my $canvas = $mw->Canvas(-highlightthickness => 0);
 my $scroll = $mw->Scrollbar(-orient => 'vertical', -command => ['yview', $canvas]);
@@ -2364,7 +2366,7 @@ $scroll->pack(-side => 'right', -fill => 'y');
 $canvas->pack(-side => 'left', -fill => 'both', -expand => 1);
 $rows_f = $canvas->Frame;
 my $rows_id = $canvas->createWindow(0, 0, -window => $rows_f, -anchor => 'nw');
-$rows_f->gridColumnconfigure(4, -weight => 1, -minsize => 0);
+$rows_f->gridColumnconfigure(5, -weight => 1, -minsize => 0);
 $_update_scroll = sub {
     $rows_f->update;
     $canvas->configure(-scrollregion => [$canvas->bbox('all')]);
@@ -2381,17 +2383,14 @@ $canvas->Tk::bind('<Button-5>', sub { $canvas->yview('scroll',  3, 'units') });
 my $r = 0;
 sub _render_row {
     my ($s) = @_;
-    my $own_user = $ssh_user // $ENV{USER} // '';
     my @info;
     push @info, $s->{kind} if defined $s->{kind} && $s->{kind} ne 'xpra';
-    my $su = $s->{user} // '';
-    push @info, $su if length $su && $su ne $own_user;
     if (defined $s->{apps} && $s->{apps} ne '(root display)'
         && $s->{apps} ne '(daemons only)') {
         push @info, $s->{apps};
     }
     my $info = join(' | ', @info);
-    my @vals = ($s->{host}, $s->{disp}, $info);
+    my @vals = ($s->{host}, $s->{disp}, $s->{user} // '', $info);
     my %fg;
     if (defined $s->{_xs_cmd}) {
         if ($s->{_xs_other_user}) {
@@ -2489,12 +2488,14 @@ sub _render_row {
             my $picked = $action;
             if ($picked eq 'Secure VNC') {
                 _keys_ensure() unless $sess->{local};
+                _bump_usage($sess->{host});
                 my $pid = spawn_attach(_vnc_attach_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
                 return;
             }
             if ($picked eq 'Insecure VNC') {
+                _bump_usage($sess->{host});
                 my $pid = spawn_attach(_vnc_direct_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
@@ -2502,6 +2503,7 @@ sub _render_row {
             }
             if ($picked eq 'X11-VNC') {
                 _keys_ensure() unless $sess->{local};
+                _bump_usage($sess->{host});
                 my $pid = spawn_attach(_x11vnc_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
@@ -2509,6 +2511,7 @@ sub _render_row {
             }
             if ($picked eq 'Attach') {
                 _keys_ensure() unless $sess->{local};
+                _bump_usage($sess->{host});
                 my $pid = spawn_attach(
                     $sess->{kind} eq 'vnc'
                         ? _vnc_attach_cmd($sess)
@@ -2962,6 +2965,12 @@ sub _x11vnc_cmd {
                . "${env_sh}net-vnc localhost::$local_port; "
                . "kill \$X11VNC_SSH 2>/dev/null";
     return ('bash', '-c', $script);
+}
+
+sub _bump_usage {
+    my ($host) = @_;
+    $SETTINGS->{_usage}{$host} = ($SETTINGS->{_usage}{$host} // 0) + 1;
+    _save_settings($SETTINGS);
 }
 
 # Build a launch-xpra invocation for the given session and action
