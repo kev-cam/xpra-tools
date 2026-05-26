@@ -2312,7 +2312,21 @@ _dbg("[debug] parent: requiring Tk for chooser");
 $mw = _tk_mw();
 _dbg("[debug] parent: MainWindow created");
 $mw->title('find-xpra: attach to X11 session');
+if (my $geo = $SETTINGS->{_geometry}) {
+    $mw->geometry($geo);
+}
 $mw->deiconify;
+my $_save_geometry = sub {
+    my $g = $mw->geometry;
+    if (defined $g && $g =~ /\d+x\d+[+-]/) {
+        $SETTINGS->{_geometry} = $g;
+        _save_settings($SETTINGS);
+    }
+};
+$mw->protocol('WM_DELETE_WINDOW', sub {
+    $_save_geometry->();
+    $mw->destroy;
+});
 my @cols = ('', '', 'Host', 'Disp', 'User', 'Info');
 
 # Rescan: re-exec self with the same args.  Discovery runs again and the
@@ -2322,7 +2336,7 @@ my @cols = ('', '', 'Host', 'Disp', 'User', 'Info');
 my $header_f = $mw->Frame;
 $header_f->pack(-fill => 'x', -padx => 6, -pady => 4);
 $header_f->Button(-text => 'Rescan',
-                  -command => sub { exec { $^X } $^X, $0, @ORIG_ARGV })
+                  -command => sub { $_save_geometry->(); exec { $^X } $^X, $0, @ORIG_ARGV })
          ->pack(-side => 'left', -fill => 'x', -expand => 1);
 $header_f->Button(-text => 'Add host',
                   -command => sub { _add_host_probe($mw) })
