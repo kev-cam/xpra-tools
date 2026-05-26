@@ -2524,6 +2524,7 @@ sub _render_row {
             if ($picked eq 'Secure VNC') {
                 _keys_ensure() unless $sess->{local};
                 _bump_usage($sess->{host}, $picked);
+                $detached_default = $picked;
                 my $pid = spawn_attach(_vnc_attach_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
@@ -2531,6 +2532,7 @@ sub _render_row {
             }
             if ($picked eq 'Insecure VNC') {
                 _bump_usage($sess->{host}, $picked);
+                $detached_default = $picked;
                 my $pid = spawn_attach(_vnc_direct_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
@@ -2539,6 +2541,7 @@ sub _render_row {
             if ($picked eq 'X11-VNC') {
                 _keys_ensure() unless $sess->{local};
                 _bump_usage($sess->{host}, $picked);
+                $detached_default = $picked;
                 my $pid = spawn_attach(_x11vnc_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
@@ -2547,6 +2550,7 @@ sub _render_row {
             if ($picked eq 'Attach') {
                 _keys_ensure() unless $sess->{local};
                 _bump_usage($sess->{host}, $picked);
+                $detached_default = $picked;
                 my $pid = spawn_attach(
                     $sess->{kind} eq 'vnc'
                         ? _vnc_attach_cmd($sess)
@@ -2632,6 +2636,7 @@ sub _render_row {
     };
     $sess->{_set_actions}      = $set_actions;
     $sess->{_actions_detached} = \@ACTIONS_DETACHED;
+    $sess->{_detached_default} = \$detached_default;
     $r++;
 }
 for my $s (@sessions) { _render_row($s) }
@@ -2744,7 +2749,7 @@ $mw->repeat(750, sub {
             $s->{pid} = undef;
             $s->{_adopted} = 0;
             $s->{_set_actions}->($s->{_actions_detached},
-                                 $s->{_actions_detached}[0]);
+                                 ${$s->{_detached_default}});
         }
     }
 });
