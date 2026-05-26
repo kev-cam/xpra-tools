@@ -2899,6 +2899,22 @@ sub _attach_cmd {
     return (_xpra_bin(), 'attach', @opts, @dpi_opts, $url);
 }
 
+sub _free_port {
+    my ($preferred) = @_;
+    require IO::Socket::INET;
+    for my $p ($preferred, $preferred + 100, 0) {
+        my $s = IO::Socket::INET->new(
+            LocalAddr => '127.0.0.1', LocalPort => $p,
+            Proto => 'tcp', Listen => 1, ReuseAddr => 1);
+        if ($s) {
+            my $port = $s->sockport;
+            close $s;
+            return $port;
+        }
+    }
+    return $preferred;
+}
+
 sub _vnc_attach_cmd {
     my ($s) = @_;
     (my $disp_n = $s->{disp}) =~ s/^://;
@@ -2916,7 +2932,7 @@ sub _vnc_attach_cmd {
     }
     my @tgt  = ssh_target(_sess_target($s));
     my @sopts = ssh_opts(interactive => 1);
-    my $local_port = 15900 + $disp_n;
+    my $local_port = _free_port(15900 + $disp_n);
     my $ssh_str = join(' ', map { /[\s'"]/ ? "'$_'" : $_ }
                        ('ssh', @sopts, @tgt,
                         '-L', "$local_port:localhost:$port", '-N'));
@@ -2952,7 +2968,7 @@ sub _x11vnc_cmd {
     my ($s) = @_;
     (my $disp_n = $s->{disp}) =~ s/^://;
     my $rfb_port = 5900 + $disp_n;
-    my $local_port = 15900 + $disp_n;
+    my $local_port = _free_port(15900 + $disp_n);
     my $env_sh = '';
     if (defined(my $zoom = _zoom_for($s->{host}))) {
         my $scale = sprintf("%.2f", $zoom / 100);
