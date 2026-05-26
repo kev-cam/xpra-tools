@@ -2967,31 +2967,11 @@ sub _vnc_direct_cmd {
 sub _x11vnc_cmd {
     my ($s) = @_;
     (my $disp_n = $s->{disp}) =~ s/^://;
-    my $rfb_port = 5900 + $disp_n;
-    my $local_port = _free_port(15900 + $disp_n);
-    my $env_sh = '';
-    if (defined(my $zoom = _zoom_for($s->{host}))) {
-        my $scale = sprintf("%.2f", $zoom / 100);
-        $env_sh = "FLTK_SCALING_FACTOR=$scale GDK_DPI_SCALE=$scale"
-                . " QT_SCALE_FACTOR=$scale ";
-    }
-    my @tgt  = ssh_target(_sess_target($s));
+    my $target = $s->{ip} // $s->{host};
     my $login_user = $s->{_attach_as};
-    if (defined $login_user) {
-        $tgt[-1] =~ s/^[^\@]*\@//;
-        $tgt[-1] = "$login_user\@$tgt[-1]";
-    }
-    my @sopts = ssh_opts(interactive => 1);
-    my $ssh_str = join(' ', map { /[\s'"]/ ? "'$_'" : $_ }
-                       ('ssh', @sopts, @tgt,
-                        '-L', "$local_port:localhost:$rfb_port"));
-    my $script = "trap 'kill 0' TERM; "
-               . "$ssh_str "
-               . "'x11vnc -display :$disp_n -rfbport $rfb_port -nopw -once' "
-               . "& X11VNC_SSH=\$!; sleep 2; "
-               . "${env_sh}net-vnc localhost::$local_port; "
-               . "kill \$X11VNC_SSH 2>/dev/null";
-    return ('bash', '-c', $script);
+    my $dest = (defined $login_user ? "$login_user\@" : '') . "$target:$disp_n";
+    my @cmd = ('net-vnc', '--x11vnc', $dest, ssh_opts(interactive => 1));
+    return @cmd;
 }
 
 sub _bump_usage {
