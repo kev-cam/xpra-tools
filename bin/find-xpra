@@ -2371,12 +2371,16 @@ my $save_default_dpi = sub {
 $dpi_entry->bind('<FocusOut>', $save_default_dpi);
 $dpi_entry->bind('<Return>',   $save_default_dpi);
 $header_f->Button(-text => 'About', -command => sub {
-    my $build_date = POSIX::strftime('%Y-%m-%d', localtime((stat $0)[9]));
+    my $build_date = POSIX::strftime('%Y-%m-%d %H:%M', localtime((stat $0)[9]));
+    my $url = 'https://github.com/kev-cam/xpra-tools';
     my $top = $mw->Toplevel(-title => 'About find-xpra');
     $top->transient($mw);
     $top->Label(-text => "find-xpra", -font => 'sans-serif 14 bold')
         ->pack(-pady => [10,4]);
-    $top->Label(-text => "Version: $VERSION\nBuild date: $build_date\nPerl: $^V")
+    $top->Label(-text => "Version: $VERSION\n"
+                       . "Built: $build_date\n"
+                       . "Perl: $^V\n"
+                       . $url)
         ->pack(-padx => 20);
     $top->Button(-text => 'OK', -command => sub { $top->destroy })
         ->pack(-pady => 10);
