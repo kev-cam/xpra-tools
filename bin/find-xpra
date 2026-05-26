@@ -2443,7 +2443,10 @@ sub _render_row {
         push @ACTIONS_DETACHED, '---', 'Edit', 'Remove';
         push @ACTIONS_ATTACHED, '---', 'Edit', 'Remove';
     }
-    my $detached_default = $sess->{kind} eq 'X' ? 'Secure VNC' : 'Attach';
+    my $fallback = $sess->{kind} eq 'X' ? 'Secure VNC' : 'Attach';
+    my $last = $SETTINGS->{_last_action}{$sess->{host}};
+    my $detached_default = (defined $last
+        && grep { $_ eq $last } @ACTIONS_DETACHED) ? $last : $fallback;
     my $action = $detached_default;
     my $current_opts = \@ACTIONS_DETACHED;
     my $default_action = sub {
@@ -2499,14 +2502,14 @@ sub _render_row {
             my $picked = $action;
             if ($picked eq 'Secure VNC') {
                 _keys_ensure() unless $sess->{local};
-                _bump_usage($sess->{host});
+                _bump_usage($sess->{host}, $picked);
                 my $pid = spawn_attach(_vnc_attach_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
                 return;
             }
             if ($picked eq 'Insecure VNC') {
-                _bump_usage($sess->{host});
+                _bump_usage($sess->{host}, $picked);
                 my $pid = spawn_attach(_vnc_direct_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
@@ -2514,7 +2517,7 @@ sub _render_row {
             }
             if ($picked eq 'X11-VNC') {
                 _keys_ensure() unless $sess->{local};
-                _bump_usage($sess->{host});
+                _bump_usage($sess->{host}, $picked);
                 my $pid = spawn_attach(_x11vnc_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
@@ -2522,7 +2525,7 @@ sub _render_row {
             }
             if ($picked eq 'Attach') {
                 _keys_ensure() unless $sess->{local};
-                _bump_usage($sess->{host});
+                _bump_usage($sess->{host}, $picked);
                 my $pid = spawn_attach(
                     $sess->{kind} eq 'vnc'
                         ? _vnc_attach_cmd($sess)
@@ -2975,8 +2978,9 @@ sub _x11vnc_cmd {
 }
 
 sub _bump_usage {
-    my ($host) = @_;
+    my ($host, $action) = @_;
     $SETTINGS->{_usage}{$host} = ($SETTINGS->{_usage}{$host} // 0) + 1;
+    $SETTINGS->{_last_action}{$host} = $action if defined $action;
     _save_settings($SETTINGS);
 }
 
