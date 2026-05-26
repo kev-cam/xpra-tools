@@ -19,6 +19,13 @@ use File::Path qw(make_path);
 use lib '/usr/local/src/net-mgr/lib';
 use NetMgr::Client;
 
+my $VERSION = '__GIT_VERSION__';
+if ($VERSION eq '__' . 'GIT_VERSION__') {
+    use File::Basename;
+    my $srcdir = dirname(dirname($0));
+    chomp($VERSION = `git -C '$srcdir' describe --always 2>/dev/null` || 'dev');
+}
+
 # Snapshot before GetOptions consumes it; needed to re-exec on Rescan.
 my @ORIG_ARGV = @ARGV;
 
@@ -2363,7 +2370,17 @@ my $save_default_dpi = sub {
 };
 $dpi_entry->bind('<FocusOut>', $save_default_dpi);
 $dpi_entry->bind('<Return>',   $save_default_dpi);
-
+$header_f->Button(-text => 'About', -command => sub {
+    my $build_date = POSIX::strftime('%Y-%m-%d', localtime((stat $0)[9]));
+    my $top = $mw->Toplevel(-title => 'About find-xpra');
+    $top->transient($mw);
+    $top->Label(-text => "find-xpra", -font => 'sans-serif 14 bold')
+        ->pack(-pady => [10,4]);
+    $top->Label(-text => "Version: $VERSION\nBuild date: $build_date\nPerl: $^V")
+        ->pack(-padx => 20);
+    $top->Button(-text => 'OK', -command => sub { $top->destroy })
+        ->pack(-pady => 10);
+})->pack(-side => 'right');
 
 my $canvas = $mw->Canvas(-highlightthickness => 0);
 my $scroll = $mw->Scrollbar(-orient => 'vertical', -command => ['yview', $canvas]);

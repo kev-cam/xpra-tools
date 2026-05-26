@@ -119,6 +119,7 @@ install:
 	  echo "  bin/$$f → $(DESTDIR)$(BINDIR)/$$f"; \
 	  sed -e "s|^use lib '/usr/local/src/net-mgr/lib';|use lib '$(NETMGR_PERL5DIR)';|" \
 	      -e "s|^use lib '/usr/local/src/xpra-tools/lib';|use lib '$(XPRATOOLS_PERL5DIR)';|" \
+	      -e "s|__GIT_VERSION__|$$(git describe --always 2>/dev/null || echo unknown)|" \
 	      bin/$$f > $(DESTDIR)$(BINDIR)/$$f.tmp && \
 	  mv $(DESTDIR)$(BINDIR)/$$f.tmp $(DESTDIR)$(BINDIR)/$$f && \
 	  chmod 755 $(DESTDIR)$(BINDIR)/$$f; \
