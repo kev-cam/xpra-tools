@@ -2350,14 +2350,6 @@ my $save_default_dpi = sub {
 $dpi_entry->bind('<FocusOut>', $save_default_dpi);
 $dpi_entry->bind('<Return>',   $save_default_dpi);
 
-my $hdr_f = $mw->Frame;
-$hdr_f->pack(-fill => 'x', -padx => 2);
-for my $i (0 .. $#cols) {
-    $hdr_f->Label(-text => $cols[$i], -font => 'sans-serif 11 bold',
-                  -relief => 'ridge', -padx => 6, -pady => 2)
-       ->grid(-row => 0, -column => $i, -sticky => 'ew');
-}
-$hdr_f->gridColumnconfigure(5, -weight => 1);
 
 my $canvas = $mw->Canvas(-highlightthickness => 0);
 my $scroll = $mw->Scrollbar(-orient => 'vertical', -command => ['yview', $canvas]);
@@ -2380,7 +2372,12 @@ $canvas->Tk::bind('<MouseWheel>', sub {
 $canvas->Tk::bind('<Button-4>', sub { $canvas->yview('scroll', -3, 'units') });
 $canvas->Tk::bind('<Button-5>', sub { $canvas->yview('scroll',  3, 'units') });
 
-my $r = 0;
+for my $i (0 .. $#cols) {
+    $rows_f->Label(-text => $cols[$i], -font => 'sans-serif 11 bold',
+                   -relief => 'ridge', -padx => 6, -pady => 2)
+       ->grid(-row => 0, -column => $i, -sticky => 'ew');
+}
+my $r = 1;
 sub _render_row {
     my ($s) = @_;
     my @info;
