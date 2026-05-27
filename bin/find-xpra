@@ -647,12 +647,16 @@ unless (defined $ssh_user) {
 if ($pick) {
     # Sort by:
     #   1. favorite (sticky pin from prior runs)
-    #   2. cached session count (so a host last seen with sessions floats)
-    #   3. net-mgr-known signals: X (6000-6063), VNC (5900-5999), net-mgr (7531)
-    #   4. name (alphabetic) — stable order for everything else.
+    #   2. usage count (most-connected first)
+    #   3. cached session count (so a host last seen with sessions floats)
+    #   4. net-mgr-known signals: X (6000-6063), VNC (5900-5999), net-mgr (7531)
+    #   5. name (alphabetic) — stable order for everything else.
+    my %_pick_usage = %{ $SETTINGS->{_usage} // {} };
     my @ranked = sort {
            (($SETTINGS->{ _name_for($b) }{favorite}//0)
             <=> ($SETTINGS->{ _name_for($a) }{favorite}//0))
+        || (($_pick_usage{ _name_for($b) }//0)
+            <=> ($_pick_usage{ _name_for($a) }//0))
         || (($CACHE->{ _name_for($b) }{n_sessions}//0)
             <=> ($CACHE->{ _name_for($a) }{n_sessions}//0))
         || (($b->{x}  // 0) <=> ($a->{x}  // 0))
@@ -2762,6 +2766,26 @@ sub _show_settings {
     my ($s) = @_;
     my $host = $s->{host};
     my $top  = $mw->Toplevel(-title => "find-xpra: settings for $host");
+
+    # Host info section
+    my $info_f = $top->Frame(-relief => 'groove', -borderwidth => 2);
+    $info_f->pack(-fill => 'x', -padx => 12, -pady => [8, 4]);
+    my @info_rows;
+    push @info_rows, ['Host:', $host];
+    push @info_rows, ['IP:', $s->{ip}] if defined $s->{ip} && $s->{ip} ne $host;
+    push @info_rows, ['Display:', $s->{disp}] if defined $s->{disp};
+    my $usage = $SETTINGS->{_usage}{$host} // 0;
+    push @info_rows, ['Connections:', $usage] if $usage;
+    my $last = $SETTINGS->{_last_action}{$host};
+    push @info_rows, ['Last action:', $last] if defined $last;
+    for my $i (0 .. $#info_rows) {
+        $info_f->Label(-text => $info_rows[$i][0], -font => 'sans-serif 10 bold',
+                       -anchor => 'e', -width => 14)
+            ->grid(-row => $i, -column => 0, -sticky => 'e', -padx => [6, 2]);
+        $info_f->Label(-text => $info_rows[$i][1], -anchor => 'w')
+            ->grid(-row => $i, -column => 1, -sticky => 'w', -padx => [2, 6]);
+    }
+
     $top->Label(-text => "Terminal for $host:",
                 -font => 'sans-serif 11 bold')
         ->pack(-anchor => 'w', -padx => 12, -pady => 6);
