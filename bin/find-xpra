@@ -279,6 +279,12 @@ sub ssh_target {
     } else {
         $host = $ip // $name;
     }
+    # Per-host SSH port override (from Settings dialog → ~/.config/find-xpra)
+    # — needed to reach VMs behind a forwarded host port (Hyper-V, VirtualBox).
+    my $port = $c->{ssh_port}
+            // ($name ? $SETTINGS->{$name}{ssh_port} : undef)
+            // ($ip   ? $SETTINGS->{$ip}{ssh_port}   : undef);
+    push @args, '-p', $port if defined $port && $port =~ /^\d+$/ && $port != 22;
     my $user = $c->{ssh_user} // $ssh_user;
     my $login = defined $user ? "$user\@$host" : $host;
     return (@args, $login);
@@ -2798,6 +2804,9 @@ sub _show_settings {
     push @info_rows, ['Host:', $host];
     push @info_rows, ['IP:', $s->{ip}] if defined $s->{ip} && $s->{ip} ne $host;
     push @info_rows, ['Display:', $s->{disp}] if defined $s->{disp};
+    if (my $cur_port = $SETTINGS->{$host}{ssh_port}) {
+        push @info_rows, ['SSH port:', $cur_port];
+    }
     my $usage = $SETTINGS->{_usage}{$host} // 0;
     push @info_rows, ['Connections:', $usage] if $usage;
     my $last = $SETTINGS->{_last_action}{$host};
@@ -2840,6 +2849,15 @@ sub _show_settings {
     $top->Entry(-textvariable => \$host_ssh_user, -width => 20)
         ->pack(-anchor => 'w', -padx => 30);
 
+    # SSH port override — e.g. a forwarded port reaching a VM behind
+    # Hyper-V / VirtualBox NAT.  Blank or 22 = default.
+    $top->Label(-text => "SSH port for $host (blank = 22):",
+                -font => 'sans-serif 11 bold')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [10, 6]);
+    my $host_ssh_port = $SETTINGS->{$host}{ssh_port} // '';
+    $top->Entry(-textvariable => \$host_ssh_port, -width => 8, -justify => 'right')
+        ->pack(-anchor => 'w', -padx => 30);
+
     # VNC zoom factor — percentage applied via FLTK_SCALING_FACTOR /
     # GDK_DPI_SCALE / QT_SCALE_FACTOR when launching vncviewer.
     $top->Label(-text => "VNC zoom % for $host (blank = 100%):",
@@ -2865,6 +2883,14 @@ sub _show_settings {
             $SETTINGS->{$host}{dpi} = $host_dpi + 0;
         } else {
             delete $SETTINGS->{$host}{dpi};
+        }
+        $host_ssh_port =~ s/^\s+|\s+$//g;
+        if (length $host_ssh_port && $host_ssh_port =~ /^\d+$/
+                && $host_ssh_port > 0 && $host_ssh_port < 65536
+                && $host_ssh_port != 22) {
+            $SETTINGS->{$host}{ssh_port} = $host_ssh_port + 0;
+        } else {
+            delete $SETTINGS->{$host}{ssh_port};
         }
         $host_zoom =~ s/^\s+|\s+$//g;
         if (length $host_zoom && $host_zoom =~ /^\d+$/ && $host_zoom != 100) {
@@ -3110,8 +3136,13 @@ sub _x11vnc_cmd {
     my $target = $s->{ip} // $s->{host};
     my $login_user = $s->{_attach_as};
     my $dest = (defined $login_user ? "$login_user\@" : '') . "$target:$disp_n";
-    my @cmd = ('net-vnc', '--x11vnc', $dest, ssh_opts(interactive => 1));
-    return @cmd;
+    my @sopts = ssh_opts(interactive => 1);
+    # net-vnc --x11vnc invokes ssh @ssh_extra $login — push -p into the
+    # opts so a per-host port override carries through to that ssh.
+    my $port = $SETTINGS->{$s->{host}}{ssh_port}
+            // ($s->{ip} ? $SETTINGS->{$s->{ip}}{ssh_port} : undef);
+    push @sopts, '-p', $port if defined $port && $port =~ /^\d+$/ && $port != 22;
+    return ('net-vnc', '--x11vnc', $dest, @sopts);
 }
 
 sub _bump_usage {
