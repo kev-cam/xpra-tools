@@ -16,6 +16,11 @@ use IO::Socket::INET;
 use POSIX ();
 use JSON::PP qw(encode_json decode_json);
 use File::Path qw(make_path);
+use File::Temp qw(tempfile);
+
+our %ATTACH_INFO;   # pid => { cmd => [...], log => path, start => epoch }
+                    # populated by spawn_attach, consumed by the reap timer
+                    # and the user-initiated Disconnect/kill handlers.
 use lib '/usr/local/src/net-mgr/lib';
 use NetMgr::Client;
 
@@ -2601,6 +2606,12 @@ sub _render_row {
                 spawn_detached(_launch_xpra_cmd($sess, $picked));
             }
             elsif (my $pid = $sess->{pid}) {
+                # User-initiated termination: drop the attach-info so
+                # the reap timer doesn't mistake the kill for a failed
+                # connection and pop up a diagnostics window.
+                if (my $info = delete $ATTACH_INFO{$pid}) {
+                    unlink $info->{log} if $info->{log};
+                }
                 if ($picked eq 'Disconnect') {
                     kill 'TERM', $pid;
                     $action = 'Force kill';
@@ -2746,6 +2757,7 @@ $mw->repeat(750, sub {
     for my $s (@sessions) {
         my $pid = $s->{pid} // next;
         my $r = waitpid($pid, POSIX::WNOHANG());
+        my $status = $?;
         my $gone = $r > 0              ? 1
                  : $r == 0             ? 0
                  : !kill(0, $pid);      # -1 (ECHILD): not our child
@@ -2754,6 +2766,18 @@ $mw->repeat(750, sub {
             $s->{_adopted} = 0;
             $s->{_set_actions}->($s->{_actions_detached},
                                  ${$s->{_detached_default}});
+            # Diagnostic pop-up: a viewer that exits non-zero shortly
+            # after launch is almost certainly a failed connection, not
+            # a user-initiated close.  Show the command + captured
+            # stdout/stderr so the user can see what went wrong.
+            if (my $info = delete $ATTACH_INFO{$pid}) {
+                my $runtime = time - ($info->{start} // time);
+                if ($r > 0 && $status != 0 && $runtime < 5) {
+                    _show_attach_diag($s, $info, $status);
+                } elsif ($info->{log}) {
+                    unlink $info->{log};
+                }
+            }
         }
     }
 });
@@ -2875,6 +2899,69 @@ sub _show_procs {
     $top->Button(-text => 'Close', -command => sub { $top->destroy })
         ->pack(-pady => 4);
 }
+
+# Pop up a diagnostics window when an attach child exited quickly with
+# non-zero status.  Shows the command that was run, the exit info, and
+# the captured stdout/stderr so the user can see why it failed.
+sub _show_attach_diag {
+    my ($s, $info, $status) = @_;
+    my $exit   = $status >> 8;
+    my $signal = $status & 0x7f;
+    my $reason = $signal ? "killed by signal $signal"
+               : $exit == 127 ? "command not found (exit 127)"
+               : "exit code $exit";
+    my $cmd = join(' ', map { /[\s'"\\]/ ? "'$_'" : $_ } @{ $info->{cmd} });
+    my $log = '';
+    if ($info->{log} && -e $info->{log}) {
+        if (open my $fh, '<', $info->{log}) {
+            local $/; $log = <$fh>;
+            close $fh;
+        }
+        unlink $info->{log};
+    }
+    $log = "(no output captured)\n" unless length $log;
+    my $top = $mw->Toplevel(-title =>
+        "find-xpra: connection failed — $s->{host} $s->{disp}");
+    $top->transient($mw);
+    $top->Label(-text => "Connection to $s->{host} $s->{disp} failed",
+                -font => 'sans-serif 12 bold', -foreground => '#c00000')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [10, 4]);
+    $top->Label(-text => $reason, -anchor => 'w')
+        ->pack(-anchor => 'w', -padx => 12);
+    $top->Label(-text => 'Command:', -font => 'sans-serif 10 bold',
+                -anchor => 'w')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [8, 0]);
+    my $cmd_txt = $top->Scrolled('Text',
+                                 -scrollbars => 'oe',
+                                 -width      => 100,
+                                 -height     => 3,
+                                 -font       => 'monospace 9',
+                                 -wrap       => 'word',
+                                )->pack(-fill => 'x', -padx => 12, -pady => 2);
+    $cmd_txt->insert('end', $cmd);
+    $cmd_txt->configure(-state => 'disabled');
+    $top->Label(-text => 'Output:', -font => 'sans-serif 10 bold',
+                -anchor => 'w')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [8, 0]);
+    my $out_txt = $top->Scrolled('Text',
+                                 -scrollbars => 'osoe',
+                                 -width      => 100,
+                                 -height     => 20,
+                                 -font       => 'monospace 9',
+                                 -wrap       => 'none',
+                                )->pack(-fill => 'both', -expand => 1,
+                                        -padx => 12, -pady => 2);
+    $out_txt->insert('end', $log);
+    $out_txt->configure(-state => 'disabled');
+    my $btns = $top->Frame->pack(-pady => 8);
+    $btns->Button(-text => 'Copy command', -command => sub {
+        $top->clipboardClear;
+        $top->clipboardAppend($cmd);
+    })->pack(-side => 'left', -padx => 4);
+    $btns->Button(-text => 'Close', -command => sub { $top->destroy })
+         ->pack(-side => 'left', -padx => 4);
+}
+
 exit 0;
 
 our $XPRA_BIN;
@@ -3195,17 +3282,26 @@ sub spawn_detached {
 sub spawn_attach {
     my @cmd = @_;
     _dbg("[debug] attach: " . join(' ', map { /\s/ ? "'$_'" : $_ } @cmd));
+    my ($lfh, $lpath) = eval { tempfile('find-xpra-attach-XXXXXX',
+                                        TMPDIR => 1, SUFFIX => '.log') };
     my $pid = fork;
     die "fork: $!" unless defined $pid;
-    return $pid if $pid;
+    if ($pid) {
+        close $lfh if $lfh;
+        $ATTACH_INFO{$pid} = { cmd => [@cmd], log => $lpath, start => time };
+        return $pid;
+    }
     # In the forked child: skip Tk's END so we don't share-close the
     # parent chooser's X11 fd if exec fails.
     POSIX::setsid();
     open STDIN,  '<', '/dev/null';
-    # In --debug mode keep stdout/stderr attached (and tee'd to the log
-    # file via _dbg) so xpra's launch errors are visible.  Otherwise
-    # silence them so a failed attach doesn't spam the chooser.
-    if ($debug && $DEBUG_LOG_FH) {
+    # Always tee stdout/stderr to a per-attach temp log so a quick
+    # non-zero exit can pop up a diagnostics window in the parent.  In
+    # --debug mode also dup into the debug log so output stays visible.
+    if ($lfh) {
+        open STDOUT, '>&', $lfh or open STDOUT, '>', '/dev/null';
+        open STDERR, '>&', $lfh or open STDERR, '>', '/dev/null';
+    } elsif ($debug && $DEBUG_LOG_FH) {
         open STDOUT, '>&', $DEBUG_LOG_FH;
         open STDERR, '>&', $DEBUG_LOG_FH;
     } else {
