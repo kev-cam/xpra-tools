@@ -310,7 +310,8 @@ sub ssh_opts {
     # User-configured extra ssh arguments (Settings → "Extra ssh
     # arguments"), e.g. -Y / -C.  Whitespace-split; appended last so they
     # can override the defaults above.
-    if (defined(my $extra = $SETTINGS->{_ssh_extra_args}) && length $extra) {
+    my $extra = $SETTINGS->{_ssh_extra_args};
+    if (defined $extra && length $extra) {
         push @opts, grep { length } split /\s+/, $extra;
     }
     return @opts;
