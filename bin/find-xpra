@@ -2663,6 +2663,7 @@ sub _render_row {
            'Kill x11vnc', '---', 'SSH', 'Settings')
         : ('Attach', 'Secure VNC', 'Insecure VNC', 'X11-VNC',
            'Restart app', 'Restart Xpra', 'Restart Xpra+WWW',
+           'Kill session',
            '---', 'SSH', 'Helper', 'Apps', 'Settings');
     my @ACTIONS_ATTACHED = $sess->{kind} eq 'vnc'
         ? ('Disconnect', 'Force kill', 'KILL',
@@ -2675,6 +2676,7 @@ sub _render_row {
         : ('Disconnect', 'Force kill', 'KILL', 'Terminal',
            'Secure VNC', 'Insecure VNC', 'X11-VNC',
            'Restart app', 'Restart Xpra', 'Restart Xpra+WWW',
+           'Kill session',
            '---', 'SSH', 'Helper', 'Apps', 'Settings');
     if ($sess->{_extra}) {
         push @ACTIONS_DETACHED, '---', 'Edit', 'Remove';
@@ -2788,6 +2790,28 @@ sub _render_row {
                 # remembered default.
                 _keys_ensure() unless $sess->{local};
                 spawn_logged($sess, 'Kill x11vnc', _kill_x11vnc_cmd($sess));
+                $action = $default_action->();
+                return;
+            }
+            if ($picked eq 'Kill session') {
+                # Stop the xpra session server on this display (frees its
+                # memory).  Destructive — confirm first.  Logged so the
+                # result is visible via "Show last log".
+                my $ans = $mw->messageBox(
+                    -title   => 'find-xpra: kill session',
+                    -message => "Stop the xpra session on "
+                              . "$sess->{host} $sess->{disp}?\n\n"
+                              . "This shuts the server down and disconnects "
+                              . "any clients (frees its memory).",
+                    -type    => 'yesno',
+                    -icon    => 'warning',
+                    -default => 'no',
+                );
+                if (lc $ans eq 'yes') {
+                    _keys_ensure() unless $sess->{local};
+                    spawn_logged($sess, 'Kill session',
+                                 _kill_session_cmd($sess));
+                }
                 $action = $default_action->();
                 return;
             }
@@ -3792,6 +3816,42 @@ sub _kill_x11vnc_cmd {
         return ('sh', '-c', $remote);
     }
     my @tgt   = ssh_target(_sess_target($s));
+    if (defined $s->{_attach_as} && length $s->{_attach_as}) {
+        $tgt[-1] =~ s/^[^\@]*\@//;
+        $tgt[-1] = "$s->{_attach_as}\@$tgt[-1]";
+    }
+    my @sopts = ssh_opts(interactive => 1);
+    return ('ssh', @sopts, @tgt, $remote);
+}
+
+# Stop an xpra session server on this display, freeing its memory.
+# `xpra stop :N` shuts the server down cleanly (disconnects clients, tears
+# down the Xdummy/Xvfb).  Diagnostic: report whether a server was listed
+# before/after so "Show last log" shows what happened.  $xpra is the
+# resolved xpra binary; the remote runs it by basename via PATH, so for
+# the remote case we just say "xpra" (the local _xpra_bin path may not
+# exist on the remote).
+sub _kill_session_cmd {
+    my ($s) = @_;
+    (my $disp_n = $s->{disp}) =~ s/^://;
+    my $xpra_local = _xpra_bin();
+    my $build = sub {
+        my ($xpra) = @_;
+        return
+              "echo '== xpra :$disp_n (before) =='; "
+            . "$xpra list 2>&1 | grep -E ':$disp_n\\b' || echo '(not listed)'; "
+            . "echo '== stopping :$disp_n =='; "
+            . "$xpra stop :$disp_n 2>&1; echo \"xpra stop rc=\$?\"; "
+            . "sleep 1; "
+            . "echo '== xpra :$disp_n (after) =='; "
+            . "$xpra list 2>&1 | grep -E ':$disp_n\\b' || echo '(gone)'; "
+            . "true";
+    };
+    if ($s->{local}) {
+        return ('sh', '-c', $build->($xpra_local));
+    }
+    my $remote = $build->('xpra');
+    my @tgt = ssh_target(_sess_target($s));
     if (defined $s->{_attach_as} && length $s->{_attach_as}) {
         $tgt[-1] =~ s/^[^\@]*\@//;
         $tgt[-1] = "$s->{_attach_as}\@$tgt[-1]";
