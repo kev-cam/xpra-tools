@@ -2590,9 +2590,17 @@ sub _row_visible {
     if ($known_only) {
         return 0 unless ($SETTINGS->{_usage}{ $s->{host} } // 0) > 0;
     }
-    return 1 if $all || $any || !defined $max_disp;
-    return 1 if !defined $s->{disp_n};
-    return $s->{disp_n} <= $max_disp ? 1 : 0;
+    # High-display ceiling — applies even under --all / --any.  Nothing
+    # above the ceiling (default 9999) is a real display: these are xpra
+    # shadow/proxy synthetic IDs (6-7 digits).  --all/--any are about
+    # showing low/plumbing displays and other users' sessions, NOT
+    # impossible high display numbers, so they must not bypass this.
+    # Set max display to 0 (Settings → unlimited) to see everything.
+    if (defined $max_disp && defined $s->{disp_n}
+        && $s->{disp_n} > $max_disp) {
+        return 0;
+    }
+    return 1;
 }
 sub _render_row {
     my ($s) = @_;
