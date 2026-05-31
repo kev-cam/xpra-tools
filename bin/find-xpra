@@ -3315,8 +3315,12 @@ sub _show_settings {
         } else {
             delete $SETTINGS->{$host}{vnc_zoom};
         }
+        # Store an explicit 0/1 (not delete-when-0) so un-hiding the local
+        # :0 sticks against its default-hidden behaviour in _host_hidden.
+        $SETTINGS->{$host}{hidden} = $hide_val ? 1 : 0;
         _save_settings($SETTINGS);
         $top->destroy;
+        _rerender_rows() if defined &_rerender_rows;
     })->pack(-side => 'left', -padx => 6);
     $btns->Button(-text => 'Cancel', -command => sub { $top->destroy })
          ->pack(-side => 'left', -padx => 6);
