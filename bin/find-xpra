@@ -2443,15 +2443,28 @@ my @cols = ('', '', 'Host', 'Disp', 'User', 'Info');
 # via xpra's own UI in that case).
 my $header_f = $mw->Frame;
 $header_f->pack(-fill => 'x', -padx => 6, -pady => 4);
-$header_f->Button(-text => 'Rescan',
-                  -command => sub { $_save_geometry->(); exec { $^X } $^X, $0, @ORIG_ARGV })
-         ->pack(-side => 'left', -fill => 'x', -expand => 1);
-$header_f->Button(-text => 'Add host',
-                  -command => sub { _add_host_probe($mw) })
-         ->pack(-side => 'left', -fill => 'x', -expand => 1);
-$header_f->Button(-text => 'Settings',
-                  -command => sub { _show_app_settings($mw) })
-         ->pack(-side => 'left', -fill => 'x', -expand => 1);
+# Shared hover-help (tooltips) for the whole UI.  $BALLOON->attach($w, ...)
+# registers help text that pops up after a short hover over $w.  Used for
+# the header controls and the per-row action menu.
+my $BALLOON = $mw->Balloon(-initwait => 600);
+my $rescan_btn = $header_f->Button(-text => 'Rescan',
+                  -command => sub { $_save_geometry->(); exec { $^X } $^X, $0, @ORIG_ARGV });
+$rescan_btn->pack(-side => 'left', -fill => 'x', -expand => 1);
+my $addhost_btn = $header_f->Button(-text => 'Add host',
+                  -command => sub { _add_host_probe($mw) });
+$addhost_btn->pack(-side => 'left', -fill => 'x', -expand => 1);
+my $settings_btn = $header_f->Button(-text => 'Settings',
+                  -command => sub { _show_app_settings($mw) });
+$settings_btn->pack(-side => 'left', -fill => 'x', -expand => 1);
+$BALLOON->attach($rescan_btn,
+    -balloonmsg => 'Re-run discovery and rebuild the list (re-execs '
+                 . 'find-xpra). Open viewers keep running.');
+$BALLOON->attach($addhost_btn,
+    -balloonmsg => 'Add a host by name/IP and probe it for sessions. '
+                 . 'Editing it later makes the entry stick.');
+$BALLOON->attach($settings_btn,
+    -balloonmsg => 'App settings: max display number, VNC viewer backend, '
+                 . 'and the ssh-askpass program.');
 # Toggle between all discovered hosts and just ones we've connected to
 # before.  Compact icon button: ↕ (a "<->" turned 90°).  Active state
 # (known-only) shown by a sunken relief rather than changing the glyph.
@@ -2465,6 +2478,9 @@ $known_btn = $header_f->Button(
         _rerender_rows();
     });
 $known_btn->pack(-side => 'left', -padx => 4);
+$BALLOON->attach($known_btn,
+    -balloonmsg => 'Toggle: show all discovered hosts vs. only hosts '
+                 . "you've connected to before. (Pressed = known only.)");
 # Debug toggle: re-exec with --debug added/removed.  --debug governs the
 # startup probe (already finished) and opens the trace log, so toggling it
 # live means re-running discovery — same as Rescan, just with the flag
@@ -2481,6 +2497,9 @@ $debug_btn = $header_f->Button(
         exec { $^X } $^X, $0, @argv;
     });
 $debug_btn->pack(-side => 'left', -padx => 4);
+$BALLOON->attach($debug_btn,
+    -balloonmsg => 'Toggle --debug (re-execs). Writes a trace to '
+                 . '/tmp/find-xpra-debug.log. (Pressed = on.)');
 # Global default DPI — passed to `xpra attach --dpi=N` for every session
 # unless the host's Settings dialog overrides it.  "auto" (or blank) means
 # "let xpra auto-detect" (the historical behaviour).  Saved on
@@ -2490,8 +2509,11 @@ $header_f->Label(-text => 'DPI:')
 my $default_dpi = $SETTINGS->{'*'}{dpi} // 'auto';
 my $dpi_entry = $header_f->Entry(-textvariable => \$default_dpi,
                                  -width   => 5,
-                                 -justify => 'right')
-                         ->pack(-side => 'left');
+                                 -justify => 'right');
+$dpi_entry->pack(-side => 'left');
+$BALLOON->attach($dpi_entry,
+    -balloonmsg => 'Default DPI for xpra attach (--dpi). "auto" or blank '
+                 . 'lets xpra decide. Per-host override in host Settings.');
 my $save_default_dpi = sub {
     $default_dpi =~ s/^\s+|\s+$//g;
     if (length $default_dpi && $default_dpi =~ /^\d+$/ && $default_dpi > 0) {
@@ -2510,7 +2532,7 @@ $dpi_entry->bind('<Return>',   $save_default_dpi);
 $dpi_entry->bind('<FocusIn>', sub {
     $default_dpi = '' if $default_dpi eq 'auto';
 });
-$header_f->Button(-text => 'About', -command => sub {
+my $about_btn = $header_f->Button(-text => 'About', -command => sub {
     my $build_date = POSIX::strftime('%Y-%m-%d %H:%M', localtime((stat $0)[9]));
     my $url = 'https://github.com/kev-cam/xpra-tools';
     my $top = $mw->Toplevel(-title => 'About find-xpra');
@@ -2524,7 +2546,10 @@ $header_f->Button(-text => 'About', -command => sub {
         ->pack(-padx => 20);
     $top->Button(-text => 'OK', -command => sub { $top->destroy })
         ->pack(-pady => 10);
-})->pack(-side => 'right');
+});
+$about_btn->pack(-side => 'right');
+$BALLOON->attach($about_btn,
+    -balloonmsg => 'Version, build date, and project URL.');
 
 my $canvas = $mw->Canvas(-highlightthickness => 0);
 my $scroll = $mw->Scrollbar(-orient => 'vertical', -command => ['yview', $canvas]);
@@ -2829,6 +2854,11 @@ sub _render_row {
     push @widgets, $action_mb, $go_btn;
     $action_mb->grid(-row => $r, -column => 0, -padx => 6, -pady => 1, -sticky => 'ew');
     $go_btn   ->grid(-row => $r, -column => 1, -padx => 6, -pady => 1, -sticky => 'ew');
+    $BALLOON->attach($action_mb,
+        -balloonmsg => 'Pick an action for this session, then press ▶ to '
+                     . 'run it. Settings/Apps/Edit open immediately.');
+    $BALLOON->attach($go_btn,
+        -balloonmsg => 'Run the selected action on this session.');
     $sess->{_widgets} = \@widgets;
     $sess->{_enable_browser} = sub {
         return if grep { $_ eq 'Attach Browser' } @ACTIONS_DETACHED;
