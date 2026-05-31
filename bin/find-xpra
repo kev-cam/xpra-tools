@@ -2586,6 +2586,17 @@ for my $i (0 .. $#cols) {
        ->grid(-row => 0, -column => $i, -sticky => 'ew');
 }
 my $r = 1;
+# Is this session's host hidden?  Per-host opt-out set in the host
+# Settings dialog ($SETTINGS->{HOST}{hidden}).  When no explicit choice
+# has been saved, the local :0 (root X display) is hidden by default —
+# it's rarely an attach target.  Hidden rows appear only in show-all
+# (--all) mode.
+sub _host_hidden {
+    my ($s) = @_;
+    my $h = $SETTINGS->{ $s->{host} }{hidden};
+    return $h ? 1 : 0 if defined $h;
+    return ($s->{local} && defined $s->{disp_n} && $s->{disp_n} == 0) ? 1 : 0;
+}
 # The high-display ceiling enforced here, at the single render chokepoint,
 # so NO path can leak an over-limit row onto the screen — the startup
 # @sessions filter misses rows added later by the "Add host" probe
@@ -2597,6 +2608,10 @@ sub _row_visible {
     # "Known hosts only": hide hosts with no prior connection (usage==0).
     if ($known_only) {
         return 0 unless ($SETTINGS->{_usage}{ $s->{host} } // 0) > 0;
+    }
+    # Per-host "hidden" opt-out — shown only in show-all (--all) mode.
+    if (!$all && _host_hidden($s)) {
+        return 0;
     }
     # High-display ceiling — applies even under --all / --any.  Nothing
     # above the ceiling (default 9999) is a real display: these are xpra
@@ -3257,6 +3272,17 @@ sub _show_settings {
     my $host_zoom = $SETTINGS->{$host}{vnc_zoom} // '';
     $top->Entry(-textvariable => \$host_zoom, -width => 8, -justify => 'right')
         ->pack(-anchor => 'w', -padx => 30);
+
+    # Hide this host: hidden hosts show only in show-all (--all) mode.
+    # Defaults to on for the local :0 root display (see _host_hidden).
+    my $hide_val = exists $SETTINGS->{$host}{hidden}
+        ? ($SETTINGS->{$host}{hidden} ? 1 : 0)
+        : (($s->{local} && defined $s->{disp_n} && $s->{disp_n} == 0) ? 1 : 0);
+    $top->Checkbutton(
+        -text     => 'Hide this host (show only in --all mode)',
+        -variable => \$hide_val,
+        -anchor   => 'w',
+    )->pack(-anchor => 'w', -padx => 12, -pady => [12, 0]);
 
     my $btns = $top->Frame->pack(-pady => 10);
     $btns->Button(-text => 'Save', -command => sub {
