@@ -3206,6 +3206,15 @@ sub _show_last_log {
         $top->clipboardClear;
         $top->clipboardAppend($cmd);
     })->pack(-side => 'left', -padx => 4);
+    # Copy the whole captured output to the clipboard — selecting text in a
+    # disabled scrolled Text widget is fiddly, so give the user a one-click
+    # grab.  Re-read the (possibly Refreshed) widget contents rather than
+    # the stale $log so a Refresh-then-Copy gets the latest.
+    $btns->Button(-text => 'Copy output', -command => sub {
+        my $txt = $out_txt->get('1.0', 'end');
+        $top->clipboardClear;
+        $top->clipboardAppend($txt);
+    })->pack(-side => 'left', -padx => 4);
     $btns->Button(-text => 'Close', -command => sub { $top->destroy })
          ->pack(-side => 'left', -padx => 4);
 }
