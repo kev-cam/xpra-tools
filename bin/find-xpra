@@ -2913,6 +2913,34 @@ sub _show_app_settings {
     $top->Entry(-textvariable => \$val, -width => 10, -justify => 'right')
         ->pack(-anchor => 'w', -padx => 30, -pady => [4, 0]);
 
+    # VNC viewer backend.  'auto' = let net-vnc pick (remmina if present),
+    # except tunneled modes (Secure VNC / X11-VNC) auto-prefer a blocking
+    # viewer so the ssh tunnel survives.  Pick a specific viewer to force
+    # it everywhere.  Only offers viewers actually found on PATH.
+    $top->Label(-text => 'VNC viewer backend:',
+                -font => 'sans-serif 11 bold')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [14, 2]);
+    $top->Label(-text => "'auto' lets the system choose (remmina if "
+                       . "installed).\nremmina detaches immediately, which "
+                       . "breaks tunneled\nSecure VNC / X11-VNC — pick "
+                       . 'vncviewer for those.',
+                -justify => 'left', -anchor => 'w')
+        ->pack(-anchor => 'w', -padx => 12);
+    my @viewers = ('auto');
+    for my $cand (qw(remmina vncviewer xtigervncviewer xvncviewer gvncviewer)) {
+        push @viewers, $cand if _have_exe($cand);
+    }
+    my $viewer_val = $SETTINGS->{_vnc_viewer} // 'auto';
+    push @viewers, $viewer_val
+        unless grep { $_ eq $viewer_val } @viewers;   # keep a stale choice visible
+    my $viewer_om = $top->Optionmenu(
+        -options  => [@viewers],
+        -variable => \$viewer_val,
+    );
+    $viewer_om->pack(-anchor => 'w', -padx => 30, -pady => [4, 0]);
+    $viewer_om->setOption($viewer_val)
+        if grep { $_ eq $viewer_val } @viewers;
+
     my $err = '';
     $top->Label(-textvariable => \$err, -foreground => '#c00000')
         ->pack(-anchor => 'w', -padx => 12, -pady => [2, 0]);
@@ -2933,6 +2961,11 @@ sub _show_app_settings {
         } else {
             $SETTINGS->{_max_disp} = $v;
             $max_disp = $v;
+        }
+        if (!defined $viewer_val || $viewer_val eq 'auto') {
+            delete $SETTINGS->{_vnc_viewer};
+        } else {
+            $SETTINGS->{_vnc_viewer} = $viewer_val;
         }
         _save_settings($SETTINGS);
         $top->destroy;
@@ -3333,6 +3366,37 @@ sub _free_port {
     return $preferred;
 }
 
+# Is NAME runnable (absolute path or on PATH)?
+sub _have_exe {
+    my ($name) = @_;
+    return 1 if $name =~ m{/} && -x $name;
+    for my $d (split /:/, $ENV{PATH} // '') {
+        return 1 if length $d && -x "$d/$name";
+    }
+    return 0;
+}
+
+# Resolve the VNC viewer backend to hand net-vnc via NET_VNC_VIEWER.
+# Returns a viewer name to force, or undef to let net-vnc auto-pick.
+#   $SETTINGS->{_vnc_viewer}: 'auto'/unset = net-vnc's own choice
+#   (remmina if installed); 'remmina' = force remmina; <name> = force it.
+# $need_blocking: the caller tunnels and tears the tunnel down when the
+# viewer exits (Secure VNC, X11-VNC).  remmina's `-c` handoff detaches
+# immediately, so it would kill the tunnel before the window connects.
+# In 'auto' mode for those callers, prefer the first *blocking* viewer on
+# PATH so the tunnel survives; fall back to undef if none is installed.
+sub _vnc_viewer {
+    my ($need_blocking) = @_;
+    my $v = $SETTINGS->{_vnc_viewer};
+    return $v if defined $v && length $v && $v ne 'auto';
+    if ($need_blocking) {
+        for my $cand (qw(vncviewer xtigervncviewer xvncviewer gvncviewer)) {
+            return $cand if _have_exe($cand);
+        }
+    }
+    return undef;
+}
+
 sub _vnc_attach_cmd {
     my ($s) = @_;
     (my $disp_n = $s->{disp}) =~ s/^://;
@@ -3346,8 +3410,17 @@ sub _vnc_attach_cmd {
                 . " QT_SCALE_FACTOR=$scale ";
     }
     if ($s->{local}) {
+        # Local: no ssh tunnel to tear down, so a detaching viewer is
+        # harmless — only force a viewer if the user explicitly chose one.
+        if (defined(my $lv = _vnc_viewer(0))) {
+            splice @env, 0, 0, 'env' unless @env;
+            splice @env, 1, 0, "NET_VNC_VIEWER=$lv";
+        }
         return (@env, 'net-vnc', "localhost:$disp_n");
     }
+    # Tunneled: needs a blocking viewer or the kill below drops the tunnel
+    # the instant the viewer detaches (the remmina failure mode).
+    my $viewer = _vnc_viewer(1);
     my @tgt  = ssh_target(_sess_target($s));
     my @sopts = ssh_opts(interactive => 1);
     my $local_port = _free_port(15900 + $disp_n);
@@ -3355,6 +3428,7 @@ sub _vnc_attach_cmd {
                        ('ssh', @sopts, @tgt,
                         '-L', "$local_port:localhost:$port", '-N'));
     $env_sh //= '';
+    $env_sh = "NET_VNC_VIEWER=$viewer $env_sh" if defined $viewer;
     my $script = "trap 'kill 0' TERM; "
                . "$ssh_str & VNC_SSH=\$!; sleep 1; "
                . "${env_sh}net-vnc localhost::$local_port; "
@@ -3379,6 +3453,12 @@ sub _vnc_direct_cmd {
         }
     }
     $target //= $s->{ip} // $s->{host};
+    # Direct connection (no tunnel to tear down), so a detaching viewer is
+    # fine — only force a viewer if the user explicitly chose one.
+    if (defined(my $v = _vnc_viewer(0))) {
+        splice @env, 0, 0, 'env' unless @env;
+        splice @env, 1, 0, "NET_VNC_VIEWER=$v";
+    }
     return (@env, 'net-vnc', "$target:$disp_n");
 }
 
@@ -3394,7 +3474,14 @@ sub _x11vnc_cmd {
     my $port = $SETTINGS->{$s->{host}}{ssh_port}
             // ($s->{ip} ? $SETTINGS->{$s->{ip}}{ssh_port} : undef);
     push @sopts, '-p', $port if defined $port && $port =~ /^\d+$/ && $port != 22;
-    return ('net-vnc', '--x11vnc', $dest, @sopts);
+    # net-vnc --x11vnc tunnels internally and runs the viewer in the
+    # foreground, tearing the tunnel down on viewer exit — so it needs a
+    # blocking viewer for the same reason as Secure VNC.
+    my @env;
+    if (defined(my $v = _vnc_viewer(1))) {
+        @env = ('env', "NET_VNC_VIEWER=$v");
+    }
+    return (@env, 'net-vnc', '--x11vnc', $dest, @sopts);
 }
 
 # Kill any x11vnc serving a specific display on the host.  Used to clear
