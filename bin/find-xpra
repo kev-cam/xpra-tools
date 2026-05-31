@@ -307,6 +307,12 @@ sub ssh_opts {
             '-o', 'NumberOfPasswordPrompts=0',
             '-o', 'PreferredAuthentications=publickey';
     }
+    # User-configured extra ssh arguments (Settings → "Extra ssh
+    # arguments"), e.g. -Y / -C.  Whitespace-split; appended last so they
+    # can override the defaults above.
+    if (defined(my $extra = $SETTINGS->{_ssh_extra_args}) && length $extra) {
+        push @opts, grep { length } split /\s+/, $extra;
+    }
     return @opts;
 }
 
@@ -3102,6 +3108,27 @@ sub _show_app_settings {
     $ap_row->Button(-text => 'Browse', -command => sub {
         my $f = $top->getOpenFile(-title => 'Select ssh-askpass program');
         $askpass_val = $f if defined $f && length $f;
+    })->pack(-side => 'left', -padx => [4, 0]);
+
+    # Extra ssh arguments appended to every ssh invocation (probe, attach,
+    # VNC tunnel, terminal, ...).  e.g. -Y for trusted X11 forwarding, or
+    # -C for compression.  Split on whitespace; stored verbatim.
+    $top->Label(-text => 'Extra ssh arguments:',
+                -font => 'sans-serif 11 bold')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [14, 2]);
+    $top->Label(-text => 'Passed to every ssh call (e.g. -Y for trusted '
+                       . "X11 forwarding, -C for compression).\n"
+                       . 'Space-separated; leave blank for none.',
+                -justify => 'left', -anchor => 'w')
+        ->pack(-anchor => 'w', -padx => 12);
+    my $sshargs_val = $SETTINGS->{_ssh_extra_args} // '';
+    my $sa_row = $top->Frame->pack(-anchor => 'w', -fill => 'x',
+                                   -padx => 30, -pady => [4, 0]);
+    my $sshargs_e = $sa_row->Entry(-textvariable => \$sshargs_val, -width => 40);
+    $sshargs_e->pack(-side => 'left', -fill => 'x', -expand => 1);
+    $sa_row->Button(-text => '-Y', -command => sub {
+        $sshargs_val = length $sshargs_val ? "$sshargs_val -Y" : '-Y'
+            unless $sshargs_val =~ /(?:^|\s)-Y(?:\s|$)/;
     })->pack(-side => 'left', -padx => [4, 0]);
 
     my $err = '';
