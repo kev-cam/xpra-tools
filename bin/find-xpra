@@ -1832,14 +1832,15 @@ if ($any) {
     }
 }
 
-# Final high-display ceiling — the one authoritative gate, applied after
-# every source (discovery, .xpra-start pivot, --any merge) has populated
-# @sessions.  The ceiling applies to manually-added (_extra) hosts too:
-# xpra shadow/proxy servers on an added host advertise huge synthetic
-# display IDs (e.g. :1295132) that the user never wants in the list, and
-# the legitimate _extra rows (the :0 fallback, pinned displays) all sit
-# well under the limit.  --all/--any disable the ceiling.
-if (!$all && !$any && defined $max_disp) {
+# Final high-display ceiling — drop sessions above the ceiling from the
+# data model after every source (discovery, .xpra-start pivot, --any
+# merge) has populated @sessions.  Applies even under --all / --any:
+# nothing above the ceiling (default 9999) is a real display — they're
+# xpra shadow/proxy synthetic IDs (e.g. :1295132).  --all/--any show
+# low/plumbing displays and other users' sessions, not impossible high
+# ones.  _row_visible() re-checks at render time; this also keeps the
+# high IDs out of the cache.  Set max display 0 (Settings) to disable.
+if (defined $max_disp) {
     @sessions = grep {
         !defined $_->{disp_n} || $_->{disp_n} <= $max_disp
     } @sessions;
