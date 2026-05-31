@@ -2530,6 +2530,10 @@ sub _render_row {
         push @ACTIONS_DETACHED, '---', 'Edit';
         push @ACTIONS_ATTACHED, '---', 'Edit';
     }
+    # "Show last log" on every row: lets the user inspect the output of the
+    # last logged command (e.g. Kill x11vnc) to see why it did/didn't work.
+    push @ACTIONS_DETACHED, 'Show last log';
+    push @ACTIONS_ATTACHED, 'Show last log';
     my $fallback = $sess->{kind} eq 'X' ? 'Secure VNC' : 'Attach';
     my $last = $SETTINGS->{_last_action}{$sess->{host}};
     my $detached_default = (defined $last
@@ -2544,9 +2548,12 @@ sub _render_row {
         my ($opts, $default) = @_;
         $current_opts = $opts if defined $opts;
         my %immediate = (
-            Settings => sub { _show_settings($sess) },
-            Apps     => sub { _show_procs($sess) },
-            Edit     => sub { _edit_extra_host($sess) },
+            Settings        => sub { _show_settings($sess) },
+            Apps            => sub { _show_procs($sess) },
+            Edit            => sub { _edit_extra_host($sess) },
+            # Non-destructive: pop up the captured output of the last
+            # logged command (currently Kill x11vnc) run from this row.
+            'Show last log' => sub { _show_last_log($sess) },
         );
         $action_menu->delete(0, 'end');
         for my $o (@$current_opts) {
@@ -2621,7 +2628,7 @@ sub _render_row {
                 # afterward so it never lingers armed or becomes the row's
                 # remembered default.
                 _keys_ensure() unless $sess->{local};
-                spawn_detached(_kill_x11vnc_cmd($sess));
+                spawn_logged($sess, 'Kill x11vnc', _kill_x11vnc_cmd($sess));
                 $action = $default_action->();
                 return;
             }
@@ -3110,6 +3117,88 @@ sub _show_attach_diag {
          ->pack(-side => 'left', -padx => 4);
 }
 
+# Show the captured output of the last logged command run from this row
+# (see spawn_logged).  Non-destructive: the log file is left in place so
+# it can be re-viewed.  If nothing has been run yet, say so.
+sub _show_last_log {
+    my ($s) = @_;
+    my $ll = $s->{_last_log};
+    unless ($ll) {
+        my $top = $mw->Toplevel(-title => "find-xpra: last log — $s->{host}");
+        $top->transient($mw);
+        $top->Label(-text => "No logged command has been run from "
+                           . "$s->{host} $s->{disp} yet.",
+                    -padx => 24, -pady => 24)->pack;
+        $top->Button(-text => 'Close', -command => sub { $top->destroy })
+            ->pack(-pady => [0, 12]);
+        return;
+    }
+    my $cmd = join(' ', map { /[\s'"\\]/ ? "'$_'" : $_ } @{ $ll->{cmd} });
+    my $when = $ll->{start} ? _ago(time - $ll->{start}) . ' ago' : '';
+    my $log = '';
+    if ($ll->{log} && -e $ll->{log}) {
+        if (open my $fh, '<', $ll->{log}) {
+            local $/; $log = <$fh>;
+            close $fh;
+        }
+    }
+    $log = "(no output captured — command may still be running)\n"
+        unless length $log;
+    my $title = $ll->{label} // 'command';
+    my $top = $mw->Toplevel(-title =>
+        "find-xpra: $title log — $s->{host} $s->{disp}");
+    $top->transient($mw);
+    $top->Label(-text => "$title on $s->{host} $s->{disp}"
+                       . ($when ? "  ($when)" : ''),
+                -font => 'sans-serif 12 bold')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [10, 4]);
+    $top->Label(-text => 'Command:', -font => 'sans-serif 10 bold',
+                -anchor => 'w')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [8, 0]);
+    my $cmd_txt = $top->Scrolled('Text',
+                                 -scrollbars => 'oe',
+                                 -width      => 100,
+                                 -height     => 3,
+                                 -font       => 'monospace 9',
+                                 -wrap       => 'word',
+                                )->pack(-fill => 'x', -padx => 12, -pady => 2);
+    $cmd_txt->insert('end', $cmd);
+    $cmd_txt->configure(-state => 'disabled');
+    $top->Label(-text => 'Output:', -font => 'sans-serif 10 bold',
+                -anchor => 'w')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [8, 0]);
+    my $out_txt = $top->Scrolled('Text',
+                                 -scrollbars => 'osoe',
+                                 -width      => 100,
+                                 -height     => 20,
+                                 -font       => 'monospace 9',
+                                 -wrap       => 'none',
+                                )->pack(-fill => 'both', -expand => 1,
+                                        -padx => 12, -pady => 2);
+    $out_txt->insert('end', $log);
+    $out_txt->configure(-state => 'disabled');
+    my $btns = $top->Frame->pack(-pady => 8);
+    $btns->Button(-text => 'Refresh', -command => sub {
+        my $new = '';
+        if ($ll->{log} && -e $ll->{log} && open my $fh, '<', $ll->{log}) {
+            local $/; $new = <$fh>;
+            close $fh;
+        }
+        $new = "(no output captured — command may still be running)\n"
+            unless length $new;
+        $out_txt->configure(-state => 'normal');
+        $out_txt->delete('1.0', 'end');
+        $out_txt->insert('end', $new);
+        $out_txt->configure(-state => 'disabled');
+    })->pack(-side => 'left', -padx => 4);
+    $btns->Button(-text => 'Copy command', -command => sub {
+        $top->clipboardClear;
+        $top->clipboardAppend($cmd);
+    })->pack(-side => 'left', -padx => 4);
+    $btns->Button(-text => 'Close', -command => sub { $top->destroy })
+         ->pack(-side => 'left', -padx => 4);
+}
+
 exit 0;
 
 our $XPRA_BIN;
@@ -3278,9 +3367,20 @@ sub _kill_x11vnc_cmd {
     (my $disp_n = $s->{disp}) =~ s/^://;
     # Match x11vnc invoked as either `-display :N` or a bare `:N`, but not
     # :Nm (e.g. :1 must not match :10).  [^0-9] / end-of-arg guards that.
-    my $remote = "pkill -f 'x11vnc.*-display[[:space:]]*:$disp_n([^0-9]|\$)'; "
-               . "pkill -f 'x11vnc([[:space:]].*)?[[:space:]]:$disp_n([^0-9]|\$)'; "
-               . "true";
+    # Diagnostic: list matching x11vnc before/after and report each pkill's
+    # exit so "Show last log" tells the user what actually happened (e.g.
+    # "(none)" = nothing to kill, pkill rc=1 = no match, rc=0 = killed).
+    my $pat1 = "x11vnc.*-display[[:space:]]*:$disp_n([^0-9]|\$)";
+    my $pat2 = "x11vnc([[:space:]].*)?[[:space:]]:$disp_n([^0-9]|\$)";
+    my $remote =
+          "echo '== x11vnc matching :$disp_n (before) =='; "
+        . "{ pgrep -af '$pat1'; pgrep -af '$pat2'; } | sort -u || true; "
+        . "pkill -f '$pat1'; echo \"pkill -display rc=\$?\"; "
+        . "pkill -f '$pat2'; echo \"pkill bare rc=\$?\"; "
+        . "sleep 1; "
+        . "echo '== x11vnc matching :$disp_n (after) =='; "
+        . "{ pgrep -af '$pat1'; pgrep -af '$pat2'; } | sort -u || echo '(none left)'; "
+        . "true";
     if ($s->{local}) {
         return ('sh', '-c', $remote);
     }
@@ -3434,6 +3534,39 @@ sub _term_cmd {
     return ('ssh', ssh_opts(interactive => 1),
             ssh_target(_sess_target($s)),
             'bash', '-c', "'$cmd'");
+}
+
+# Like spawn_detached, but capture the command's stdout+stderr to a
+# per-row temp log so "Show last log" can display it.  Stamps the session
+# with {_last_log}=>{cmd,log,start,label}; replaces (and unlinks) any
+# previous log for that row.  Used for diagnostic one-shots like Kill
+# x11vnc where the user needs to see what happened on the remote.
+sub spawn_logged {
+    my ($sess, $label, @cmd) = @_;
+    _dbg("[debug] $label: " . join(' ', map { /\s/ ? "'$_'" : $_ } @cmd));
+    # Drop the prior log for this row before starting a new one.
+    if (my $old = $sess->{_last_log}) {
+        unlink $old->{log} if $old->{log};
+    }
+    my ($lfh, $lpath) = eval { tempfile('find-xpra-cmd-XXXXXX',
+                                        TMPDIR => 1, SUFFIX => '.log') };
+    $sess->{_last_log} = { cmd => [@cmd], log => $lpath,
+                           start => time, label => $label };
+    my $pid = fork // die "fork: $!";
+    if ($pid) { close $lfh if $lfh; waitpid($pid, 0); return; }
+    POSIX::setsid();
+    my $pid2 = fork;
+    POSIX::_exit(1) unless defined $pid2;
+    POSIX::_exit(0) if $pid2;
+    open STDIN, '<', '/dev/null';
+    if ($lfh) {
+        open STDOUT, '>&', $lfh or open STDOUT, '>', '/dev/null';
+        open STDERR, '>&', $lfh or open STDERR, '>', '/dev/null';
+    } else {
+        open STDOUT, '>', '/dev/null';
+        open STDERR, '>', '/dev/null';
+    }
+    exec { $cmd[0] } @cmd or POSIX::_exit(127);
 }
 
 # Fire-and-forget spawn (no PID tracking, no zombie).  Double-fork into
