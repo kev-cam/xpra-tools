@@ -53,6 +53,44 @@ my $MAX_DISP_DEFAULT = 9999;
 my $max_disp = $SETTINGS->{_max_disp} // $MAX_DISP_DEFAULT;
 $max_disp = undef if defined $max_disp && $max_disp == 0;   # 0 => unlimited
 
+# ssh-askpass program for GUI password prompts.  ssh exec's $SSH_ASKPASS
+# by name (PATH lookup); if the configured/default program doesn't exist,
+# ssh silently can't prompt and publickey-only connections fail with no
+# visible reason.  $SETTINGS->{_askpass} pins a choice from the Settings
+# dialog; otherwise auto-detect the first installed one.  Distros scatter
+# these: a bare name on PATH, or under /usr/lib*/openssh, /usr/libexec.
+my @ASKPASS_CANDIDATES = qw(
+    /usr/bin/ssh-askpass
+    /usr/bin/ssh-askpass-gnome
+    /usr/bin/ksshaskpass
+    /usr/bin/lxqt-openssh-askpass
+    /usr/bin/ssh-askpass-fullscreen
+    /usr/lib/openssh/gnome-ssh-askpass
+    /usr/lib/openssh/ssh-askpass
+    /usr/libexec/openssh/ssh-askpass
+    /usr/libexec/openssh/gnome-ssh-askpass
+);
+# Return the askpass program to use: the configured one (if set), else the
+# first candidate that exists on disk, else undef (no usable askpass).
+sub _askpass {
+    my $cfg = $SETTINGS->{_askpass};
+    if (defined $cfg && length $cfg) {
+        # Absolute path: trust it.  Bare name: resolve via PATH.
+        return $cfg if $cfg =~ m{/} && -x $cfg;
+        if ($cfg !~ m{/}) {
+            for my $d (split /:/, $ENV{PATH} // '') {
+                return "$d/$cfg" if length $d && -x "$d/$cfg";
+            }
+        }
+        # Configured but not found — fall through to auto-detect so a
+        # stale setting doesn't wedge every connection.
+    }
+    for my $c (@ASKPASS_CANDIDATES) {
+        return $c if -x $c;
+    }
+    return undef;
+}
+
 my $listen     = $ENV{NET_MGR_LISTEN};
 my $ssh_user;             # undef → let ssh_config(5) pick the user
 my $user;                 # --user: ssh as USER and filter sessions to USER
@@ -102,7 +140,7 @@ $ssh_user //= $user if defined $user;
 # tty even if it wanted to.  SSH_ASKPASS_REQUIRE=force makes OpenSSH 8.4+
 # use askpass even with $DISPLAY unset on systems that ship one.
 unless ($no_prompt) {
-    $ENV{SSH_ASKPASS}         //= 'ssh-askpass';
+    $ENV{SSH_ASKPASS}         //= (_askpass() // 'ssh-askpass');
     $ENV{SSH_ASKPASS_REQUIRE} //= 'force';
 }
 
@@ -2111,7 +2149,7 @@ sub _add_host_probe {
         $wr->autoflush(1);
         POSIX::setsid();
         open STDIN, '<', '/dev/null';
-        $ENV{SSH_ASKPASS} //= 'ssh-askpass';
+        $ENV{SSH_ASKPASS} //= (_askpass() // 'ssh-askpass');
         $SIG{ALRM} = sub { POSIX::_exit(1) };
         alarm($overall_to + 5);
         my @tgt = ssh_target({ name => $host, ip => $host_ip });
@@ -2941,6 +2979,35 @@ sub _show_app_settings {
     $viewer_om->setOption($viewer_val)
         if grep { $_ eq $viewer_val } @viewers;
 
+    # ssh-askpass program.  ssh needs a GUI askpass to prompt for
+    # passwords (the probe forks have no tty); if the configured one
+    # isn't installed, connections silently fail.  'auto' = first
+    # installed candidate.  Offers only askpass programs found on disk,
+    # plus the current choice (even if missing, so it stays visible).
+    $top->Label(-text => 'SSH askpass program:',
+                -font => 'sans-serif 11 bold')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [14, 2]);
+    my $ap_now = _askpass();
+    $top->Label(-text => "GUI password prompt for ssh.  'auto' picks the "
+                       . "first installed.\nCurrently resolves to: "
+                       . ($ap_now // '(NONE FOUND — connections will fail)'),
+                -justify => 'left', -anchor => 'w')
+        ->pack(-anchor => 'w', -padx => 12);
+    my @askpass = ('auto');
+    for my $c (@ASKPASS_CANDIDATES) {
+        push @askpass, $c if -x $c;
+    }
+    my $askpass_val = $SETTINGS->{_askpass} // 'auto';
+    push @askpass, $askpass_val
+        unless grep { $_ eq $askpass_val } @askpass;   # keep a stale/custom choice visible
+    my $askpass_om = $top->Optionmenu(
+        -options  => [@askpass],
+        -variable => \$askpass_val,
+    );
+    $askpass_om->pack(-anchor => 'w', -padx => 30, -pady => [4, 0]);
+    $askpass_om->setOption($askpass_val)
+        if grep { $_ eq $askpass_val } @askpass;
+
     my $err = '';
     $top->Label(-textvariable => \$err, -foreground => '#c00000')
         ->pack(-anchor => 'w', -padx => 12, -pady => [2, 0]);
@@ -2966,6 +3033,11 @@ sub _show_app_settings {
             delete $SETTINGS->{_vnc_viewer};
         } else {
             $SETTINGS->{_vnc_viewer} = $viewer_val;
+        }
+        if (!defined $askpass_val || $askpass_val eq 'auto') {
+            delete $SETTINGS->{_askpass};
+        } else {
+            $SETTINGS->{_askpass} = $askpass_val;
         }
         _save_settings($SETTINGS);
         $top->destroy;
@@ -3681,7 +3753,7 @@ sub _ssh_cmd {
         $ssh[-1] =~ s/^[^\@]*\@//;
         $ssh[-1] = "$login_user\@$ssh[-1]";
     }
-    my @env = ('env', 'SSH_ASKPASS=ssh-askpass',
+    my @env = ('env', 'SSH_ASKPASS=' . (_askpass() // 'ssh-askpass'),
                'SSH_ASKPASS_REQUIRE=prefer');
     if ($term eq 'xterm') {
         return (@env, $term, '-e', @ssh);
