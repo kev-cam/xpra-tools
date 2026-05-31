@@ -2547,6 +2547,14 @@ sub _render_row {
             Settings => sub { _show_settings($sess) },
             Apps     => sub { _show_procs($sess) },
             Edit     => sub { _edit_extra_host($sess) },
+            # Fire-and-forget: clears a stale x11vnc holding the rfb port
+            # on this display.  An immediate action so it never sticks as
+            # the row's selected/default mode — pick it, it runs, the
+            # dropdown stays on whatever was selected before.
+            'Kill x11vnc' => sub {
+                _keys_ensure() unless $sess->{local};
+                spawn_detached(_kill_x11vnc_cmd($sess));
+            },
         );
         $action_menu->delete(0, 'end');
         for my $o (@$current_opts) {
@@ -2611,16 +2619,6 @@ sub _render_row {
                 my $pid = spawn_attach(_x11vnc_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
-                return;
-            }
-            if ($picked eq 'Kill x11vnc') {
-                # Clears a stale x11vnc holding the rfb port on this
-                # display (the usual cause of a failed Secure/X11 VNC
-                # attach).  Fire-and-forget ssh; not an attach, so it
-                # doesn't change this row's pid/action state.
-                _keys_ensure() unless $sess->{local};
-                spawn_detached(_kill_x11vnc_cmd($sess));
-                $action = $default_action->();
                 return;
             }
             if ($picked eq 'Attach') {
