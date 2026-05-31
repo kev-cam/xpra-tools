@@ -43,6 +43,16 @@ my $CACHE_PATH  = "$CONFIG_DIR/cache.json";
 my $SETTINGS    = _load_settings();
 my $CACHE       = _load_cache();
 
+# Soft ceiling on display numbers shown.  Xpra shadow/proxy servers use
+# very high synthetic display IDs (e.g. :1000200) the user rarely wants in
+# the list.  Stored in $SETTINGS->{_max_disp}: a positive integer is the
+# ceiling, 0 means "no limit", and an absent key falls back to the default
+# below.  Editable from the header "Settings" dialog.  --all/--any bypass
+# it entirely.
+my $MAX_DISP_DEFAULT = 9999;
+my $max_disp = $SETTINGS->{_max_disp} // $MAX_DISP_DEFAULT;
+$max_disp = undef if defined $max_disp && $max_disp == 0;   # 0 => unlimited
+
 my $listen     = $ENV{NET_MGR_LISTEN};
 my $ssh_user;             # undef → let ssh_config(5) pick the user
 my $user;                 # --user: ssh as USER and filter sessions to USER
@@ -1571,9 +1581,13 @@ for my $s (@sessions) {
     }
 }
 unless ($all || $any) {
+    # Lower-bound only here (hide presumed-plain-X displays under :20).
+    # The high-display ceiling is applied as a single final gate further
+    # down, after the .xpra-start pivot and --any merge have added their
+    # sessions — otherwise those late additions leak past the limit.
     @sessions = grep {
         $_->{kind} eq 'vnc' || $_->{_extra}
-        || (defined $_->{disp_n} && $_->{disp_n} >= 20 && $_->{disp_n} <= 1000)
+        || (defined $_->{disp_n} && $_->{disp_n} >= 20)
     } @sessions;
 }
 if (defined $user && !$any) {
@@ -1775,6 +1789,16 @@ if ($any) {
             }
         }
     }
+}
+
+# Final high-display ceiling — the one authoritative gate, applied after
+# every source (discovery, .xpra-start pivot, --any merge) has populated
+# @sessions.  Manually-added (_extra) hosts are exempt: the user asked for
+# them explicitly.  --all/--any disable the ceiling.
+if (!$all && !$any && defined $max_disp) {
+    @sessions = grep {
+        $_->{_extra} || !defined $_->{disp_n} || $_->{disp_n} <= $max_disp
+    } @sessions;
 }
 
 my %_usage = %{ $SETTINGS->{_usage} // {} };
@@ -2010,13 +2034,18 @@ sub _ask_host {
 }
 
 sub _remove_extra_host {
-    my ($host) = @_;
+    # $all_rows: also tear down rows that aren't flagged _extra (used when
+    # editing a discovered host — its old rows must go before the re-probe
+    # re-renders them, or we'd leave a stale duplicate behind).
+    my ($host, $all_rows) = @_;
     my $extras = $SETTINGS->{_extra_hosts} // [];
     @$extras = grep { $_->{name} ne $host && $_->{ip} ne $host } @$extras;
     _save_settings($SETTINGS);
     my @keep;
     for my $s (@sessions) {
-        if ($s->{_extra} && ($s->{host} eq $host || ($s->{ip} // '') eq $host)) {
+        my $match = ($s->{host} eq $host || ($s->{ip} // '') eq $host)
+                 && ($all_rows || $s->{_extra});
+        if ($match) {
             $_->destroy for @{ $s->{_widgets} // [] };
         } else {
             push @keep, $s;
@@ -2031,10 +2060,20 @@ sub _edit_extra_host {
     my $old_ip   = $sess->{ip} // '';
     my $extras = $SETTINGS->{_extra_hosts} // [];
     my ($cur) = grep { $_->{name} eq $old_host || $_->{ip} eq $old_ip } @$extras;
-    $cur //= { name => $old_host, ip => $old_ip };
+    # Discovered rows aren't in _extra_hosts yet — seed the dialog from the
+    # live session so user/display pre-fill, then editing promotes it to a
+    # persisted (sticky) extra host via _add_host_probe.
+    $cur //= {
+        name => $old_host,
+        ip   => $old_ip,
+        (defined $sess->{user} && length $sess->{user}
+            ? (user => $sess->{user}) : ()),
+        (defined $sess->{disp} && $sess->{disp} =~ /^:(\d+)$/
+            ? (disp => $1 + 0) : ()),
+    };
     my $h = _ask_host($mw, $cur);
     return unless defined $h;
-    _remove_extra_host($old_host);
+    _remove_extra_host($old_host, 1);
     _add_host_probe($mw, $h);
 }
 
@@ -2363,6 +2402,9 @@ $header_f->Button(-text => 'Rescan',
 $header_f->Button(-text => 'Add host',
                   -command => sub { _add_host_probe($mw) })
          ->pack(-side => 'left', -fill => 'x', -expand => 1);
+$header_f->Button(-text => 'Settings',
+                  -command => sub { _show_app_settings($mw) })
+         ->pack(-side => 'left', -fill => 'x', -expand => 1);
 # Global default DPI — passed to `xpra attach --dpi=N` for every session
 # unless the host's Settings dialog overrides it.  Blank means "let xpra
 # auto-detect" (the historical behaviour).  Saved on FocusOut / Return.
@@ -2478,6 +2520,12 @@ sub _render_row {
     if ($sess->{_extra}) {
         push @ACTIONS_DETACHED, '---', 'Edit', 'Remove';
         push @ACTIONS_ATTACHED, '---', 'Edit', 'Remove';
+    } else {
+        # Discovered (net-mgr) rows are editable too; editing promotes them
+        # to a persisted extra host so the change sticks across reruns.
+        # No 'Remove' — a discovered host would just reappear on next scan.
+        push @ACTIONS_DETACHED, '---', 'Edit';
+        push @ACTIONS_ATTACHED, '---', 'Edit';
     }
     my $fallback = $sess->{kind} eq 'X' ? 'Secure VNC' : 'Attach';
     my $last = $SETTINGS->{_last_action}{$sess->{host}};
@@ -2789,6 +2837,65 @@ $mw->repeat(750, sub {
 });
 
 Tk::MainLoop();
+
+# Application-wide settings (header "Settings" button) — distinct from the
+# per-host dialog below.  Currently just the max-display ceiling; designed
+# to grow.  Saves to ~/.config/find-xpra/config.json.  Changing the ceiling
+# offers an immediate Rescan so the new value takes effect on the list.
+sub _show_app_settings {
+    my ($parent) = @_;
+    my $top = $parent->Toplevel(-title => 'find-xpra: settings');
+    $top->transient($parent);
+
+    $top->Label(-text => 'Maximum display number to show:',
+                -font => 'sans-serif 11 bold')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [10, 2]);
+    $top->Label(-text => 'Sessions on displays above this are hidden '
+                       . "(e.g. xpra shadow servers on :1000000+).\n"
+                       . '0 or blank = no limit.  Default is '
+                       . "$MAX_DISP_DEFAULT.",
+                -justify => 'left', -anchor => 'w')
+        ->pack(-anchor => 'w', -padx => 12);
+    my $val = defined $max_disp ? $max_disp : 0;
+    $top->Entry(-textvariable => \$val, -width => 10, -justify => 'right')
+        ->pack(-anchor => 'w', -padx => 30, -pady => [4, 0]);
+
+    my $err = '';
+    $top->Label(-textvariable => \$err, -foreground => '#c00000')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [2, 0]);
+
+    my $btns = $top->Frame->pack(-pady => 10);
+    my $save = sub {
+        my ($rescan) = @_;
+        (my $v = $val) =~ s/^\s+|\s+$//g;
+        $v = '0' if $v eq '';
+        unless ($v =~ /^\d+$/) {
+            $err = 'Enter a non-negative whole number (0 = no limit)';
+            return;
+        }
+        $v += 0;
+        if ($v == 0) {
+            delete $SETTINGS->{_max_disp};
+            $max_disp = undef;
+        } else {
+            $SETTINGS->{_max_disp} = $v;
+            $max_disp = $v;
+        }
+        _save_settings($SETTINGS);
+        $top->destroy;
+        if ($rescan) {
+            $_save_geometry->();
+            exec { $^X } $^X, $0, @ORIG_ARGV;
+        }
+    };
+    $btns->Button(-text => 'Save & Rescan', -command => sub { $save->(1) })
+        ->pack(-side => 'left', -padx => 6);
+    $btns->Button(-text => 'Save', -command => sub { $save->(0) })
+        ->pack(-side => 'left', -padx => 6);
+    $btns->Button(-text => 'Cancel', -command => sub { $top->destroy })
+        ->pack(-side => 'left', -padx => 6);
+    $top->protocol('WM_DELETE_WINDOW' => sub { $top->destroy });
+}
 
 # Pop up a per-host settings window — currently just terminal choice,
 # but designed to grow.  Saves to ~/.config/find-xpra/config.json on Save.
