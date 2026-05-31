@@ -2530,10 +2530,10 @@ sub _render_row {
         push @ACTIONS_DETACHED, '---', 'Edit';
         push @ACTIONS_ATTACHED, '---', 'Edit';
     }
-    # "Show last log" on every row: lets the user inspect the output of the
-    # last logged command (e.g. Kill x11vnc) to see why it did/didn't work.
-    push @ACTIONS_DETACHED, 'Show last log';
-    push @ACTIONS_ATTACHED, 'Show last log';
+    # "Probe" + "Show last log" on every row: Probe dumps what's actually
+    # running on the host into the log; Show last log re-opens that output.
+    push @ACTIONS_DETACHED, 'Probe', 'Show last log';
+    push @ACTIONS_ATTACHED, 'Probe', 'Show last log';
     my $fallback = $sess->{kind} eq 'X' ? 'Secure VNC' : 'Attach';
     my $last = $SETTINGS->{_last_action}{$sess->{host}};
     my $detached_default = (defined $last
@@ -2629,6 +2629,17 @@ sub _render_row {
                 # remembered default.
                 _keys_ensure() unless $sess->{local};
                 spawn_logged($sess, 'Kill x11vnc', _kill_x11vnc_cmd($sess));
+                $action = $default_action->();
+                return;
+            }
+            if ($picked eq 'Probe') {
+                # Select-then-▶: run the broad host probe, then auto-open
+                # its log once it's had time to finish (ssh + the remote
+                # commands).  Refresh in the log window re-reads if it's
+                # still arriving.  Not sticky — reset $action afterward.
+                _keys_ensure() unless $sess->{local};
+                spawn_logged($sess, 'Probe', _probe_host_cmd($sess));
+                $mw->after(2500, sub { _show_last_log($sess) });
                 $action = $default_action->();
                 return;
             }
@@ -3362,6 +3373,53 @@ sub _x11vnc_cmd {
 # Scoped to the one display: pkill matches `x11vnc ... -display :N` and the
 # common bare `x11vnc :N` form, with a word boundary so :0 doesn't also
 # match :0something.  Runs locally (sh -c) for a local session, else ssh.
+# Broad "what's running on this host?" probe for the log viewer.  Reuses
+# the bourne-style remote command shape that discovery uses (so it works
+# on the same hosts), but dumps everything human-readable rather than
+# parsing it: VNC/x11vnc/xpra processes, listening RFB (5900+) and X
+# (6000+) ports, the X11 sockets, and `xpra list`.  This is what tells
+# the user why a VNC attach clashes (e.g. a server already on :0's port,
+# under a different process name than the kill pattern expects).
+sub _probe_host_cmd {
+    my ($s) = @_;
+    (my $disp_n = $s->{disp}) =~ s/^://;
+    my $remote = join('; ',
+        'echo "== host =="',
+        'hostname; id',
+        'echo',
+        'echo "== VNC / x11vnc / Xvnc processes =="',
+        'ps -eo user,pid,args | grep -E '
+            . "'[Xx](11)?vnc|tigervnc|tightvnc|vino|krfb|Xvnc' "
+            . '| grep -v grep || echo "(none)"',
+        'echo',
+        'echo "== xpra / Xdummy / Xvfb processes =="',
+        'ps -eo user,pid,args | grep -E '
+            . "'xpra|Xdummy|Xvfb' | grep -v grep || echo \"(none)\"",
+        'echo',
+        'echo "== listening RFB (5900-5999) & X (6000-6099) ports =="',
+        '(ss -tlnp 2>/dev/null || ss -tln 2>/dev/null '
+            . '|| netstat -tlnp 2>/dev/null || netstat -tln 2>/dev/null) '
+            . "| grep -E ':(59[0-9][0-9]|60[0-9][0-9])' || echo \"(none)\"",
+        'echo',
+        'echo "== X11 sockets (/tmp/.X11-unix) =="',
+        'ls -la /tmp/.X11-unix/ 2>/dev/null || echo "(none)"',
+        'echo',
+        'echo "== xpra list =="',
+        'xpra list 2>&1 || echo "(xpra list failed)"',
+        'true',
+    );
+    if ($s->{local}) {
+        return ('sh', '-c', $remote);
+    }
+    my @tgt = ssh_target(_sess_target($s));
+    if (defined $s->{_attach_as} && length $s->{_attach_as}) {
+        $tgt[-1] =~ s/^[^\@]*\@//;
+        $tgt[-1] = "$s->{_attach_as}\@$tgt[-1]";
+    }
+    my @sopts = ssh_opts(interactive => 1);
+    return ('ssh', @sopts, @tgt, $remote);
+}
+
 sub _kill_x11vnc_cmd {
     my ($s) = @_;
     (my $disp_n = $s->{disp}) =~ s/^://;
