@@ -53,6 +53,11 @@ my $MAX_DISP_DEFAULT = 9999;
 my $max_disp = $SETTINGS->{_max_disp} // $MAX_DISP_DEFAULT;
 $max_disp = undef if defined $max_disp && $max_disp == 0;   # 0 => unlimited
 
+# "Known hosts only" view toggle: when on, show only hosts we've connected
+# to before (tracked in $SETTINGS->{_usage}).  Off = show every discovered
+# host.  Toggled by a header button; not persisted (a per-session view).
+my $known_only = 0;
+
 # ssh-askpass program for GUI password prompts.  ssh exec's $SSH_ASKPASS
 # by name (PATH lookup); if the configured/default program doesn't exist,
 # ssh silently can't prompt and publickey-only connections fail with no
@@ -2447,28 +2452,47 @@ $header_f->Button(-text => 'Add host',
 $header_f->Button(-text => 'Settings',
                   -command => sub { _show_app_settings($mw) })
          ->pack(-side => 'left', -fill => 'x', -expand => 1);
+# Toggle between all discovered hosts and just ones we've connected to
+# before.  Label reflects what clicking will switch TO.
+my $known_btn_text = $known_only ? 'Show all hosts' : 'Known hosts';
+my $known_btn;
+$known_btn = $header_f->Button(
+    -textvariable => \$known_btn_text,
+    -command => sub {
+        $known_only = !$known_only;
+        $known_btn_text = $known_only ? 'Show all hosts' : 'Known hosts';
+        _rerender_rows();
+    });
+$known_btn->pack(-side => 'left', -fill => 'x', -expand => 1);
 # Global default DPI — passed to `xpra attach --dpi=N` for every session
-# unless the host's Settings dialog overrides it.  Blank means "let xpra
-# auto-detect" (the historical behaviour).  Saved on FocusOut / Return.
-$header_f->Label(-text => 'Default DPI:')
+# unless the host's Settings dialog overrides it.  "auto" (or blank) means
+# "let xpra auto-detect" (the historical behaviour).  Saved on
+# FocusOut / Return.
+$header_f->Label(-text => 'DPI:')
          ->pack(-side => 'left', -padx => [12, 4]);
-my $default_dpi = $SETTINGS->{'*'}{dpi} // '';
+my $default_dpi = $SETTINGS->{'*'}{dpi} // 'auto';
 my $dpi_entry = $header_f->Entry(-textvariable => \$default_dpi,
                                  -width   => 5,
                                  -justify => 'right')
                          ->pack(-side => 'left');
 my $save_default_dpi = sub {
     $default_dpi =~ s/^\s+|\s+$//g;
-    if (length $default_dpi && $default_dpi =~ /^\d+$/) {
+    if (length $default_dpi && $default_dpi =~ /^\d+$/ && $default_dpi > 0) {
         $SETTINGS->{'*'}{dpi} = $default_dpi + 0;
     } else {
+        # blank / "auto" / non-numeric all mean auto-detect
         delete $SETTINGS->{'*'}{dpi};
-        $default_dpi = '';
+        $default_dpi = 'auto';
     }
     _save_settings($SETTINGS);
 };
 $dpi_entry->bind('<FocusOut>', $save_default_dpi);
 $dpi_entry->bind('<Return>',   $save_default_dpi);
+# Clear the "auto" placeholder on focus-in so the user types into an empty
+# field; restore it on focus-out if they left it empty (save handles that).
+$dpi_entry->bind('<FocusIn>', sub {
+    $default_dpi = '' if $default_dpi eq 'auto';
+});
 $header_f->Button(-text => 'About', -command => sub {
     my $build_date = POSIX::strftime('%Y-%m-%d %H:%M', localtime((stat $0)[9]));
     my $url = 'https://github.com/kev-cam/xpra-tools';
@@ -2520,6 +2544,10 @@ my $r = 1;
 # a suppressed session in @sessions.  --all/--any disable the ceiling.
 sub _row_visible {
     my ($s) = @_;
+    # "Known hosts only": hide hosts with no prior connection (usage==0).
+    if ($known_only) {
+        return 0 unless ($SETTINGS->{_usage}{ $s->{host} } // 0) > 0;
+    }
     return 1 if $all || $any || !defined $max_disp;
     return 1 if !defined $s->{disp_n};
     return $s->{disp_n} <= $max_disp ? 1 : 0;
@@ -2798,6 +2826,19 @@ sub _render_row {
 }
 for my $s (@sessions) { _render_row($s) }
 $mw->after(50, $_update_scroll);
+
+# Re-render every row from scratch — used by the "known hosts only"
+# toggle.  Destroys current row widgets, resets the grid row counter, and
+# re-renders whichever sessions _row_visible() now admits.
+sub _rerender_rows {
+    for my $s (@sessions) {
+        $_->destroy for @{ $s->{_widgets} // [] };
+        delete $s->{_widgets};
+    }
+    $r = 1;
+    for my $s (@sessions) { _render_row($s) }
+    $mw->after(50, $_update_scroll);
+}
 
 # Background HTML5-port probe.  We can't synchronously TCP-connect from
 # the Tk thread without freezing the UI on closed/firewalled ports
