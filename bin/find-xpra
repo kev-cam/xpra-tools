@@ -2453,17 +2453,18 @@ $header_f->Button(-text => 'Settings',
                   -command => sub { _show_app_settings($mw) })
          ->pack(-side => 'left', -fill => 'x', -expand => 1);
 # Toggle between all discovered hosts and just ones we've connected to
-# before.  Label reflects what clicking will switch TO.
-my $known_btn_text = $known_only ? 'Show all hosts' : 'Known hosts';
+# before.  Compact icon button: ↕ (a "<->" turned 90°).  Active state
+# (known-only) shown by a sunken relief rather than changing the glyph.
 my $known_btn;
 $known_btn = $header_f->Button(
-    -textvariable => \$known_btn_text,
+    -text    => "\x{2195}",          # ↕ U+2195 UP DOWN ARROW
+    -relief  => $known_only ? 'sunken' : 'raised',
     -command => sub {
         $known_only = !$known_only;
-        $known_btn_text = $known_only ? 'Show all hosts' : 'Known hosts';
+        $known_btn->configure(-relief => $known_only ? 'sunken' : 'raised');
         _rerender_rows();
     });
-$known_btn->pack(-side => 'left', -fill => 'x', -expand => 1);
+$known_btn->pack(-side => 'left', -padx => 4);
 # Global default DPI — passed to `xpra attach --dpi=N` for every session
 # unless the host's Settings dialog overrides it.  "auto" (or blank) means
 # "let xpra auto-detect" (the historical behaviour).  Saved on
