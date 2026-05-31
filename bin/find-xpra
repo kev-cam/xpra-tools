@@ -74,17 +74,11 @@ my @ASKPASS_CANDIDATES = qw(
 # first candidate that exists on disk, else undef (no usable askpass).
 sub _askpass {
     my $cfg = $SETTINGS->{_askpass};
-    if (defined $cfg && length $cfg) {
-        # Absolute path: trust it.  Bare name: resolve via PATH.
-        return $cfg if $cfg =~ m{/} && -x $cfg;
-        if ($cfg !~ m{/}) {
-            for my $d (split /:/, $ENV{PATH} // '') {
-                return "$d/$cfg" if length $d && -x "$d/$cfg";
-            }
-        }
-        # Configured but not found — fall through to auto-detect so a
-        # stale setting doesn't wedge every connection.
-    }
+    # An explicit configured choice always wins, trusted VERBATIM (bare
+    # name or full path) — don't second-guess it with an -x test, so it
+    # works on platforms whose askpass lives somewhere our candidate list
+    # doesn't cover (e.g. Cygwin paths).  'auto'/empty means auto-detect.
+    return $cfg if defined $cfg && length $cfg && $cfg ne 'auto';
     for my $c (@ASKPASS_CANDIDATES) {
         return $c if -x $c;
     }
@@ -140,7 +134,11 @@ $ssh_user //= $user if defined $user;
 # tty even if it wanted to.  SSH_ASKPASS_REQUIRE=force makes OpenSSH 8.4+
 # use askpass even with $DISPLAY unset on systems that ship one.
 unless ($no_prompt) {
-    $ENV{SSH_ASKPASS}         //= (_askpass() // 'ssh-askpass');
+    # Override (not //=): the environment may already export SSH_ASKPASS
+    # to something that doesn't exist here, which would silently defeat
+    # the Settings choice.  Our resolved value wins; only fall back to the
+    # inherited env if we found nothing at all.
+    if (defined(my $ap = _askpass())) { $ENV{SSH_ASKPASS} = $ap }
     $ENV{SSH_ASKPASS_REQUIRE} //= 'force';
 }
 
@@ -2149,7 +2147,7 @@ sub _add_host_probe {
         $wr->autoflush(1);
         POSIX::setsid();
         open STDIN, '<', '/dev/null';
-        $ENV{SSH_ASKPASS} //= (_askpass() // 'ssh-askpass');
+        if (defined(my $ap = _askpass())) { $ENV{SSH_ASKPASS} = $ap }
         $SIG{ALRM} = sub { POSIX::_exit(1) };
         alarm($overall_to + 5);
         my @tgt = ssh_target({ name => $host, ip => $host_ip });
@@ -2981,32 +2979,33 @@ sub _show_app_settings {
 
     # ssh-askpass program.  ssh needs a GUI askpass to prompt for
     # passwords (the probe forks have no tty); if the configured one
-    # isn't installed, connections silently fail.  'auto' = first
-    # installed candidate.  Offers only askpass programs found on disk,
-    # plus the current choice (even if missing, so it stays visible).
+    # isn't installed, connections silently fail.  Free-text (Entry, not
+    # a dropdown) because the right program varies by platform — Cygwin,
+    # BSD, etc. live outside our Linux candidate list.  'auto' or blank =
+    # auto-detect the first installed candidate; anything else is used
+    # verbatim (bare name resolved on PATH by ssh, or a full path).
     $top->Label(-text => 'SSH askpass program:',
                 -font => 'sans-serif 11 bold')
         ->pack(-anchor => 'w', -padx => 12, -pady => [14, 2]);
     my $ap_now = _askpass();
-    $top->Label(-text => "GUI password prompt for ssh.  'auto' picks the "
-                       . "first installed.\nCurrently resolves to: "
-                       . ($ap_now // '(NONE FOUND — connections will fail)'),
+    my @installed = grep { -x $_ } @ASKPASS_CANDIDATES;
+    $top->Label(-text => "GUI password prompt for ssh.  'auto' or blank "
+                       . "= auto-detect; or give a name/path.\n"
+                       . 'Currently resolves to: '
+                       . ($ap_now // '(NONE FOUND — connections will fail)')
+                       . "\nDetected on this box: "
+                       . (@installed ? join(', ', @installed) : '(none)'),
                 -justify => 'left', -anchor => 'w')
         ->pack(-anchor => 'w', -padx => 12);
-    my @askpass = ('auto');
-    for my $c (@ASKPASS_CANDIDATES) {
-        push @askpass, $c if -x $c;
-    }
     my $askpass_val = $SETTINGS->{_askpass} // 'auto';
-    push @askpass, $askpass_val
-        unless grep { $_ eq $askpass_val } @askpass;   # keep a stale/custom choice visible
-    my $askpass_om = $top->Optionmenu(
-        -options  => [@askpass],
-        -variable => \$askpass_val,
-    );
-    $askpass_om->pack(-anchor => 'w', -padx => 30, -pady => [4, 0]);
-    $askpass_om->setOption($askpass_val)
-        if grep { $_ eq $askpass_val } @askpass;
+    my $ap_row = $top->Frame->pack(-anchor => 'w', -fill => 'x',
+                                   -padx => 30, -pady => [4, 0]);
+    my $askpass_e = $ap_row->Entry(-textvariable => \$askpass_val, -width => 40);
+    $askpass_e->pack(-side => 'left', -fill => 'x', -expand => 1);
+    $ap_row->Button(-text => 'Browse', -command => sub {
+        my $f = $top->getOpenFile(-title => 'Select ssh-askpass program');
+        $askpass_val = $f if defined $f && length $f;
+    })->pack(-side => 'left', -padx => [4, 0]);
 
     my $err = '';
     $top->Label(-textvariable => \$err, -foreground => '#c00000')
@@ -3034,7 +3033,9 @@ sub _show_app_settings {
         } else {
             $SETTINGS->{_vnc_viewer} = $viewer_val;
         }
-        if (!defined $askpass_val || $askpass_val eq 'auto') {
+        $askpass_val =~ s/^\s+|\s+$//g if defined $askpass_val;
+        if (!defined $askpass_val || !length $askpass_val
+            || $askpass_val eq 'auto') {
             delete $SETTINGS->{_askpass};
         } else {
             $SETTINGS->{_askpass} = $askpass_val;
