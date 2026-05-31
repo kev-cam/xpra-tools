@@ -2598,7 +2598,8 @@ sub _render_row {
                 _keys_ensure() unless $sess->{local};
                 _bump_usage($sess->{host}, $picked);
                 $detached_default = $picked;
-                my $pid = spawn_attach(_vnc_attach_cmd($sess));
+                my $pid = spawn_attach($sess, 'Secure VNC',
+                                       _vnc_attach_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
                 return;
@@ -2606,7 +2607,8 @@ sub _render_row {
             if ($picked eq 'Insecure VNC') {
                 _bump_usage($sess->{host}, $picked);
                 $detached_default = $picked;
-                my $pid = spawn_attach(_vnc_direct_cmd($sess));
+                my $pid = spawn_attach($sess, 'Insecure VNC',
+                                       _vnc_direct_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
                 return;
@@ -2615,7 +2617,8 @@ sub _render_row {
                 _keys_ensure() unless $sess->{local};
                 _bump_usage($sess->{host}, $picked);
                 $detached_default = $picked;
-                my $pid = spawn_attach(_x11vnc_cmd($sess));
+                my $pid = spawn_attach($sess, 'X11-VNC',
+                                       _x11vnc_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
                 return;
@@ -2647,7 +2650,7 @@ sub _render_row {
                 _keys_ensure() unless $sess->{local};
                 _bump_usage($sess->{host}, $picked);
                 $detached_default = $picked;
-                my $pid = spawn_attach(
+                my $pid = spawn_attach($sess, 'Attach',
                     $sess->{kind} eq 'vnc'
                         ? _vnc_attach_cmd($sess)
                         : _attach_cmd($sess));
@@ -2695,10 +2698,10 @@ sub _render_row {
             elsif (my $pid = $sess->{pid}) {
                 # User-initiated termination: drop the attach-info so
                 # the reap timer doesn't mistake the kill for a failed
-                # connection and pop up a diagnostics window.
-                if (my $info = delete $ATTACH_INFO{$pid}) {
-                    unlink $info->{log} if $info->{log};
-                }
+                # connection and pop up a diagnostics window.  Keep the
+                # log file — "Show last log" still points at it via
+                # $sess->{_last_log}; it's replaced on the next command.
+                delete $ATTACH_INFO{$pid};
                 if ($picked eq 'Disconnect') {
                     kill 'TERM', $pid;
                     $action = 'Force kill';
@@ -2861,9 +2864,10 @@ $mw->repeat(750, sub {
                 my $runtime = time - ($info->{start} // time);
                 if ($r > 0 && $status != 0 && $runtime < 5) {
                     _show_attach_diag($s, $info, $status);
-                } elsif ($info->{log}) {
-                    unlink $info->{log};
                 }
+                # Don't unlink the log — "Show last log" still points at
+                # it ($s->{_last_log} shares this path).  It's replaced
+                # when the next command runs on this row.
             }
         }
     }
@@ -3083,7 +3087,8 @@ sub _show_attach_diag {
             local $/; $log = <$fh>;
             close $fh;
         }
-        unlink $info->{log};
+        # Don't unlink — $sess->{_last_log} shares this path so the user
+        # can reopen it via "Show last log".  Replaced on next command.
     }
     $log = "(no output captured)\n" unless length $log;
     my $top = $mw->Toplevel(-title =>
@@ -3658,9 +3663,20 @@ sub spawn_detached {
 # find-xpra exits or the controlling terminal closes) and return the
 # child PID.  Caller is expected to waitpid(WNOHANG) it from the Tk
 # repeat-timer when the viewer exits.
+#
+# Records the command's log on BOTH %ATTACH_INFO (keyed by pid, consumed
+# by the reap timer for the auto-diagnostic pop-up) and $sess->{_last_log}
+# (so "Show last log" can show it later — the auto-popup only fires on a
+# quick non-zero exit, but the user may want to inspect a slow failure or
+# a viewer that exited 0 but never connected).  The two share one temp
+# file; it survives until the next command on this row replaces it.
 sub spawn_attach {
-    my @cmd = @_;
-    _dbg("[debug] attach: " . join(' ', map { /\s/ ? "'$_'" : $_ } @cmd));
+    my ($sess, $label, @cmd) = @_;
+    _dbg("[debug] $label: " . join(' ', map { /\s/ ? "'$_'" : $_ } @cmd));
+    # Drop the prior log for this row before starting a new one.
+    if (my $old = $sess->{_last_log}) {
+        unlink $old->{log} if $old->{log};
+    }
     my ($lfh, $lpath) = eval { tempfile('find-xpra-attach-XXXXXX',
                                         TMPDIR => 1, SUFFIX => '.log') };
     my $pid = fork;
@@ -3668,6 +3684,8 @@ sub spawn_attach {
     if ($pid) {
         close $lfh if $lfh;
         $ATTACH_INFO{$pid} = { cmd => [@cmd], log => $lpath, start => time };
+        $sess->{_last_log} = { cmd => [@cmd], log => $lpath,
+                               start => time, label => $label };
         return $pid;
     }
     # In the forked child: skip Tk's END so we don't share-close the
