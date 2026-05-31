@@ -2362,6 +2362,9 @@ sub _add_host_probe {
         }
         @new = sort { $a->{disp_n} <=> $b->{disp_n} } @new;
         for my $s (@new) {
+            # Skip over-limit rows entirely — don't render and don't keep
+            # them in @sessions (where the reap timer would still poll them).
+            next unless _row_visible($s);
             push @sessions, $s;
             _render_row($s);
         }
@@ -2473,8 +2476,21 @@ for my $i (0 .. $#cols) {
        ->grid(-row => 0, -column => $i, -sticky => 'ew');
 }
 my $r = 1;
+# The high-display ceiling enforced here, at the single render chokepoint,
+# so NO path can leak an over-limit row onto the screen — the startup
+# @sessions filter misses rows added later by the "Add host" probe
+# (_finish_add_host calls _render_row directly).  Returns true if the row
+# was actually rendered, false if suppressed, so callers can avoid leaving
+# a suppressed session in @sessions.  --all/--any disable the ceiling.
+sub _row_visible {
+    my ($s) = @_;
+    return 1 if $all || $any || !defined $max_disp;
+    return 1 if !defined $s->{disp_n};
+    return $s->{disp_n} <= $max_disp ? 1 : 0;
+}
 sub _render_row {
     my ($s) = @_;
+    return 0 unless _row_visible($s);
     my @info;
     push @info, $s->{kind} if defined $s->{kind} && $s->{kind} ne 'xpra';
     if (defined $s->{apps} && $s->{apps} ne '(root display)'
