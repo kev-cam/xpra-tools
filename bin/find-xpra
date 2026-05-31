@@ -1793,11 +1793,14 @@ if ($any) {
 
 # Final high-display ceiling — the one authoritative gate, applied after
 # every source (discovery, .xpra-start pivot, --any merge) has populated
-# @sessions.  Manually-added (_extra) hosts are exempt: the user asked for
-# them explicitly.  --all/--any disable the ceiling.
+# @sessions.  The ceiling applies to manually-added (_extra) hosts too:
+# xpra shadow/proxy servers on an added host advertise huge synthetic
+# display IDs (e.g. :1295132) that the user never wants in the list, and
+# the legitimate _extra rows (the :0 fallback, pinned displays) all sit
+# well under the limit.  --all/--any disable the ceiling.
 if (!$all && !$any && defined $max_disp) {
     @sessions = grep {
-        $_->{_extra} || !defined $_->{disp_n} || $_->{disp_n} <= $max_disp
+        !defined $_->{disp_n} || $_->{disp_n} <= $max_disp
     } @sessions;
 }
 
@@ -2498,20 +2501,20 @@ sub _render_row {
     my $sess = $s;
     my @ACTIONS_DETACHED = $sess->{kind} eq 'vnc'
         ? ('Attach', 'Secure VNC', 'Insecure VNC', 'X11-VNC',
-           '---', 'SSH', 'Apps', 'Settings')
+           'Kill x11vnc', '---', 'SSH', 'Apps', 'Settings')
         : $sess->{kind} eq 'X'
         ? ('Secure VNC', 'Insecure VNC', 'X11-VNC',
-           '---', 'SSH', 'Settings')
+           'Kill x11vnc', '---', 'SSH', 'Settings')
         : ('Attach', 'Secure VNC', 'Insecure VNC', 'X11-VNC',
            'Restart app', 'Restart Xpra', 'Restart Xpra+WWW',
            '---', 'SSH', 'Helper', 'Apps', 'Settings');
     my @ACTIONS_ATTACHED = $sess->{kind} eq 'vnc'
         ? ('Disconnect', 'Force kill', 'KILL',
-           'Secure VNC', 'Insecure VNC', 'X11-VNC',
+           'Secure VNC', 'Insecure VNC', 'X11-VNC', 'Kill x11vnc',
            '---', 'SSH', 'Apps', 'Settings')
         : $sess->{kind} eq 'X'
         ? ('Disconnect', 'Force kill', 'KILL',
-           'Secure VNC', 'Insecure VNC', 'X11-VNC',
+           'Secure VNC', 'Insecure VNC', 'X11-VNC', 'Kill x11vnc',
            '---', 'SSH', 'Settings')
         : ('Disconnect', 'Force kill', 'KILL', 'Terminal',
            'Secure VNC', 'Insecure VNC', 'X11-VNC',
@@ -2608,6 +2611,16 @@ sub _render_row {
                 my $pid = spawn_attach(_x11vnc_cmd($sess));
                 $sess->{pid} = $pid;
                 $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
+                return;
+            }
+            if ($picked eq 'Kill x11vnc') {
+                # Clears a stale x11vnc holding the rfb port on this
+                # display (the usual cause of a failed Secure/X11 VNC
+                # attach).  Fire-and-forget ssh; not an attach, so it
+                # doesn't change this row's pid/action state.
+                _keys_ensure() unless $sess->{local};
+                spawn_detached(_kill_x11vnc_cmd($sess));
+                $action = $default_action->();
                 return;
             }
             if ($picked eq 'Attach') {
@@ -3250,6 +3263,32 @@ sub _x11vnc_cmd {
             // ($s->{ip} ? $SETTINGS->{$s->{ip}}{ssh_port} : undef);
     push @sopts, '-p', $port if defined $port && $port =~ /^\d+$/ && $port != 22;
     return ('net-vnc', '--x11vnc', $dest, @sopts);
+}
+
+# Kill any x11vnc serving a specific display on the host.  Used to clear
+# a stale/wedged x11vnc that's holding the rfb port (5900+), which makes a
+# subsequent Secure VNC / X11-VNC attach fail or land on the wrong screen.
+# Scoped to the one display: pkill matches `x11vnc ... -display :N` and the
+# common bare `x11vnc :N` form, with a word boundary so :0 doesn't also
+# match :0something.  Runs locally (sh -c) for a local session, else ssh.
+sub _kill_x11vnc_cmd {
+    my ($s) = @_;
+    (my $disp_n = $s->{disp}) =~ s/^://;
+    # Match x11vnc invoked as either `-display :N` or a bare `:N`, but not
+    # :Nm (e.g. :1 must not match :10).  [^0-9] / end-of-arg guards that.
+    my $remote = "pkill -f 'x11vnc.*-display[[:space:]]*:$disp_n([^0-9]|\$)'; "
+               . "pkill -f 'x11vnc([[:space:]].*)?[[:space:]]:$disp_n([^0-9]|\$)'; "
+               . "true";
+    if ($s->{local}) {
+        return ('sh', '-c', $remote);
+    }
+    my @tgt   = ssh_target(_sess_target($s));
+    if (defined $s->{_attach_as} && length $s->{_attach_as}) {
+        $tgt[-1] =~ s/^[^\@]*\@//;
+        $tgt[-1] = "$s->{_attach_as}\@$tgt[-1]";
+    }
+    my @sopts = ssh_opts(interactive => 1);
+    return ('ssh', @sopts, @tgt, $remote);
 }
 
 sub _bump_usage {
