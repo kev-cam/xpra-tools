@@ -2465,6 +2465,22 @@ $known_btn = $header_f->Button(
         _rerender_rows();
     });
 $known_btn->pack(-side => 'left', -padx => 4);
+# Debug toggle: re-exec with --debug added/removed.  --debug governs the
+# startup probe (already finished) and opens the trace log, so toggling it
+# live means re-running discovery — same as Rescan, just with the flag
+# flipped.  Sunken relief = currently on.  Glyph: 🐞 (falls back gracefully
+# to a box if the Tk font lacks it; the relief still shows state).
+my $debug_btn;
+$debug_btn = $header_f->Button(
+    -text    => "\x{1F41E}",         # 🐞 LADY BEETLE
+    -relief  => $debug ? 'sunken' : 'raised',
+    -command => sub {
+        $_save_geometry->();
+        my @argv = grep { $_ ne '--debug' && $_ ne '-debug' } @ORIG_ARGV;
+        push @argv, '--debug' unless $debug;   # add it only when turning ON
+        exec { $^X } $^X, $0, @argv;
+    });
+$debug_btn->pack(-side => 'left', -padx => 4);
 # Global default DPI — passed to `xpra attach --dpi=N` for every session
 # unless the host's Settings dialog overrides it.  "auto" (or blank) means
 # "let xpra auto-detect" (the historical behaviour).  Saved on
