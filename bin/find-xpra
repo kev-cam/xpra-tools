@@ -53,10 +53,11 @@ my $MAX_DISP_DEFAULT = 9999;
 my $max_disp = $SETTINGS->{_max_disp} // $MAX_DISP_DEFAULT;
 $max_disp = undef if defined $max_disp && $max_disp == 0;   # 0 => unlimited
 
-# "Known hosts only" view toggle: when on, show only hosts we've connected
-# to before (tracked in $SETTINGS->{_usage}).  Off = show every discovered
-# host.  Toggled by a header button; not persisted (a per-session view).
-my $known_only = 0;
+# "Show hidden" view toggle: when off (default) sessions whose host is
+# marked Hide (per-host Settings; local :0 hidden by default) are kept out
+# of the list to reduce clutter.  When on, those hidden sessions are
+# revealed too.  Toggled by a header button; not persisted (per-session).
+my $show_hidden = 0;
 
 # ssh-askpass program for GUI password prompts.  ssh exec's $SSH_ASKPASS
 # by name (PATH lookup); if the configured/default program doesn't exist,
@@ -2473,22 +2474,23 @@ $BALLOON->attach($addhost_btn,
 $BALLOON->attach($settings_btn,
     -balloonmsg => 'App settings: max display number, VNC viewer backend, '
                  . 'and the ssh-askpass program.');
-# Toggle between all discovered hosts and just ones we've connected to
-# before.  Compact icon button: ↕ (a "<->" turned 90°).  Active state
-# (known-only) shown by a sunken relief rather than changing the glyph.
+# "Show hidden" toggle: reveal sessions whose host is marked Hide (and the
+# local :0, hidden by default).  Compact icon button: ↕ (a "<->" turned
+# 90°).  Active state (hidden shown) shown by a sunken relief.
 my $known_btn;
 $known_btn = $header_f->Button(
     -text    => "\x{2195}",          # ↕ U+2195 UP DOWN ARROW
-    -relief  => $known_only ? 'sunken' : 'raised',
+    -relief  => $show_hidden ? 'sunken' : 'raised',
     -command => sub {
-        $known_only = !$known_only;
-        $known_btn->configure(-relief => $known_only ? 'sunken' : 'raised');
+        $show_hidden = !$show_hidden;
+        $known_btn->configure(-relief => $show_hidden ? 'sunken' : 'raised');
         _rerender_rows();
     });
 $known_btn->pack(-side => 'left', -padx => 4);
 $BALLOON->attach($known_btn,
-    -balloonmsg => 'Toggle: show all discovered hosts vs. only hosts '
-                 . "you've connected to before. (Pressed = known only.)");
+    -balloonmsg => 'Show hidden sessions (hosts marked Hide in their '
+                 . 'Settings, and the local :0 by default). '
+                 . 'Pressed = hidden shown.');
 # Debug toggle: re-exec with --debug added/removed.  --debug governs the
 # startup probe (already finished) and opens the trace log, so toggling it
 # live means re-running discovery — same as Rescan, just with the flag
@@ -2605,12 +2607,10 @@ sub _host_hidden {
 # a suppressed session in @sessions.  --all/--any disable the ceiling.
 sub _row_visible {
     my ($s) = @_;
-    # "Known hosts only": hide hosts with no prior connection (usage==0).
-    if ($known_only) {
-        return 0 unless ($SETTINGS->{_usage}{ $s->{host} } // 0) > 0;
-    }
-    # Per-host "hidden" opt-out — shown only in show-all (--all) mode.
-    if (!$all && _host_hidden($s)) {
+    # Per-host "hidden" opt-out (host Settings → Hide; local :0 hidden by
+    # default).  Suppressed unless the "show hidden" header toggle is on,
+    # or --all was given on the command line.
+    if (!$all && !$show_hidden && _host_hidden($s)) {
         return 0;
     }
     # High-display ceiling — applies even under --all / --any.  Nothing
