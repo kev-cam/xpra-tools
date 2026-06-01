@@ -59,6 +59,20 @@ $max_disp = undef if defined $max_disp && $max_disp == 0;   # 0 => unlimited
 # revealed too.  Toggled by a header button; not persisted (per-session).
 my $show_hidden = 0;
 
+# Target X display for windows we launch (viewers, terminals, helpers).
+# When find-xpra itself runs inside an xpra/nested session, spawned
+# viewers would otherwise inherit that session's $DISPLAY and open inside
+# it; set this to e.g. ":0" to push them to the real screen instead.
+# Blank = inherit the current $DISPLAY (historical behaviour).  Edited in
+# the header "Display:" field; seeded from a saved default if present.
+my $target_display = $SETTINGS->{_target_display} // '';
+# Apply $target_display to the current (child) process's environment, just
+# before exec in the spawn_* helpers.  No-op when blank.
+sub _apply_target_display {
+    return unless defined $target_display && length $target_display;
+    $ENV{DISPLAY} = $target_display;
+}
+
 # ssh-askpass program for GUI password prompts.  ssh exec's $SSH_ASKPASS
 # by name (PATH lookup); if the configured/default program doesn't exist,
 # ssh silently can't prompt and publickey-only connections fail with no
@@ -2542,6 +2556,38 @@ $dpi_entry->bind('<Return>',   $save_default_dpi);
 $dpi_entry->bind('<FocusIn>', sub {
     $default_dpi = '' if $default_dpi eq 'auto';
 });
+# Target display for launched windows.  When find-xpra runs inside an
+# xpra/nested session, set this to e.g. ":0" so viewers/terminals open on
+# the real screen instead of inside this session.  Blank = inherit the
+# current $DISPLAY.  Saved (as the default) on FocusOut / Return.
+$header_f->Label(-text => 'Display:')
+         ->pack(-side => 'left', -padx => [12, 4]);
+my $disp_field = $target_display eq '' ? 'auto' : $target_display;
+my $disp_entry = $header_f->Entry(-textvariable => \$disp_field,
+                                  -width   => 6,
+                                  -justify => 'right');
+$disp_entry->pack(-side => 'left');
+$BALLOON->attach($disp_entry,
+    -balloonmsg => 'X display for windows find-xpra launches (e.g. :0). '
+                 . 'Useful when running inside an xpra session. '
+                 . '"auto" or blank = use the current $DISPLAY.');
+my $save_target_display = sub {
+    $disp_field =~ s/^\s+|\s+$//g;
+    if (length $disp_field && lc $disp_field ne 'auto') {
+        $target_display = $disp_field;
+        $SETTINGS->{_target_display} = $disp_field;
+    } else {
+        $target_display = '';
+        delete $SETTINGS->{_target_display};
+        $disp_field = 'auto';
+    }
+    _save_settings($SETTINGS);
+};
+$disp_entry->bind('<FocusOut>', $save_target_display);
+$disp_entry->bind('<Return>',   $save_target_display);
+$disp_entry->bind('<FocusIn>', sub {
+    $disp_field = '' if $disp_field eq 'auto';
+});
 my $about_btn = $header_f->Button(-text => 'About', -command => sub {
     my $build_date = POSIX::strftime('%Y-%m-%d %H:%M', localtime((stat $0)[9]));
     my $url = 'https://github.com/kev-cam/xpra-tools';
@@ -4079,6 +4125,7 @@ sub spawn_logged {
         open STDOUT, '>', '/dev/null';
         open STDERR, '>', '/dev/null';
     }
+    _apply_target_display();
     exec { $cmd[0] } @cmd or POSIX::_exit(127);
 }
 
@@ -4097,6 +4144,7 @@ sub spawn_detached {
     open STDIN,  '<', '/dev/null';
     open STDOUT, '>', '/dev/null';
     open STDERR, '>', '/dev/null';
+    _apply_target_display();
     exec { $cmd[0] } @cmd or POSIX::_exit(127);
 }
 
@@ -4146,5 +4194,6 @@ sub spawn_attach {
         open STDOUT, '>', '/dev/null';
         open STDERR, '>', '/dev/null';
     }
+    _apply_target_display();
     exec { $cmd[0] } @cmd or POSIX::_exit(127);
 }
