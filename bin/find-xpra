@@ -2795,22 +2795,15 @@ sub _render_row {
             }
             if ($picked eq 'Kill session') {
                 # Stop the xpra session server on this display (frees its
-                # memory).  Destructive — confirm first.  Logged so the
+                # memory).  Destructive — confirm first, offering Stop
+                # (graceful `xpra stop`) vs Kill (graceful, then pkill any
+                # leftover Xdummy/Xvfb/xpra for the display).  Logged so the
                 # result is visible via "Show last log".
-                my $ans = $mw->messageBox(
-                    -title   => 'find-xpra: kill session',
-                    -message => "Stop the xpra session on "
-                              . "$sess->{host} $sess->{disp}?\n\n"
-                              . "This shuts the server down and disconnects "
-                              . "any clients (frees its memory).",
-                    -type    => 'yesno',
-                    -icon    => 'warning',
-                    -default => 'no',
-                );
-                if (lc $ans eq 'yes') {
+                my $choice = _kill_session_dialog($sess);
+                if ($choice) {       # 'stop' or 'kill'; undef = cancel
                     _keys_ensure() unless $sess->{local};
-                    spawn_logged($sess, 'Kill session',
-                                 _kill_session_cmd($sess));
+                    spawn_logged($sess, "Kill session ($choice)",
+                                 _kill_session_cmd($sess, $choice eq 'kill'));
                 }
                 $action = $default_action->();
                 return;
@@ -3824,28 +3817,78 @@ sub _kill_x11vnc_cmd {
     return ('ssh', @sopts, @tgt, $remote);
 }
 
+# Confirmation dialog for "Kill session": offers Stop (graceful) vs Kill
+# (force) vs Cancel.  Returns 'stop', 'kill', or undef (cancel).  Modal:
+# grab + waitWindow so the caller blocks until the user chooses.
+sub _kill_session_dialog {
+    my ($s) = @_;
+    my $choice;        # stays undef on cancel / window close
+    my $dlg = $mw->Toplevel(-title => 'find-xpra: kill session');
+    $dlg->transient($mw);
+    $dlg->Label(-text => "Kill the xpra session on $s->{host} $s->{disp}?",
+                -font => 'sans-serif 11 bold', -padx => 16, -pady => [14, 4])
+        ->pack(-anchor => 'w');
+    $dlg->Label(
+        -justify => 'left', -anchor => 'w', -padx => 16, -pady => [0, 8],
+        -text => "Stop  — graceful `xpra stop` (disconnects clients).\n"
+               . "Kill  — stop, then force-kill any leftover\n"
+               . "          Xdummy/Xvfb/xpra for this display.",
+    )->pack(-anchor => 'w');
+    my $bf = $dlg->Frame->pack(-pady => 10);
+    $bf->Button(-text => 'Stop', -width => 8,
+        -command => sub { $choice = 'stop'; $dlg->destroy })
+       ->pack(-side => 'left', -padx => 6);
+    $bf->Button(-text => 'Kill', -width => 8,
+        -command => sub { $choice = 'kill'; $dlg->destroy })
+       ->pack(-side => 'left', -padx => 6);
+    $bf->Button(-text => 'Cancel', -width => 8,
+        -command => sub { $dlg->destroy })
+       ->pack(-side => 'left', -padx => 6);
+    $dlg->protocol('WM_DELETE_WINDOW' => sub { $dlg->destroy });
+    $dlg->grab;
+    $dlg->waitWindow;
+    return $choice;
+}
+
 # Stop an xpra session server on this display, freeing its memory.
 # `xpra stop :N` shuts the server down cleanly (disconnects clients, tears
-# down the Xdummy/Xvfb).  Diagnostic: report whether a server was listed
+# down the Xdummy/Xvfb).  With $force, also pkill any leftover server
+# procs for the display.  Diagnostic: report whether a server was listed
 # before/after so "Show last log" shows what happened.  $xpra is the
 # resolved xpra binary; the remote runs it by basename via PATH, so for
 # the remote case we just say "xpra" (the local _xpra_bin path may not
 # exist on the remote).
 sub _kill_session_cmd {
-    my ($s) = @_;
+    my ($s, $force) = @_;
     (my $disp_n = $s->{disp}) =~ s/^://;
     my $xpra_local = _xpra_bin();
+    # Force mode: after the graceful `xpra stop`, pkill any server process
+    # still bound to this display — the xpra wrapper, its Xdummy/Xvfb, and
+    # the xpra proxy/start for :N — for a session too wedged to stop on its
+    # own.  Word-boundary guard so :1 doesn't also match :10.
+    my $force_pat = "(xpra_Xdummy|Xdummy|Xvfb|xpra)([[:space:]].*)?"
+                  . "[[:space:]]:$disp_n([^0-9]|\$)";
     my $build = sub {
         my ($xpra) = @_;
-        return
+        my $cmd =
               "echo '== xpra :$disp_n (before) =='; "
             . "$xpra list 2>&1 | grep -E ':$disp_n\\b' || echo '(not listed)'; "
             . "echo '== stopping :$disp_n =='; "
             . "$xpra stop :$disp_n 2>&1; echo \"xpra stop rc=\$?\"; "
-            . "sleep 1; "
-            . "echo '== xpra :$disp_n (after) =='; "
-            . "$xpra list 2>&1 | grep -E ':$disp_n\\b' || echo '(gone)'; "
-            . "true";
+            . "sleep 1; ";
+        if ($force) {
+            $cmd .=
+                  "echo '== force-killing leftovers =='; "
+                . "pkill -f '$force_pat'; echo \"pkill rc=\$?\"; "
+                . "sleep 1; ";
+        }
+        $cmd .=
+              "echo '== xpra :$disp_n (after) =='; "
+            . "$xpra list 2>&1 | grep -E ':$disp_n\\b' || echo '(gone)'; ";
+        $cmd .= "pgrep -af '$force_pat' || echo '(no leftover procs)'; "
+            if $force;
+        $cmd .= "true";
+        return $cmd;
     };
     if ($s->{local}) {
         return ('sh', '-c', $build->($xpra_local));
