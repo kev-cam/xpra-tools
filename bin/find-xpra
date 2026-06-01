@@ -3825,6 +3825,10 @@ sub _kill_session_dialog {
     my $choice;        # stays undef on cancel / window close
     my $dlg = $mw->Toplevel(-title => 'find-xpra: kill session');
     $dlg->transient($mw);
+    # Grab BEFORE building/mapping the widgets — matches the working
+    # _ask_host dialog.  Grabbing an already-mapped toplevel misbehaves on
+    # some window managers and can leave the content unmapped (blank).
+    $dlg->grab;
     $dlg->Label(-text => "Kill the xpra session on $s->{host} $s->{disp}?",
                 -font => 'sans-serif 11 bold', -padx => 16, -pady => [14, 4])
         ->pack(-anchor => 'w');
@@ -3845,7 +3849,6 @@ sub _kill_session_dialog {
         -command => sub { $dlg->destroy })
        ->pack(-side => 'left', -padx => 6);
     $dlg->protocol('WM_DELETE_WINDOW' => sub { $dlg->destroy });
-    $dlg->grab;
     $dlg->waitWindow;
     return $choice;
 }
