@@ -2153,6 +2153,52 @@ sub _remove_extra_host {
     @sessions = @keep;
 }
 
+# Remove a single session row (host+display) — used by the "Remove"
+# action.  The old code routed Remove through _remove_extra_host($host),
+# which tore down EVERY row sharing the host; clicking Remove on one bad
+# display wiped the lot.  Here we drop just the clicked row and record
+# that host+display as hidden so a rescan won't bring this specific bad
+# display back (recoverable via the ↕ "show hidden" toggle, or by
+# un-ticking Hide in Settings).  When it was the host's last row, the
+# manually-added host entry is forgotten entirely (the old whole-host
+# Remove still happens, just only once nothing else is left).
+sub _remove_session {
+    my ($sess) = @_;
+    my $host = $sess->{host};
+    my $ip   = $sess->{ip} // '';
+    my $dn   = $sess->{disp_n};
+
+    # Drop the clicked row from the model; _rerender_rows re-packs the
+    # grid (avoids a gap where the destroyed row used to be).
+    @sessions = grep { $_ != $sess } @sessions;
+
+    # Keep this exact display out of future scans (recoverable).
+    $SETTINGS->{_hidden}{"$host\t$dn"} = 1 if defined $dn;
+
+    my $extras = $SETTINGS->{_extra_hosts} // [];
+    my $host_left = grep {
+        ($_->{host} // '') eq $host || ($_->{ip} // '') eq $host
+     || ($ip ne '' && (($_->{host} // '') eq $ip || ($_->{ip} // '') eq $ip))
+    } @sessions;
+    if (!$host_left) {
+        # Last row for this host — forget the manually-added host outright.
+        @$extras = grep { $_->{name} ne $host && $_->{ip} ne $host
+                       && ($ip eq '' || ($_->{name} ne $ip && $_->{ip} ne $ip)) }
+                   @$extras;
+    } else {
+        # Other rows remain — only clear a pin that targeted this display,
+        # so the fallback "(root display)" row for it doesn't re-appear.
+        for my $e (@$extras) {
+            next unless $e->{name} eq $host || $e->{ip} eq $host
+                     || ($ip ne '' && ($e->{name} eq $ip || $e->{ip} eq $ip));
+            delete $e->{disp}
+                if defined $e->{disp} && defined $dn && $e->{disp} == $dn;
+        }
+    }
+    _save_settings($SETTINGS);
+    _rerender_rows() if defined &_rerender_rows;
+}
+
 sub _edit_extra_host {
     my ($sess) = @_;
     my $old_host = $sess->{host};
@@ -2935,7 +2981,7 @@ sub _render_row {
                 return;
             }
             elsif ($picked eq 'Remove') {
-                _remove_extra_host($sess->{host});
+                _remove_session($sess);
                 return;
             }
             elsif ($picked eq 'Apps') {
