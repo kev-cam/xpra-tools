@@ -1414,6 +1414,24 @@ for my $pid (keys %pid_for) {
         } @group)[0];
         $canonical{$_} = $canon for @group;
     }
+    # Always fold the local host under "localhost", whatever net-mgr named
+    # it (e.g. usb15_1), so its sessions group there rather than under the
+    # box's real hostname.  Reuse the relabel machinery below.
+    {
+        my %local_name = map  { $_->{name} => 1 }
+                         grep { $_->{local} && defined $_->{name}
+                                && $_->{name} ne 'localhost' } @candidates;
+        if (%local_name) {
+            # Aliases already collapsed onto a local name → localhost too.
+            for my $k (keys %canonical) {
+                $canonical{$k} = 'localhost' if $local_name{ $canonical{$k} };
+            }
+            $canonical{$_} = 'localhost' for keys %local_name;
+            # Rename the candidate(s) so the _name_for-keyed maps below
+            # (local_for_name / ip_for_name / ...) key on localhost.
+            $_->{local} and $_->{name} = 'localhost' for @candidates;
+        }
+    }
     if (%canonical) {
         $_->[0] = $canonical{$_->[0]} // $_->[0] for @rows;
         my %relabelled;
