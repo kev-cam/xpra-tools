@@ -366,7 +366,37 @@ sub ssh_target {
 sub _sess_target {
     my ($s) = @_;
     return { name => $s->{host}, ip => $s->{ip},
+             (defined $s->{_attach_as} && length $s->{_attach_as}
+                ? (ssh_user => $s->{_attach_as}) : ()),
              ($s->{_extra} ? (_extra => 1) : ()) };
+}
+
+# Resolve an explicit per-host SSH login user: the Settings-dialog
+# override ($SETTINGS->{HOST}{ssh_user}) first, else a user typed into
+# the Add/Edit-host dialog (persisted under _extra_hosts).  Returns undef
+# when neither is set, so callers fall back to ssh_config / $ssh_user.
+# This is the login used for attach / VNC / SSH actions — not just the
+# discovery probe.
+sub _host_login_user {
+    my ($host, $ip) = @_;
+    my $u = (defined $host && $SETTINGS->{$host} ? $SETTINGS->{$host}{ssh_user} : undef)
+         // (defined $ip   && $SETTINGS->{$ip}   ? $SETTINGS->{$ip}{ssh_user}   : undef);
+    unless (defined $u && length $u) {
+        for my $e (@{ $SETTINGS->{_extra_hosts} || [] }) {
+            next unless defined $e->{user} && length $e->{user};
+            my $match;
+            $match = 1 if defined $e->{name}
+                       && ((defined $host && $e->{name} eq $host)
+                        || (defined $ip   && $e->{name} eq $ip));
+            $match = 1 if defined $e->{ip}
+                       && ((defined $host && $e->{ip} eq $host)
+                        || (defined $ip   && $e->{ip} eq $ip));
+            next unless $match;
+            $u = $e->{user};
+            last;
+        }
+    }
+    return (defined $u && length $u) ? $u : undef;
 }
 
 # Resolve the ssh login user for a candidate by consulting ssh_config.
@@ -1897,10 +1927,12 @@ for my $s (@sessions) {
                : $other_user            ? '(login required)'
                :                          '(daemons only)';
 }
-# Apply per-host SSH user overrides from Settings.
+# Apply per-host SSH user overrides (Settings dialog, or a user typed
+# into the Add/Edit-host dialog) so attach / VNC / SSH actions log in as
+# that user, not just the discovery probe.
 for my $s (@sessions) {
-    my $u = $SETTINGS->{$s->{host}}{ssh_user};
-    $s->{_attach_as} = $u if defined $u && length $u;
+    my $u = _host_login_user($s->{host}, $s->{ip});
+    $s->{_attach_as} = $u if defined $u;
 }
 
 # Drop sessions whose only contents are session plumbing (no real app to
@@ -2418,6 +2450,10 @@ sub _add_host_probe {
             my $other = $any && defined $s->{user} && length $s->{user}
                       && $s->{user} ne $own_user;
             $s->{_attach_as} = $s->{user} if $other;
+            # An explicit per-host login (Settings, or the user just typed
+            # into the Add/Edit-host dialog) wins — apply it to attach/ssh.
+            my $hu = _host_login_user($s->{host}, $s->{ip}) // $host_user;
+            $s->{_attach_as} = $hu if defined $hu && length $hu;
             $s->{apps} = length $main        ? _fmt_cmd($main, 60)
                        : $s->{xpra_listed}   ? '(empty xpra)'
                        : $s->{kind} eq 'vnc' ? '(vnc)'
