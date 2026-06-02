@@ -1898,6 +1898,15 @@ if (defined $max_disp) {
     } @sessions;
 }
 
+# Hard-removed displays (Remove action) are gone for good — drop them from
+# the model entirely so the reap timer never polls them and the ↕ toggle
+# can't reveal them.  Recover only by editing _removed in the config file.
+if (my $rm = $SETTINGS->{_removed}) {
+    @sessions = grep {
+        !defined $_->{disp_n} || !$rm->{ "$_->{host}\t$_->{disp_n}" }
+    } @sessions;
+}
+
 my %_usage = %{ $SETTINGS->{_usage} // {} };
 @sessions = sort {
        ($b->{local}//0) <=> ($a->{local}//0)
@@ -2153,15 +2162,27 @@ sub _remove_extra_host {
     @sessions = @keep;
 }
 
-# Remove a single session row (host+display) — used by the "Remove"
-# action.  The old code routed Remove through _remove_extra_host($host),
-# which tore down EVERY row sharing the host; clicking Remove on one bad
-# display wiped the lot.  Here we drop just the clicked row and record
-# that host+display as hidden so a rescan won't bring this specific bad
-# display back (recoverable via the ↕ "show hidden" toggle, or by
-# un-ticking Hide in Settings).  When it was the host's last row, the
-# manually-added host entry is forgotten entirely (the old whole-host
-# Remove still happens, just only once nothing else is left).
+# Soft-hide a single session row (host+display) — the "Hide" action.
+# Reversible: the row is suppressed now and stays out of the normal list,
+# but the ↕ "show hidden" toggle reveals it and Settings → Hide un-ticks
+# it.  This is the recoverable counterpart to the permanent Remove below.
+sub _hide_session {
+    my ($sess) = @_;
+    my $dn = $sess->{disp_n};
+    return unless defined $dn;
+    $SETTINGS->{_hidden}{"$sess->{host}\t$dn"} = 1;
+    _save_settings($SETTINGS);
+    _rerender_rows() if defined &_rerender_rows;
+}
+
+# Hard-remove a single session row (host+display) — the "Remove" action.
+# The old code routed Remove through _remove_extra_host($host), which tore
+# down EVERY row sharing the host; clicking Remove on one bad display
+# wiped the lot.  Here we drop just the clicked row and blocklist that
+# host+display in _removed so it never reappears on a rescan and the ↕
+# toggle won't reveal it — recover only by editing _removed in the config
+# file.  (Use Hide for the reversible version.)  When it was the host's
+# last row, the manually-added host entry is forgotten entirely.
 sub _remove_session {
     my ($sess) = @_;
     my $host = $sess->{host};
@@ -2172,8 +2193,11 @@ sub _remove_session {
     # grid (avoids a gap where the destroyed row used to be).
     @sessions = grep { $_ != $sess } @sessions;
 
-    # Keep this exact display out of future scans (recoverable).
-    $SETTINGS->{_hidden}{"$host\t$dn"} = 1 if defined $dn;
+    # Permanently blocklist this exact display against future scans.
+    $SETTINGS->{_removed}{"$host\t$dn"} = 1 if defined $dn;
+    # Drop any stale soft-hide entry — Remove supersedes Hide.
+    delete $SETTINGS->{_hidden}{"$host\t$dn"}
+        if defined $dn && $SETTINGS->{_hidden};
 
     my $extras = $SETTINGS->{_extra_hosts} // [];
     my $host_left = grep {
@@ -2738,6 +2762,12 @@ sub _session_hidden {
 # a suppressed session in @sessions.  --all/--any disable the ceiling.
 sub _row_visible {
     my ($s) = @_;
+    # Hard-removed (Remove action) — never shown, not even under --all or
+    # the ↕ "show hidden" toggle.  Guard against autovivifying _removed.
+    if (defined $s->{disp_n} && $SETTINGS->{_removed}
+        && $SETTINGS->{_removed}{ "$s->{host}\t$s->{disp_n}" }) {
+        return 0;
+    }
     # Per-host "hidden" opt-out (host Settings → Hide; local :0 hidden by
     # default).  Suppressed unless the "show hidden" header toggle is on,
     # or --all was given on the command line.
@@ -2806,15 +2836,15 @@ sub _render_row {
            'Restart app', 'Restart Xpra', 'Restart Xpra+WWW',
            'Kill session',
            '---', 'SSH', 'Helper', 'Apps', 'Settings');
+    # Hide (soft, reversible) sits beside Remove (hard, permanent).  Hide
+    # is on every row; Remove only on manually-added (_extra) hosts — a
+    # discovered host would just reappear on the next scan.
     if ($sess->{_extra}) {
-        push @ACTIONS_DETACHED, '---', 'Edit', 'Remove';
-        push @ACTIONS_ATTACHED, '---', 'Edit', 'Remove';
+        push @ACTIONS_DETACHED, '---', 'Edit', 'Hide', 'Remove';
+        push @ACTIONS_ATTACHED, '---', 'Edit', 'Hide', 'Remove';
     } else {
-        # Discovered (net-mgr) rows are editable too; editing promotes them
-        # to a persisted extra host so the change sticks across reruns.
-        # No 'Remove' — a discovered host would just reappear on next scan.
-        push @ACTIONS_DETACHED, '---', 'Edit';
-        push @ACTIONS_ATTACHED, '---', 'Edit';
+        push @ACTIONS_DETACHED, '---', 'Edit', 'Hide';
+        push @ACTIONS_ATTACHED, '---', 'Edit', 'Hide';
     }
     # "Probe" + "Show last log" on every row: Probe dumps what's actually
     # running on the host into the log; Show last log re-opens that output.
@@ -2837,6 +2867,10 @@ sub _render_row {
             Settings        => sub { _show_settings($sess) },
             Apps            => sub { _show_procs($sess) },
             Edit            => sub { _edit_extra_host($sess) },
+            # Reversible: hide this row now; reveal via the ↕ toggle and
+            # un-hide in Settings.  (Remove, by contrast, is permanent and
+            # deferred behind ▶.)
+            Hide            => sub { _hide_session($sess) },
             # Non-destructive: pop up the captured output of the last
             # logged command (currently Kill x11vnc) run from this row.
             'Show last log' => sub { _show_last_log($sess) },
