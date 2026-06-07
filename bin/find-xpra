@@ -2854,6 +2854,13 @@ sub _render_row {
            'Restart app', 'Restart Xpra', 'Restart Xpra+WWW',
            'Kill session',
            '---', 'SSH', 'Helper', 'Apps', 'Settings');
+    # remmina hosts every connection in ONE shared client process/window, so a
+    # Disconnect (kill of the attach + its group) would tear down everyone's
+    # windows.  Drop Disconnect for remmina-backed rows and default to a benign
+    # re-attach instead; Force kill/KILL stay for deliberate teardown.
+    @ACTIONS_ATTACHED = grep { $_ ne 'Disconnect' } @ACTIONS_ATTACHED
+        if $sess->{_remmina};
+    my $attached_default = $sess->{_remmina} ? 'Secure VNC' : 'Disconnect';
     # Hide (soft, reversible) sits beside Remove (hard, permanent).  Hide
     # is on every row; Remove only on manually-added (_extra) hosts — a
     # discovered host would just reappear on the next scan.
@@ -2875,7 +2882,7 @@ sub _render_row {
     my $action = $detached_default;
     my $current_opts = \@ACTIONS_DETACHED;
     my $default_action = sub {
-        return $sess->{pid} ? 'Disconnect' : $detached_default;
+        return $sess->{pid} ? $attached_default : $detached_default;
     };
     my ($action_mb, $action_menu);
     my $set_actions = sub {
@@ -2925,7 +2932,7 @@ sub _render_row {
     $action_menu = $action_mb->Menu(-tearoff => 0);
     $action_mb->configure(-menu => $action_menu);
     if ($sess->{pid}) {
-        $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
+        $set_actions->(\@ACTIONS_ATTACHED, $attached_default);
     } else {
         $set_actions->(\@ACTIONS_DETACHED, $detached_default);
     }
@@ -2939,7 +2946,7 @@ sub _render_row {
                 my $pid = spawn_attach($sess, 'Secure VNC',
                                        _vnc_attach_cmd($sess));
                 $sess->{pid} = $pid;
-                $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
+                $set_actions->(\@ACTIONS_ATTACHED, $attached_default);
                 return;
             }
             if ($picked eq 'Insecure VNC') {
@@ -2948,7 +2955,7 @@ sub _render_row {
                 my $pid = spawn_attach($sess, 'Insecure VNC',
                                        _vnc_direct_cmd($sess));
                 $sess->{pid} = $pid;
-                $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
+                $set_actions->(\@ACTIONS_ATTACHED, $attached_default);
                 return;
             }
             if ($picked eq 'X11-VNC') {
@@ -2958,7 +2965,7 @@ sub _render_row {
                 my $pid = spawn_attach($sess, 'X11-VNC',
                                        _x11vnc_cmd($sess));
                 $sess->{pid} = $pid;
-                $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
+                $set_actions->(\@ACTIONS_ATTACHED, $attached_default);
                 return;
             }
             if ($picked eq 'Kill x11vnc') {
@@ -3008,7 +3015,7 @@ sub _render_row {
                         ? _vnc_attach_cmd($sess)
                         : _attach_cmd($sess));
                 $sess->{pid} = $pid;
-                $set_actions->(\@ACTIONS_ATTACHED, 'Disconnect');
+                $set_actions->(\@ACTIONS_ATTACHED, $attached_default);
                 return;
             }
             if ($picked eq 'Attach Browser') {
@@ -3805,6 +3812,17 @@ sub _have_exe {
     return 0;
 }
 
+# True if this attach command will bring up remmina as its VNC viewer. Only
+# net-vnc launches a viewer; it picks remmina unless NET_VNC_VIEWER forces
+# another. remmina is a single shared client (one window hosts every
+# connection), so find-xpra must not offer to Disconnect/kill it per-row.
+sub _cmd_uses_remmina {
+    my $joined = join(' ', @_);
+    return 0 unless $joined =~ /\bnet-vnc\b/;
+    return ($1 eq 'remmina' ? 1 : 0) if $joined =~ /NET_VNC_VIEWER=(\S+)/;
+    return _have_exe('remmina') ? 1 : 0;   # auto: net-vnc uses remmina if present
+}
+
 # Resolve the VNC viewer backend to hand net-vnc via NET_VNC_VIEWER.
 # Returns a viewer name to force, or undef to let net-vnc auto-pick.
 #   $SETTINGS->{_vnc_viewer}: 'auto'/unset = net-vnc's own choice
@@ -4307,6 +4325,9 @@ sub spawn_attach {
     if ($pid) {
         close $lfh if $lfh;
         $ATTACH_INFO{$pid} = { cmd => [@cmd], log => $lpath, start => time };
+        # remmina is a single shared client; flag the row so its action menu
+        # omits Disconnect (which would close every connection's window).
+        $sess->{_remmina} = _cmd_uses_remmina(@cmd);
         $sess->{_last_log} = { cmd => [@cmd], log => $lpath,
                                start => time, label => $label };
         return $pid;
