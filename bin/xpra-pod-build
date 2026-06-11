@@ -66,6 +66,20 @@ my %FLAVORS = (
                      . 'echo "%USER% ALL=(ALL) NOPASSWD:ALL" '
                      . '> /etc/sudoers.d/%USER%',
     },
+    'debian-trixie' => {
+        from        => 'docker.io/library/debian:13',
+        install     => 'export DEBIAN_FRONTEND=noninteractive && '
+                     . 'apt-get update && '
+                     . 'apt-get install -y --no-install-recommends '
+                     . 'xpra openssh-server xterm sudo ca-certificates '
+                     . 'dbus-x11 && '
+                     . 'apt-get clean && rm -rf /var/lib/apt/lists/*',
+        adduser     => 'useradd -m -s /bin/bash -u %UID% %USER% && '
+                     . 'usermod -p \'*\' %USER% && '
+                     . 'usermod -aG sudo %USER% && '
+                     . 'echo "%USER% ALL=(ALL) NOPASSWD:ALL" '
+                     . '> /etc/sudoers.d/%USER%',
+    },
     'fedora' => {
         from        => 'registry.fedoraproject.org/fedora:latest',
         install     => 'dnf -y install xpra openssh-server xterm sudo '
@@ -162,6 +176,7 @@ sub detect_flavor {
     return 'ubuntu-jammy'    if $id eq 'ubuntu' && $code eq 'jammy';
     return 'ubuntu-noble'    if $id eq 'ubuntu' && $code eq 'noble';
     return 'debian-bookworm' if $id eq 'debian' && $code eq 'bookworm';
+    return 'debian-trixie'   if $id eq 'debian' && $code eq 'trixie';
     return 'fedora'          if $id eq 'fedora';
     return 'arch'            if $id eq 'arch' || $id eq 'archlinux';
 
@@ -169,6 +184,7 @@ sub detect_flavor {
         return 'ubuntu-jammy'    if $code eq 'jammy';
         return 'ubuntu-noble'    if $code eq 'noble';
         return 'debian-bookworm' if $code eq 'bookworm';
+        return 'debian-trixie'   if $code eq 'trixie';
     }
     return undef;
 }
