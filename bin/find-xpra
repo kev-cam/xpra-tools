@@ -1684,11 +1684,18 @@ for my $s (@sessions) {
         next if $seen{"$name\t:$dn"};
         # If sessions were found but no pinned display requested, skip
         next if !defined $c->{_disp} && (grep { $_->{host} eq $name } @sessions);
+        # Default kind by display number (same heuristic as the main
+        # aggregation): :20+ is presumed xpra, otherwise plain X.  Without
+        # this, an explicitly-added xpra host whose probe couldn't reach
+        # it (eg cross-subnet SSH failure) reads as base X and the action
+        # menu drops 'Attach'.
+        my $kind = ($dn >= 20) ? 'xpra' : 'X';
+        my $apps = $kind eq 'xpra' ? '(xpra)' : '(root display)';
         push @sessions, { host => $name, disp => ":$dn", disp_n => $dn,
-                          ip => $c->{ip}, local => 0, kind => 'X',
+                          ip => $c->{ip}, local => 0, kind => $kind,
                           user => $ssh_user // $user_for_name{$name} // $ENV{USER} // '',
                           cmds => [], procs => [], n => 0,
-                          apps => '(root display)', _extra => 1 };
+                          apps => $apps, _extra => 1 };
     }
 }
 unless ($all || $any) {
