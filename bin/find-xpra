@@ -2609,6 +2609,12 @@ $addhost_btn->pack(-side => 'left', -fill => 'x', -expand => 1);
 my $settings_btn = $header_f->Button(-text => 'Settings',
                   -command => sub { _show_app_settings($mw) });
 $settings_btn->pack(-side => 'left', -fill => 'x', -expand => 1);
+# Copy the whole session table to the clipboard as TSV — per-cell text
+# selection only lets the user grab one field at a time; this is the
+# "select the whole page" affordance.
+my $copy_btn = $header_f->Button(-text => 'Copy',
+                  -command => sub { _copy_sessions_to_clipboard() });
+$copy_btn->pack(-side => 'left', -fill => 'x', -expand => 1);
 $BALLOON->attach($rescan_btn,
     -balloonmsg => 'Re-run discovery and rebuild the list (re-execs '
                  . 'find-xpra). Open viewers keep running.');
@@ -2618,6 +2624,9 @@ $BALLOON->attach($addhost_btn,
 $BALLOON->attach($settings_btn,
     -balloonmsg => 'App settings: max display number, VNC viewer backend, '
                  . 'and the ssh-askpass program.');
+$BALLOON->attach($copy_btn,
+    -balloonmsg => 'Copy the whole session table (host, display, user, info) '
+                 . 'to the clipboard as tab-separated text.');
 # "Show hidden" toggle: reveal sessions whose host is marked Hide (and the
 # local :0, hidden by default).  Compact icon button: ↕ (a "<->" turned
 # 90°).  Active state (hidden shown) shown by a sunken relief.
@@ -3272,6 +3281,30 @@ $mw->repeat(750, sub {
 });
 
 Tk::MainLoop();
+
+# Dump the visible session table to the X clipboard as tab-separated text
+# (Host / Disp / User / Info, headed by the column names).  Useful when
+# the user wants to share the list — per-cell Entry widgets only support
+# single-field selection.
+sub _copy_sessions_to_clipboard {
+    my @lines = (join("\t", qw(Host Disp User Info)));
+    for my $s (@sessions) {
+        my @info;
+        push @info, $s->{kind} if defined $s->{kind} && $s->{kind} ne 'xpra';
+        if (defined $s->{apps} && $s->{apps} ne '(root display)'
+            && $s->{apps} ne '(daemons only)') {
+            push @info, $s->{apps};
+        }
+        push @lines, join("\t",
+            $s->{host}        // '',
+            $s->{disp}        // '',
+            $s->{user}        // '',
+            join(' | ', @info));
+    }
+    my $text = join("\n", @lines) . "\n";
+    $mw->clipboardClear;
+    $mw->clipboardAppend($text);
+}
 
 # Application-wide settings (header "Settings" button) — distinct from the
 # per-host dialog below.  Currently just the max-display ceiling; designed
