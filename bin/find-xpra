@@ -2520,15 +2520,21 @@ sub _add_host_probe {
             $s->{local}  = 0;
             $s->{_extra} = 1;
         }
-        # If nothing found, offer a fallback display
+        # If nothing found, offer a fallback display.  For an xpra-range
+        # display (>= 20) default the kind to 'xpra' so the action menu
+        # includes 'Attach' — otherwise an explicitly-added xpra host
+        # whose probe didn't enumerate the display reads as a base X
+        # server and the only useful action is missing.
         if (!@new || defined $host_disp) {
             my $dn = $host_disp // 0;
             my $key = "$host\t:$dn";
             unless ($by_sess{$key}) {
+                my $kind = ($dn >= 20) ? 'xpra' : 'X';
+                my $apps = $kind eq 'xpra' ? '(xpra)' : '(root display)';
                 push @new, { host => $host, disp => ":$dn", disp_n => $dn,
-                             ip => $host_ip, local => 0, kind => 'X',
+                             ip => $host_ip, local => 0, kind => $kind,
                              user => $own_user, cmds => [], procs => [], n => 0,
-                             apps => '(root display)', _extra => 1 };
+                             apps => $apps, _extra => 1 };
             }
         }
         # Label apps
@@ -2824,10 +2830,24 @@ sub _render_row {
         }
     }
     my @widgets;
+    # Read-only Entry widgets (rather than Labels) so the host/display/
+    # user/info text is selectable for copy-paste — flat + borderless so
+    # it still looks like a plain row.
+    my $row_bg = $rows_f->cget('-background');
     for my $c (0 .. $#vals) {
-        my $w = $rows_f->Label(-text => $vals[$c], -anchor => 'w',
-                               -padx => 6, %fg);
-        $w->grid(-row => $r, -column => $c + 2, -sticky => 'ew');
+        my $val = $vals[$c] // '';
+        my $w = $rows_f->Entry(
+            -relief             => 'flat',
+            -borderwidth        => 0,
+            -highlightthickness => 0,
+            -takefocus          => 0,
+            -readonlybackground => $row_bg,
+            -width              => length($val) + 1,
+            %fg,
+        );
+        $w->insert(0, $val);
+        $w->configure(-state => 'readonly');
+        $w->grid(-row => $r, -column => $c + 2, -sticky => 'ew', -padx => 6);
         push @widgets, $w;
     }
     my $sess = $s;
