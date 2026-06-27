@@ -1705,6 +1705,18 @@ if (defined $user && !$any) {
     @sessions = grep { defined $_->{user} && $_->{user} eq $user } @sessions;
 }
 
+# Dedup xpra-start entries by (host, disp_n).  When a single physical
+# box appears via multiple net-mgr machine rows (e.g. nas3's three NICs
+# each registered as a separate machine, all flagged local) we run the
+# probe N times and push N copies of every ~/.xpra-start line under the
+# same host key.  The canonical-name relabel block above also
+# concatenates entries from multiple aliases.  Without this dedup the
+# pivot loop below emits N identical rows per display.
+for my $h (keys %xs_for_host) {
+    my %seen;
+    $xs_for_host{$h} = [ grep { !$seen{$_->{disp_n}}++ } @{ $xs_for_host{$h} } ];
+}
+
 # If a host published a ~/.xpra-start file, pivot the picker to its
 # entries.  For each line we either:
 #   - reuse the live session detected at that display, or
@@ -2611,10 +2623,14 @@ my $settings_btn = $header_f->Button(-text => 'Settings',
 $settings_btn->pack(-side => 'left', -fill => 'x', -expand => 1);
 # Copy the whole session table to the clipboard as TSV — per-cell text
 # selection only lets the user grab one field at a time; this is the
-# "select the whole page" affordance.
-my $copy_btn = $header_f->Button(-text => 'Copy',
-                  -command => sub { _copy_sessions_to_clipboard() });
-$copy_btn->pack(-side => 'left', -fill => 'x', -expand => 1);
+# "select the whole page" affordance.  Debug-only: it exists to share
+# diagnostic snapshots, not as part of the everyday UI.
+my $copy_btn;
+if ($debug) {
+    $copy_btn = $header_f->Button(-text => 'Copy',
+                      -command => sub { _copy_sessions_to_clipboard() });
+    $copy_btn->pack(-side => 'left', -fill => 'x', -expand => 1);
+}
 $BALLOON->attach($rescan_btn,
     -balloonmsg => 'Re-run discovery and rebuild the list (re-execs '
                  . 'find-xpra). Open viewers keep running.');
@@ -2626,7 +2642,7 @@ $BALLOON->attach($settings_btn,
                  . 'and the ssh-askpass program.');
 $BALLOON->attach($copy_btn,
     -balloonmsg => 'Copy the whole session table (host, display, user, info) '
-                 . 'to the clipboard as tab-separated text.');
+                 . 'to the clipboard as tab-separated text.') if $copy_btn;
 # "Show hidden" toggle: reveal sessions whose host is marked Hide (and the
 # local :0, hidden by default).  Compact icon button: ↕ (a "<->" turned
 # 90°).  Active state (hidden shown) shown by a sunken relief.
