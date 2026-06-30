@@ -2110,6 +2110,80 @@ sub _scan_attached {
 
 my ($mw, $rows_f, $_update_scroll);
 
+# Pack the per-host identity rows (Hostname, IP, User, Display, Inner X display)
+# into $parent (a Tk frame/toplevel) and return:
+#   { entries => { name=>$e, ip=>$e, user=>$e, disp=>$e, inner_disp=>$e },
+#     collect => sub { ... } }
+# `collect` returns a normalized hash {name,ip,user,disp,inner_disp} with
+# whitespace stripped, leading ':' on display fields removed, and disp /
+# inner_disp coerced to integers; keys with empty values are omitted.
+# Optional %opts:
+#   skip => { name=>1, ip=>1, ... }   omit the row entirely (entries{$k} absent)
+# Both _ask_host (Add/Edit Host) and _show_settings (per-host Settings) embed
+# this so a new identity field lands in ONE place. ssh_user is intentionally
+# part of the identity subset (writes to _extra_hosts entry's `user`); the
+# operational override $SETTINGS->{$host}{ssh_user} stays in _show_settings as
+# a higher-priority field — _host_login_user's precedence is unaffected.
+sub _pack_host_form_fields {
+    my ($parent, $defaults, %opts) = @_;
+    $defaults //= {};
+    my $skip = $opts{skip} || {};
+    my %vals = (
+        name       => $defaults->{name}       // '',
+        ip         => $defaults->{ip}         // '',
+        user       => $defaults->{user}       // '',
+        disp       => (defined $defaults->{disp}       ? $defaults->{disp}       : ''),
+        inner_disp => (defined $defaults->{inner_disp} ? $defaults->{inner_disp} : ''),
+    );
+    # IP defaults to blank when it matches the name — common when discovery
+    # filled both from the same hostname; keeps the IP field empty so the
+    # user doesn't accidentally pin a literal hostname there.
+    $vals{ip} = '' if $vals{ip} eq $vals{name};
+    my %entries;
+    my @spec = (
+        [ name       => 'Hostname:' ],
+        [ ip         => 'IP (optional if hostname resolves):' ],
+        [ user       => 'User (optional):' ],
+        [ disp       => 'Display (optional, e.g. 0, 2):' ],
+        [ inner_disp => 'Inner X display (DISPLAY inside the host, e.g. 0):' ],
+    );
+    for my $row (@spec) {
+        my ($key, $label) = @$row;
+        next if $skip->{$key};
+        $parent->Label(-text => $label)->pack(-padx => 8, -pady => [6,2]);
+        $entries{$key} = $parent->Entry(-textvariable => \$vals{$key}, -width => 30);
+        $entries{$key}->pack(-padx => 8);
+        if ($key eq 'inner_disp') {
+            # Inner X display = the DISPLAY value that exists INSIDE this host's
+            # OS, which can differ from the externally-discovered VNC slot.
+            # Example: a VM is published on the LAN as lenny:4 (port 5904) but
+            # its Xorg actually runs on :0 — ssh-ing in and running an X client
+            # needs DISPLAY=:0, not :4. Blank = mirror the Display field above.
+            # Consumed by _term_cmd / _x11vnc_cmd (remote-side DISPLAY); the
+            # port-based VNC builders deliberately use the external slot.
+            $parent->Label(-text => '(leave blank to use the Display value above)',
+                           -foreground => '#666666')
+                ->pack(-padx => 8);
+        }
+    }
+    my $collect = sub {
+        my %out;
+        for my $k (qw(name ip user)) {
+            my $v = $vals{$k};
+            $v =~ s/^\s+|\s+$//g;
+            $out{$k} = $v if length $v;
+        }
+        for my $k (qw(disp inner_disp)) {
+            my $v = $vals{$k};
+            $v =~ s/^\s+|\s+$//g;
+            $v =~ s/^://;
+            $out{$k} = $v + 0 if length $v && $v =~ /^\d+$/;
+        }
+        return \%out;
+    };
+    return { entries => \%entries, collect => $collect };
+}
+
 sub _ask_host {
     my ($parent, $defaults) = @_;
     $defaults //= {};
@@ -2117,91 +2191,48 @@ sub _ask_host {
     my $dlg = $parent->Toplevel(-title => $title);
     $dlg->transient($parent);
     $dlg->grab;
-    $dlg->Label(-text => 'Hostname:')->pack(-padx => 8, -pady => [8,2]);
-    my $name_val = $defaults->{name} // '';
-    my $name_e = $dlg->Entry(-textvariable => \$name_val, -width => 30);
-    $name_e->pack(-padx => 8);
-    $name_e->focus;
-    $dlg->Label(-text => 'IP (optional if hostname resolves):')
-        ->pack(-padx => 8, -pady => [6,2]);
-    my $ip_val = $defaults->{ip} // '';
-    $ip_val = '' if $ip_val eq $name_val;
-    my $ip_e = $dlg->Entry(-textvariable => \$ip_val, -width => 30);
-    $ip_e->pack(-padx => 8);
-    $dlg->Label(-text => 'User (optional):')
-        ->pack(-padx => 8, -pady => [6,2]);
-    my $user_val = $defaults->{user} // '';
-    my $user_e = $dlg->Entry(-textvariable => \$user_val, -width => 30);
-    $user_e->pack(-padx => 8);
-    $dlg->Label(-text => 'Display (optional, e.g. 0, 2):')
-        ->pack(-padx => 8, -pady => [6,2]);
-    my $disp_val = defined $defaults->{disp} ? $defaults->{disp} : '';
-    my $disp_e = $dlg->Entry(-textvariable => \$disp_val, -width => 30);
-    $disp_e->pack(-padx => 8);
-    # Inner X display = the DISPLAY value that exists INSIDE this host's OS,
-    # which can differ from the externally-discovered VNC slot. Example: a VM
-    # is published on the LAN as lenny:4 (port 5904), but its Xorg actually
-    # runs on :0 — ssh-ing in and running an X client needs DISPLAY=:0, not :4.
-    # Blank = mirror the Display field above. Consumed by _term_cmd /
-    # _x11vnc_cmd (remote-side DISPLAY); the port-based VNC builders are
-    # deliberately NOT changed — they use the external discovery slot.
-    $dlg->Label(-text => 'Inner X display (DISPLAY inside the host, e.g. 0):')
-        ->pack(-padx => 8, -pady => [6,2]);
-    my $inner_disp_val = defined $defaults->{inner_disp} ? $defaults->{inner_disp} : '';
-    my $inner_e = $dlg->Entry(-textvariable => \$inner_disp_val, -width => 30);
-    $inner_e->pack(-padx => 8);
-    $dlg->Label(-text => '(leave blank to use the Display value above)',
-                -foreground => '#666666')
-        ->pack(-padx => 8);
+    my $fields = _pack_host_form_fields($dlg, $defaults);
+    my $e = $fields->{entries};
+    $e->{name}->focus;
     my $err_msg = '';
     my $err_lbl = $dlg->Label(-textvariable => \$err_msg,
                               -foreground => '#c00000');
     $err_lbl->pack(-padx => 8, -pady => [4,0]);
-    my $ok;
+    my ($ok, $result);
     my $validate = sub {
-        (my $ip = $ip_val) =~ s/^\s+|\s+$//g;
-        if (length $ip) {
-            unless ($ip =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/
+        my $v = $fields->{collect}->();
+        if (defined $v->{ip}) {
+            unless ($v->{ip} =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/
                     && $1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255) {
                 $err_msg = 'Invalid IP address';
-                $ip_e->focus;
+                $e->{ip}->focus;
                 return;
             }
         }
-        (my $n = $name_val) =~ s/^\s+|\s+$//g;
-        unless (length $n || length $ip) {
+        unless (defined $v->{name} || defined $v->{ip}) {
             $err_msg = 'Hostname or IP required';
-            $name_e->focus;
+            $e->{name}->focus;
             return;
         }
+        # Either-or defaulting: if only one of name/ip is set, mirror it.
+        $v->{name} //= $v->{ip};
+        $v->{ip}   //= $v->{name};
+        $result = $v;
         $ok = 1;
         $dlg->destroy;
     };
-    $name_e->bind('<Return>', sub { $ip_e->focus });
-    $ip_e->bind('<Return>', sub { $user_e->focus });
-    $user_e->bind('<Return>', sub { $disp_e->focus });
-    $disp_e->bind('<Return>', sub { $inner_e->focus });
-    $inner_e->bind('<Return>', $validate);
+    $e->{name}->bind      ('<Return>', sub { $e->{ip}->focus });
+    $e->{ip}->bind        ('<Return>', sub { $e->{user}->focus });
+    $e->{user}->bind      ('<Return>', sub { $e->{disp}->focus });
+    $e->{disp}->bind      ('<Return>', sub { $e->{inner_disp}->focus });
+    $e->{inner_disp}->bind('<Return>', $validate);
     my $bf = $dlg->Frame->pack(-pady => 8);
     $bf->Button(-text => 'OK',     -command => $validate)
        ->pack(-side => 'left', -padx => 4);
     $bf->Button(-text => 'Cancel', -command => sub { $dlg->destroy })
        ->pack(-side => 'left', -padx => 4);
     $dlg->waitWindow;
-    return undef unless $ok;
-    $name_val       =~ s/^\s+|\s+$//g;
-    $ip_val         =~ s/^\s+|\s+$//g;
-    $user_val       =~ s/^\s+|\s+$//g;
-    $disp_val       =~ s/^\s+|\s+$//g;
-    $disp_val       =~ s/^://;
-    $inner_disp_val =~ s/^\s+|\s+$//g;
-    $inner_disp_val =~ s/^://;
-    $name_val = $ip_val unless length $name_val;
-    $ip_val = $name_val unless length $ip_val;
-    return { name => $name_val, ip => $ip_val,
-             (length $user_val ? (user => $user_val) : ()),
-             (length $disp_val       && $disp_val       =~ /^\d+$/ ? (disp       => $disp_val       + 0) : ()),
-             (length $inner_disp_val && $inner_disp_val =~ /^\d+$/ ? (inner_disp => $inner_disp_val + 0) : ()) };
+    return $ok ? $result : undef;
 }
 
 sub _remove_extra_host {
@@ -3520,13 +3551,29 @@ sub _show_settings {
     my $host = $s->{host};
     my $top  = $mw->Toplevel(-title => "find-xpra: settings for $host");
 
+    # Locate any existing _extra_hosts entry for this host once, so the
+    # display-overrides section can seed defaults and the Save handler can
+    # write back without re-scanning. Matches by name OR ip — same shape
+    # _edit_extra_host uses.
+    my $extras = $SETTINGS->{_extra_hosts} //= [];
+    my ($extra_entry) = grep {
+        ($_->{name} // '') eq $host
+        || (defined $s->{ip} && ($_->{ip} // '') eq $s->{ip})
+    } @$extras;
+    my $cur_inner = $extra_entry ? $extra_entry->{inner_disp} : $s->{inner_disp};
+    my $cur_disp  = $extra_entry && defined $extra_entry->{disp}
+                  ? $extra_entry->{disp}
+                  : $s->{disp_n};
+
     # Host info section
     my $info_f = $top->Frame(-relief => 'groove', -borderwidth => 2);
     $info_f->pack(-fill => 'x', -padx => 12, -pady => [8, 4]);
     my @info_rows;
     push @info_rows, ['Host:', $host];
     push @info_rows, ['IP:', $s->{ip}] if defined $s->{ip} && $s->{ip} ne $host;
-    push @info_rows, ['Display:', $s->{disp}] if defined $s->{disp};
+    # 'Display:' is intentionally NOT shown here — it lives in the editable
+    # Display overrides section below (read-only + editable would just be
+    # redundant noise).
     if (my $cur_port = $SETTINGS->{$host}{ssh_port}) {
         push @info_rows, ['SSH port:', $cur_port];
     }
@@ -3590,6 +3637,21 @@ sub _show_settings {
     $top->Entry(-textvariable => \$host_zoom, -width => 8, -justify => 'right')
         ->pack(-anchor => 'w', -padx => 30);
 
+    # Display overrides for $host — Display + Inner X display, sharing the
+    # same form factor as the Add/Edit Host dialog so a new identity field
+    # lands in one place (_pack_host_form_fields). name/ip/user are skipped
+    # here: name+ip belong to discovery, and ssh_user has its own
+    # higher-priority override above. Values land in the same _extra_hosts
+    # entry _ask_host writes to, so _term_cmd / _x11vnc_cmd pick them up
+    # without any consumer-side change.
+    $top->Label(-text => "Display overrides for $host:",
+                -font => 'sans-serif 11 bold')
+        ->pack(-anchor => 'w', -padx => 12, -pady => [12, 4]);
+    my $disp_box = $top->Frame->pack(-anchor => 'w', -padx => 30);
+    my $disp_fields = _pack_host_form_fields($disp_box,
+        { disp => $cur_disp, inner_disp => $cur_inner },
+        skip => { name => 1, ip => 1, user => 1 });
+
     # Hide this session (host+display): hidden sessions show only via the
     # ↕ "show hidden" toggle (or --all).  Defaults on for the local :0.
     my $hide_key = ($s->{host} // '') . "\t" . ($s->{disp_n} // '');
@@ -3633,6 +3695,26 @@ sub _show_settings {
         } else {
             delete $SETTINGS->{$host}{vnc_zoom};
         }
+
+        # Display overrides → _extra_hosts entry. Promote a discovered host
+        # ONLY when the user actually set disp / inner_disp (or a previous
+        # entry already exists) — otherwise opening Settings on every
+        # discovered row would silently make every host sticky.
+        my $dvals = $disp_fields->{collect}->();
+        my $want_persist = $extra_entry
+                        || defined $dvals->{disp}
+                        || defined $dvals->{inner_disp};
+        if ($want_persist) {
+            unless ($extra_entry) {
+                $extra_entry = { name => $host, ip => ($s->{ip} // $host) };
+                push @$extras, $extra_entry;
+            }
+            for my $k (qw(disp inner_disp)) {
+                if (defined $dvals->{$k}) { $extra_entry->{$k} = $dvals->{$k} }
+                else                      { delete $extra_entry->{$k} }
+            }
+        }
+
         # Store an explicit 0/1 (not delete-when-0) so un-hiding the local
         # :0 sticks against its default-hidden behaviour in _session_hidden.
         $SETTINGS->{_hidden}{$hide_key} = $hide_val ? 1 : 0;
