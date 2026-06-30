@@ -3565,8 +3565,22 @@ sub _show_settings {
                   ? $extra_entry->{disp}
                   : $s->{disp_n};
 
+    # Layout: Save/Cancel buttons pinned to the bottom of $top so they stay
+    # visible regardless of scroll position; everything else lives in a
+    # Scrolled('Pane') filling the rest. The Pane (Tk::Pane) is a Frame that
+    # can grow taller than its container; the surrounding scrollbar appears
+    # on demand. -sticky=nw keeps the content left-aligned during resizes.
+    require Tk::Pane;
+    my $btns = $top->Frame->pack(-side => 'bottom', -pady => 10);
+    my $body = $top->Scrolled('Pane',
+        -scrollbars => 'oe',
+        -sticky     => 'nw',
+        -height     => 560,
+        -width      => 420,
+    )->pack(-side => 'top', -fill => 'both', -expand => 1);
+
     # Host info section
-    my $info_f = $top->Frame(-relief => 'groove', -borderwidth => 2);
+    my $info_f = $body->Frame(-relief => 'groove', -borderwidth => 2);
     $info_f->pack(-fill => 'x', -padx => 12, -pady => [8, 4]);
     my @info_rows;
     push @info_rows, ['Host:', $host];
@@ -3589,8 +3603,8 @@ sub _show_settings {
             ->grid(-row => $i, -column => 1, -sticky => 'w', -padx => [2, 6]);
     }
 
-    $top->Label(-text => "Terminal for $host:",
-                -font => 'sans-serif 11 bold')
+    $body->Label(-text => "Terminal for $host:",
+                 -font => 'sans-serif 11 bold')
         ->pack(-anchor => 'w', -padx => 12, -pady => 6);
 
     # Dropdown instead of N radiobuttons — the radio stack was tall enough to
@@ -3600,7 +3614,7 @@ sub _show_settings {
     my @choices = qw(xterm mate-terminal gnome-terminal urxvt
                      alacritty kitty terminator lxterminal st);
     my $sel = _terminal_for($host);
-    my $term_om = $top->Optionmenu(
+    my $term_om = $body->Optionmenu(
         -options  => [@choices],
         -variable => \$sel,
         -width    => 20,
@@ -3612,37 +3626,37 @@ sub _show_settings {
 
     # Per-host DPI override.  Blank = inherit the global default DPI
     # (set beside the Rescan button).
-    $top->Label(-text => "DPI override for $host (blank = use default):",
-                -font => 'sans-serif 11 bold')
+    $body->Label(-text => "DPI override for $host (blank = use default):",
+                 -font => 'sans-serif 11 bold')
         ->pack(-anchor => 'w', -padx => 12, -pady => [10, 6]);
     my $host_dpi = $SETTINGS->{$host}{dpi} // '';
-    $top->Entry(-textvariable => \$host_dpi, -width => 8, -justify => 'right')
+    $body->Entry(-textvariable => \$host_dpi, -width => 8, -justify => 'right')
         ->pack(-anchor => 'w', -padx => 30);
 
     # SSH user override — used as the login for attach / VNC / SSH actions.
-    $top->Label(-text => "SSH user for $host (blank = default):",
-                -font => 'sans-serif 11 bold')
+    $body->Label(-text => "SSH user for $host (blank = default):",
+                 -font => 'sans-serif 11 bold')
         ->pack(-anchor => 'w', -padx => 12, -pady => [10, 6]);
     my $host_ssh_user = $SETTINGS->{$host}{ssh_user} // '';
-    $top->Entry(-textvariable => \$host_ssh_user, -width => 20)
+    $body->Entry(-textvariable => \$host_ssh_user, -width => 20)
         ->pack(-anchor => 'w', -padx => 30);
 
     # SSH port override — e.g. a forwarded port reaching a VM behind
     # Hyper-V / VirtualBox NAT.  Blank or 22 = default.
-    $top->Label(-text => "SSH port for $host (blank = 22):",
-                -font => 'sans-serif 11 bold')
+    $body->Label(-text => "SSH port for $host (blank = 22):",
+                 -font => 'sans-serif 11 bold')
         ->pack(-anchor => 'w', -padx => 12, -pady => [10, 6]);
     my $host_ssh_port = $SETTINGS->{$host}{ssh_port} // '';
-    $top->Entry(-textvariable => \$host_ssh_port, -width => 8, -justify => 'right')
+    $body->Entry(-textvariable => \$host_ssh_port, -width => 8, -justify => 'right')
         ->pack(-anchor => 'w', -padx => 30);
 
     # VNC zoom factor — percentage applied via FLTK_SCALING_FACTOR /
     # GDK_DPI_SCALE / QT_SCALE_FACTOR when launching vncviewer.
-    $top->Label(-text => "VNC zoom % for $host (blank = 100%):",
-                -font => 'sans-serif 11 bold')
+    $body->Label(-text => "VNC zoom % for $host (blank = 100%):",
+                 -font => 'sans-serif 11 bold')
         ->pack(-anchor => 'w', -padx => 12, -pady => [10, 6]);
     my $host_zoom = $SETTINGS->{$host}{vnc_zoom} // '';
-    $top->Entry(-textvariable => \$host_zoom, -width => 8, -justify => 'right')
+    $body->Entry(-textvariable => \$host_zoom, -width => 8, -justify => 'right')
         ->pack(-anchor => 'w', -padx => 30);
 
     # Display overrides for $host — Display + Inner X display, sharing the
@@ -3652,10 +3666,10 @@ sub _show_settings {
     # higher-priority override above. Values land in the same _extra_hosts
     # entry _ask_host writes to, so _term_cmd / _x11vnc_cmd pick them up
     # without any consumer-side change.
-    $top->Label(-text => "Display overrides for $host:",
-                -font => 'sans-serif 11 bold')
+    $body->Label(-text => "Display overrides for $host:",
+                 -font => 'sans-serif 11 bold')
         ->pack(-anchor => 'w', -padx => 12, -pady => [12, 4]);
-    my $disp_box = $top->Frame->pack(-anchor => 'w', -padx => 30);
+    my $disp_box = $body->Frame->pack(-anchor => 'w', -padx => 30);
     my $disp_fields = _pack_host_form_fields($disp_box,
         { disp => $cur_disp, inner_disp => $cur_inner },
         skip => { name => 1, ip => 1, user => 1 });
@@ -3666,13 +3680,14 @@ sub _show_settings {
     my $hide_val = exists $SETTINGS->{_hidden}{$hide_key}
         ? ($SETTINGS->{_hidden}{$hide_key} ? 1 : 0)
         : (($s->{local} && defined $s->{disp_n} && $s->{disp_n} == 0) ? 1 : 0);
-    $top->Checkbutton(
+    $body->Checkbutton(
         -text     => 'Hide this session (show only via the ↕ toggle)',
         -variable => \$hide_val,
         -anchor   => 'w',
     )->pack(-anchor => 'w', -padx => 12, -pady => [12, 0]);
 
-    my $btns = $top->Frame->pack(-pady => 10);
+    # ($btns frame was created at the top of the sub, pinned to the bottom
+    # of $top so it stays visible regardless of the body's scroll position.)
     $btns->Button(-text => 'Save', -command => sub {
         $SETTINGS->{$host}{terminal} = $sel;
         $host_ssh_user =~ s/^\s+|\s+$//g;
