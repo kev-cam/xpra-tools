@@ -3593,14 +3593,22 @@ sub _show_settings {
                 -font => 'sans-serif 11 bold')
         ->pack(-anchor => 'w', -padx => 12, -pady => 6);
 
+    # Dropdown instead of N radiobuttons — the radio stack was tall enough to
+    # push the rest of the form (DPI / ssh user / port / VNC zoom / display
+    # overrides / hide) off short screens. Same widget pattern as the viewer
+    # picker further up at line 3439.
     my @choices = qw(xterm mate-terminal gnome-terminal urxvt
                      alacritty kitty terminator lxterminal st);
     my $sel = _terminal_for($host);
-    for my $t (@choices) {
-        $top->Radiobutton(-text => $t, -value => $t, -variable => \$sel,
-                          -anchor => 'w')
-            ->pack(-fill => 'x', -padx => 30);
-    }
+    my $term_om = $top->Optionmenu(
+        -options  => [@choices],
+        -variable => \$sel,
+        -width    => 20,
+    );
+    $term_om->pack(-anchor => 'w', -padx => 30);
+    # Optionmenu auto-selects the first option on construction; force our
+    # actual default afterwards (same dance as the user picker at line 949).
+    $term_om->setOption($sel) if defined $sel && grep { $_ eq $sel } @choices;
 
     # Per-host DPI override.  Blank = inherit the global default DPI
     # (set beside the Rescan button).
