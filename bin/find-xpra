@@ -716,13 +716,15 @@ for my $h (@{ $SETTINGS->{_extra_hosts} // [] }) {
     my ($n, $ip) = ($h->{name}, $h->{ip});
     my ($existing) = grep { ($_->{name} // '') eq $n || ($_->{ip} // '') eq $ip } @candidates;
     if ($existing) {
-        $existing->{_extra}   = 1;
-        $existing->{ssh_user} = $h->{user} if defined $h->{user};
-        $existing->{_disp}    = $h->{disp} if defined $h->{disp};
+        $existing->{_extra}      = 1;
+        $existing->{ssh_user}    = $h->{user}       if defined $h->{user};
+        $existing->{_disp}       = $h->{disp}       if defined $h->{disp};
+        $existing->{_inner_disp} = $h->{inner_disp} if defined $h->{inner_disp};
     } else {
         push @candidates, { name => $n, ip => $ip, _extra => 1,
-                            (defined $h->{user} ? (ssh_user => $h->{user}) : ()),
-                            (defined $h->{disp} ? (_disp => $h->{disp})   : ()) };
+                            (defined $h->{user}       ? (ssh_user    => $h->{user})       : ()),
+                            (defined $h->{disp}       ? (_disp       => $h->{disp})       : ()),
+                            (defined $h->{inner_disp} ? (_inner_disp => $h->{inner_disp}) : ()) };
     }
 }
 
@@ -1482,6 +1484,8 @@ my %ip_for_name    = map { _name_for($_) => $_->{ip}       } @candidates;
 my %local_for_name = map { _name_for($_) => $_->{local}    } @candidates;
 my %user_for_name  = map { _name_for($_) => $_->{ssh_user} } @candidates;
 my %extra_for_name = map { _name_for($_) => $_->{_extra}   } grep { $_->{_extra} } @candidates;
+my %inner_disp_for_name = map { _name_for($_) => $_->{_inner_disp} }
+                          grep { defined $_->{_inner_disp} } @candidates;
 my %by_session;       # "$host\t$disp" -> { host, disp, kind, user, cmds, n }
 # Seed sessions reported by `xpra list` first — that way an xpra session
 # with no surviving show-x11 procs (or no apps at all) still appears.
@@ -1669,10 +1673,12 @@ my @sessions = values %by_session;
 # numeric display.  Drop displays under :20 unless --all was given —
 # they're presumed plain X (see kind heuristic above).
 for my $s (@sessions) {
-    ($s->{disp_n}) = $s->{disp} =~ /^:(\d+)/;
-    $s->{ip}       = $ip_for_name{$s->{host}};
-    $s->{local}    = $local_for_name{$s->{host}} ? 1 : 0;
-    $s->{_extra}   = 1 if $extra_for_name{$s->{host}};
+    ($s->{disp_n})   = $s->{disp} =~ /^:(\d+)/;
+    $s->{ip}         = $ip_for_name{$s->{host}};
+    $s->{local}      = $local_for_name{$s->{host}} ? 1 : 0;
+    $s->{_extra}     = 1 if $extra_for_name{$s->{host}};
+    $s->{inner_disp} = $inner_disp_for_name{$s->{host}}
+        if defined $inner_disp_for_name{$s->{host}};
 }
 # --host fallback: if a manually-added host produced no sessions (or has a
 # pinned display number), offer that display.
@@ -1695,7 +1701,8 @@ for my $s (@sessions) {
                           ip => $c->{ip}, local => 0, kind => $kind,
                           user => $ssh_user // $user_for_name{$name} // $ENV{USER} // '',
                           cmds => [], procs => [], n => 0,
-                          apps => $apps, _extra => 1 };
+                          apps => $apps, _extra => 1,
+                          (defined $c->{_inner_disp} ? (inner_disp => $c->{_inner_disp}) : ()) };
     }
 }
 unless ($all || $any) {
@@ -2131,6 +2138,21 @@ sub _ask_host {
     my $disp_val = defined $defaults->{disp} ? $defaults->{disp} : '';
     my $disp_e = $dlg->Entry(-textvariable => \$disp_val, -width => 30);
     $disp_e->pack(-padx => 8);
+    # Inner X display = the DISPLAY value that exists INSIDE this host's OS,
+    # which can differ from the externally-discovered VNC slot. Example: a VM
+    # is published on the LAN as lenny:4 (port 5904), but its Xorg actually
+    # runs on :0 — ssh-ing in and running an X client needs DISPLAY=:0, not :4.
+    # Blank = mirror the Display field above. Consumed by _term_cmd /
+    # _x11vnc_cmd (remote-side DISPLAY); the port-based VNC builders are
+    # deliberately NOT changed — they use the external discovery slot.
+    $dlg->Label(-text => 'Inner X display (DISPLAY inside the host, e.g. 0):')
+        ->pack(-padx => 8, -pady => [6,2]);
+    my $inner_disp_val = defined $defaults->{inner_disp} ? $defaults->{inner_disp} : '';
+    my $inner_e = $dlg->Entry(-textvariable => \$inner_disp_val, -width => 30);
+    $inner_e->pack(-padx => 8);
+    $dlg->Label(-text => '(leave blank to use the Display value above)',
+                -foreground => '#666666')
+        ->pack(-padx => 8);
     my $err_msg = '';
     my $err_lbl = $dlg->Label(-textvariable => \$err_msg,
                               -foreground => '#c00000');
@@ -2158,7 +2180,8 @@ sub _ask_host {
     $name_e->bind('<Return>', sub { $ip_e->focus });
     $ip_e->bind('<Return>', sub { $user_e->focus });
     $user_e->bind('<Return>', sub { $disp_e->focus });
-    $disp_e->bind('<Return>', $validate);
+    $disp_e->bind('<Return>', sub { $inner_e->focus });
+    $inner_e->bind('<Return>', $validate);
     my $bf = $dlg->Frame->pack(-pady => 8);
     $bf->Button(-text => 'OK',     -command => $validate)
        ->pack(-side => 'left', -padx => 4);
@@ -2166,16 +2189,19 @@ sub _ask_host {
        ->pack(-side => 'left', -padx => 4);
     $dlg->waitWindow;
     return undef unless $ok;
-    $name_val =~ s/^\s+|\s+$//g;
-    $ip_val   =~ s/^\s+|\s+$//g;
-    $user_val =~ s/^\s+|\s+$//g;
-    $disp_val =~ s/^\s+|\s+$//g;
-    $disp_val =~ s/^://;
+    $name_val       =~ s/^\s+|\s+$//g;
+    $ip_val         =~ s/^\s+|\s+$//g;
+    $user_val       =~ s/^\s+|\s+$//g;
+    $disp_val       =~ s/^\s+|\s+$//g;
+    $disp_val       =~ s/^://;
+    $inner_disp_val =~ s/^\s+|\s+$//g;
+    $inner_disp_val =~ s/^://;
     $name_val = $ip_val unless length $name_val;
     $ip_val = $name_val unless length $ip_val;
     return { name => $name_val, ip => $ip_val,
              (length $user_val ? (user => $user_val) : ()),
-             (length $disp_val && $disp_val =~ /^\d+$/ ? (disp => $disp_val + 0) : ()) };
+             (length $disp_val       && $disp_val       =~ /^\d+$/ ? (disp       => $disp_val       + 0) : ()),
+             (length $inner_disp_val && $inner_disp_val =~ /^\d+$/ ? (inner_disp => $inner_disp_val + 0) : ()) };
 }
 
 sub _remove_extra_host {
@@ -3988,9 +4014,15 @@ sub _vnc_direct_cmd {
 sub _x11vnc_cmd {
     my ($s) = @_;
     (my $disp_n = $s->{disp}) =~ s/^://;
+    # Override with the INNER X display when the host declares one — net-vnc
+    # --x11vnc starts x11vnc on the remote box pointing at this DISPLAY, so
+    # what matters is the X server actually running inside the host, NOT the
+    # externally-discovered VNC slot. Example: a VM published as lenny:4 with
+    # Xorg running on :0 needs x11vnc -display :0, not :4.
+    my $inner_n = $s->{inner_disp} // $disp_n;
     my $target = $s->{ip} // $s->{host};
     my $login_user = $s->{_attach_as};
-    my $dest = (defined $login_user ? "$login_user\@" : '') . "$target:$disp_n";
+    my $dest = (defined $login_user ? "$login_user\@" : '') . "$target:$inner_n";
     my @sopts = ssh_opts(interactive => 1);
     # net-vnc --x11vnc invokes ssh @ssh_extra $login — push -p into the
     # opts so a per-host port override carries through to that ssh.
@@ -4063,20 +4095,25 @@ sub _probe_host_cmd {
 sub _kill_x11vnc_cmd {
     my ($s) = @_;
     (my $disp_n = $s->{disp}) =~ s/^://;
+    # Match the X display x11vnc actually serves on the remote box — that is
+    # the INNER display, not the externally-discovered VNC slot. For a VM
+    # published as lenny:4 with Xorg on :0, the x11vnc process is invoked as
+    # `x11vnc -display :0`; pkill for `:4` would never match.
+    my $inner_n = $s->{inner_disp} // $disp_n;
     # Match x11vnc invoked as either `-display :N` or a bare `:N`, but not
     # :Nm (e.g. :1 must not match :10).  [^0-9] / end-of-arg guards that.
     # Diagnostic: list matching x11vnc before/after and report each pkill's
     # exit so "Show last log" tells the user what actually happened (e.g.
     # "(none)" = nothing to kill, pkill rc=1 = no match, rc=0 = killed).
-    my $pat1 = "x11vnc.*-display[[:space:]]*:$disp_n([^0-9]|\$)";
-    my $pat2 = "x11vnc([[:space:]].*)?[[:space:]]:$disp_n([^0-9]|\$)";
+    my $pat1 = "x11vnc.*-display[[:space:]]*:$inner_n([^0-9]|\$)";
+    my $pat2 = "x11vnc([[:space:]].*)?[[:space:]]:$inner_n([^0-9]|\$)";
     my $remote =
-          "echo '== x11vnc matching :$disp_n (before) =='; "
+          "echo '== x11vnc matching :$inner_n (before) =='; "
         . "{ pgrep -af '$pat1'; pgrep -af '$pat2'; } | sort -u || true; "
         . "pkill -f '$pat1'; echo \"pkill -display rc=\$?\"; "
         . "pkill -f '$pat2'; echo \"pkill bare rc=\$?\"; "
         . "sleep 1; "
-        . "echo '== x11vnc matching :$disp_n (after) =='; "
+        . "echo '== x11vnc matching :$inner_n (after) =='; "
         . "{ pgrep -af '$pat1'; pgrep -af '$pat2'; } | sort -u || echo '(none left)'; "
         . "true";
     if ($s->{local}) {
@@ -4304,11 +4341,16 @@ sub _ssh_cmd {
 sub _term_cmd {
     my ($s) = @_;
     (my $disp_n = $s->{disp}) =~ s/^://;
+    # Remote shell's DISPLAY: prefer the inner X display when set, so a
+    # terminal launched on the remote box attaches to that host's Xorg
+    # (the externally-discovered slot can be a different number — e.g.
+    # the VNC port offset — that doesn't exist as a real X server there).
+    my $inner_n = $s->{inner_disp} // $disp_n;
     my $term = _terminal_for($s->{host});
     # mate-terminal / gnome-terminal don't accept `-display`; they use
     # the DISPLAY env var.  xterm accepts both — we use env-var form so
     # one launch line works for everything.
-    my $cmd = "(DISPLAY=:$disp_n $term &)";
+    my $cmd = "(DISPLAY=:$inner_n $term &)";
     if ($s->{local}) {
         # Perl exec hands $cmd to bash directly — no shell re-tokenisation,
         # so no extra quoting needed.
