@@ -2302,6 +2302,8 @@ sub _edit_extra_host {
             ? (user => $sess->{user}) : ()),
         (defined $sess->{disp} && $sess->{disp} =~ /^:(\d+)$/
             ? (disp => $1 + 0) : ()),
+        (defined $sess->{inner_disp}
+            ? (inner_disp => $sess->{inner_disp}) : ()),
     };
     my $h = _ask_host($mw, $cur);
     return unless defined $h;
@@ -2313,16 +2315,18 @@ sub _add_host_probe {
     my ($parent, $prefilled) = @_;
     my $h = $prefilled // _ask_host($parent);
     return unless defined $h;
-    my $host      = $h->{name};
-    my $host_ip   = $h->{ip};
-    my $host_user = $h->{user};
-    my $host_disp = $h->{disp};
+    my $host       = $h->{name};
+    my $host_ip    = $h->{ip};
+    my $host_user  = $h->{user};
+    my $host_disp  = $h->{disp};
+    my $host_inner = $h->{inner_disp};
     # Persist — remove any stale entries for this name or IP first
     my $extras = $SETTINGS->{_extra_hosts} //= [];
     @$extras = grep { $_->{name} ne $host && $_->{ip} ne $host_ip } @$extras;
     my $entry = { name => $host, ip => $host_ip };
-    $entry->{user} = $host_user if defined $host_user;
-    $entry->{disp} = $host_disp if defined $host_disp;
+    $entry->{user}       = $host_user  if defined $host_user;
+    $entry->{disp}       = $host_disp  if defined $host_disp;
+    $entry->{inner_disp} = $host_inner if defined $host_inner;
     push @$extras, $entry;
     _save_settings($SETTINGS);
     _keys_ensure();
