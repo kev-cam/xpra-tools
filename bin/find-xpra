@@ -2644,6 +2644,10 @@ $header_f->pack(-fill => 'x', -padx => 6, -pady => 4);
 # Shared hover-help (tooltips) for the whole UI.  $BALLOON->attach($w, ...)
 # registers help text that pops up after a short hover over $w.  Used for
 # the header controls and the per-row action menu.
+# Explicit require: Tk's auto-loader would otherwise warn ("Assuming
+# 'require Tk::Balloon;'") on the first $mw->Balloon call. We don't
+# top-level `use` it because Tk itself is loaded lazily (CLI mode skips it).
+require Tk::Balloon;
 my $BALLOON = $mw->Balloon(-initwait => 600);
 my $rescan_btn = $header_f->Button(-text => 'Rescan',
                   -command => sub { $_save_geometry->(); exec { $^X } $^X, $0, @ORIG_ARGV });
