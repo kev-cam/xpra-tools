@@ -4149,7 +4149,13 @@ sub _x11vnc_cmd {
     if (defined(my $v = _vnc_viewer(1))) {
         @env = ('env', "NET_VNC_VIEWER=$v");
     }
-    return (@env, 'net-vnc', '--x11vnc', $dest, @sopts);
+    # Zoom goes to x11vnc (-scale on the remote), not the viewer: shrinking
+    # server-side is what cuts the pixels relayed through the tunnel.
+    my @scale;
+    if (defined(my $zoom = _zoom_for($s->{host}))) {
+        @scale = ('--scale', sprintf("%.2f", $zoom / 100));
+    }
+    return (@env, 'net-vnc', '--x11vnc', @scale, $dest, @sopts);
 }
 
 # Kill any x11vnc serving a specific display on the host.  Used to clear
