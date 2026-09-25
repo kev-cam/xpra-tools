@@ -123,6 +123,7 @@ my $any;
 my $all;
 my @extra_hosts;
 my $help;
+my $show_version;
 
 GetOptions(
     'listen=s'   => \$listen,
@@ -142,8 +143,16 @@ GetOptions(
     'a|all'      => \$all,
     'host=s@'    => \@extra_hosts,
     'h|help'     => \$help,
+    'version'    => \$show_version,
 ) or die usage();
 print(usage()), exit 0 if $help;
+# Same facts as the About dialog: git describe of the source, and the
+# script's mtime (= when `make install` wrote it).
+if ($show_version) {
+    my $built = POSIX::strftime('%Y-%m-%d %H:%M', localtime((stat $0)[9]));
+    print "find-xpra $VERSION (built $built)\n";
+    exit 0;
+}
 
 # --user is a shorthand: ssh as that user AND only show their sessions.
 # --ssh-user (if also given) wins for the ssh-as part.
@@ -546,6 +555,7 @@ usage: find-xpra [options]
                         sessions are discovered, offers :0 as fallback
   --debug               print the probe command for each candidate and
                         leave ssh's stderr attached so failures show why
+  --version             print the version and build date, then exit
   -h, --help            this message
 EOF
 
